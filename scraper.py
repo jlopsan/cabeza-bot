@@ -1026,27 +1026,64 @@ class ScraperWallapop:
 
     # ── Extracción de anuncio individual ────────────────────────────────────
 
-    async def obtener_item(self, item_id: str):
+    async def obtener_item(self, item_id: str, url_pagina: str = ""):
         """
-        Obtiene datos de un anuncio individual por item_id.
+        Busca un anuncio en la Search API por keywords extraídas del slug
+        (más robusto que el item-detail API que requiere hash ID).
         Devuelve Anuncio o None.
         """
-        url_api = f"https://api.wallapop.com/api/v3/items/{item_id}"
-        try:
-            async with httpx.AsyncClient(timeout=20, headers=self._HEADERS) as c:
-                r = await c.get(url_api)
-                r.raise_for_status()
-                data = r.json()
-        except Exception as e:
-            logger.error(f"[Wallapop] Error obteniendo item {item_id}: {e}")
+        # Extraer keywords del slug (todo excepto el ID numérico al final)
+        slug = url_pagina.split("/item/")[-1] if "/item/" in url_pagina else item_id
+        slug_sin_id = re.sub(r"-\d{6,}$", "", slug.split("?")[0])
+        keywords = " ".join(p for p in slug_sin_id.split("-") if p)
+        if not keywords:
+            keywords = slug_sin_id or item_id
+
+        logger.info(f"[Wallapop] Buscando item {item_id} con keywords='{keywords}'")
+
+        params = {
+            "keywords": keywords, "source": "search_box",
+            "latitude": WALLAPOP_LATITUDE, "longitude": WALLAPOP_LONGITUDE,
+            "distance": WALLAPOP_DISTANCE, "order_by": "newest",
+            "category_id": 100, "section_type": "organic_search_results",
+            "items_count": 50,
+        }
+
+        data = await self._fetch(params)
+        items = self._extraer_items(data)
+
+        # Buscar el item exacto por numeric ID en web_slug
+        target = None
+        for it in items:
+            ws = it.get("web_slug", "")
+            if ws.endswith(f"-{item_id}") or ws == slug:
+                target = it
+                break
+
+        if not target:
+            # Si no encontrado, intentar con el item API usando hash ID
+            # (buscamos el hash en los primeros resultados)
+            logger.warning(f"[Wallapop] Item {item_id} no encontrado en search, intentando API hash")
+            for it in items[:5]:
+                hash_id = it.get("id", "")
+                if hash_id:
+                    try:
+                        async with httpx.AsyncClient(timeout=10, headers=self._HEADERS) as c:
+                            r = await c.get(f"https://api.wallapop.com/api/v3/items/{hash_id}")
+                            if r.status_code == 200:
+                                d = r.json()
+                                if d.get("slug", "").endswith(f"-{item_id}"):
+                                    target = d
+                                    break
+                    except Exception:
+                        continue
+
+        if not target:
+            logger.error(f"[Wallapop] No se pudo obtener el anuncio {item_id}")
             return None
 
-        try:
-            content = data.get("content") or data.get("item") or data
-            return self._item_a_anuncio(content, item_id)
-        except Exception as e:
-            logger.error(f"[Wallapop] Error parseando item {item_id}: {e}")
-            return None
+        url = url_pagina or f"https://es.wallapop.com/item/{target.get('web_slug', slug)}"
+        return self._item_a_anuncio(target, item_id, url_pagina=url)
 
     async def buscar_items(
         self, keywords: str, año: int, km: int, n: int = 30,
@@ -1054,12 +1091,12 @@ class ScraperWallapop:
     ) -> list:
         """
         Busca anuncios en Wallapop y devuelve lista de Anuncio.
-        Variante de buscar_precios que expone los items individuales.
+        Usa order_by=newest para evitar listings con precio=0 de concesionarios.
         """
         params = {
             "keywords": keywords, "source": "search_box",
             "latitude": WALLAPOP_LATITUDE, "longitude": WALLAPOP_LONGITUDE,
-            "distance": WALLAPOP_DISTANCE, "order_by": "price_low_to_high",
+            "distance": WALLAPOP_DISTANCE, "order_by": "newest",
             "category_id": 100, "section_type": "organic_search_results",
             "min_year": año - año_tolerancia, "max_year": año + año_tolerancia,
             "max_km": km + km_tolerancia, "items_count": n,
@@ -1068,7 +1105,6 @@ class ScraperWallapop:
         data = await self._fetch(params)
         items = self._extraer_items(data)
 
-        # Reintentar sin filtros de año/km si no hay resultados
         if not items:
             logger.warning("[Wallapop] Reintentando comparables sin año/km")
             params2 = {k: v for k, v in params.items()
@@ -1079,54 +1115,75 @@ class ScraperWallapop:
         anuncios = []
         for item in items:
             try:
-                content = item.get("content") or item
-                a = self._item_a_anuncio(content, str(content.get("id", "")))
+                a = self._item_a_anuncio(item, str(item.get("id", "")))
                 if a and a.precio > 0:
                     anuncios.append(a)
             except Exception as e:
                 logger.debug(f"[Wallapop] Error parseando item comparable: {e}")
-        logger.info(f"[Wallapop] {len(anuncios)} comparables extraídos")
+        logger.info(f"[Wallapop] {len(anuncios)} comparables con precio>0 de {len(items)} items")
         return anuncios
 
     @staticmethod
-    def _item_a_anuncio(content: dict, fallback_id: str = ""):
-        """Convierte un dict de la API de Wallapop en un dataclass Anuncio."""
+    def _item_a_anuncio(content: dict, fallback_id: str = "", url_pagina: str = ""):
+        """
+        Convierte un dict de la API de Wallapop en un dataclass Anuncio.
+        Soporta la estructura actual (2025): type_attributes para datos de coche,
+        price.amount o price.cash.amount para precio, images[].urls.medium para fotos.
+        """
         from models import Anuncio
         from datetime import datetime as _dt, timezone as _tz
 
         item_id = str(content.get("id") or fallback_id)
-        precio  = 0.0
-        precio_obj = content.get("price") or {}
-        if isinstance(precio_obj, dict):
-            precio = float(precio_obj.get("amount") or precio_obj.get("value") or 0)
-        elif isinstance(precio_obj, (int, float)):
-            precio = float(precio_obj)
 
-        descripcion = content.get("description", "") or ""
+        # Precio: buscar en múltiples ubicaciones de la estructura actual
+        precio = 0.0
+        p = content.get("price") or {}
+        if isinstance(p, dict):
+            # Estructura search: {"amount": 28500, "currency": "EUR"}
+            # Estructura detail: {"cash": {"amount": 28500, ...}, ...}
+            precio = float(p.get("amount") or
+                           (p.get("cash") or {}).get("amount") or
+                           p.get("value") or 0)
+        elif isinstance(p, (int, float)):
+            precio = float(p)
+
+        # Descripción (string en search, {"original": "..."} en detail API)
+        desc_raw = content.get("description") or ""
+        if isinstance(desc_raw, dict):
+            desc_raw = desc_raw.get("original") or desc_raw.get("text") or ""
+        descripcion = str(desc_raw)[:1500]
+
+        # Foto: images[].urls.medium (nueva) o images[].medium (vieja)
         foto = ""
-        imgs = content.get("images") or content.get("main_image") or {}
+        imgs = content.get("images") or []
         if isinstance(imgs, list) and imgs:
-            foto = imgs[0].get("medium") or imgs[0].get("original") or ""
+            urls = imgs[0].get("urls") or imgs[0]
+            foto = urls.get("medium") or urls.get("original") or urls.get("small") or ""
         elif isinstance(imgs, dict):
-            foto = imgs.get("medium") or imgs.get("original") or ""
+            foto = imgs.get("medium") or ""
 
         # Localización
         loc = content.get("location") or {}
-        provincia = loc.get("city") or loc.get("region_name") or ""
+        provincia = (loc.get("city") or loc.get("postal_code") or
+                     loc.get("region") or loc.get("region_name") or "")
 
         # URL pública
         slug = content.get("web_slug") or content.get("slug") or item_id
-        url = f"https://es.wallapop.com/item/{slug}"
+        url = url_pagina or f"https://es.wallapop.com/item/{slug}"
 
-        # Datos de coche: en extra_info.cars o en extra_info directamente
+        # Datos de coche: type_attributes (nueva API) > extra_info.cars (antigua)
+        ta   = content.get("type_attributes") or {}
         extra = content.get("extra_info") or {}
-        cars  = extra.get("cars") or extra if isinstance(extra, dict) else {}
-        km  = int(cars.get("km") or cars.get("kilometers") or 0)
-        año = int(cars.get("year") or cars.get("registration_year") or 0)
+        cars  = extra.get("cars") or (extra if isinstance(extra, dict) else {})
 
-        # Marca/modelo desde el título si no están en extra_info
-        marca  = str(cars.get("brand") or cars.get("make") or "").lower().strip()
-        modelo = str(cars.get("model") or "").lower().strip()
+        km  = int(ta.get("km") or ta.get("kilometers") or
+                  cars.get("km") or cars.get("kilometers") or 0)
+        año = int(ta.get("year") or ta.get("registration_year") or
+                  cars.get("year") or cars.get("registration_year") or 0)
+        marca  = str(ta.get("brand") or ta.get("make") or
+                     cars.get("brand") or cars.get("make") or "").lower().strip()
+        modelo = str(ta.get("model") or
+                     cars.get("model") or "").lower().strip()
 
         return Anuncio(
             item_id=item_id,
@@ -1327,8 +1384,10 @@ async def obtener_anuncio_wallapop(url: str):
     if not item_id:
         logger.error(f"[ES] No se pudo extraer item_id de: {url}")
         return None
+    # Limpiar URL: quitar query params pero conservar el slug completo
+    url_limpia = url.split("?")[0].rstrip("/")
     logger.info(f"[ES] Obteniendo anuncio Wallapop item_id={item_id}")
-    return await ScraperWallapop().obtener_item(item_id)
+    return await ScraperWallapop().obtener_item(item_id, url_pagina=url_limpia)
 
 
 async def buscar_comparables_wallapop(

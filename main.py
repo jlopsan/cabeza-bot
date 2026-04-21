@@ -633,6 +633,9 @@ async def cmd_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         logger.error(f"[BOT] Error buscando comparables: {e}")
         comparables = []
 
+    # Excluir el propio anuncio de los comparables
+    comparables = [c for c in comparables if c.item_id != anuncio.item_id]
+
     # Guardar anuncio objetivo + comparables en histórico
     todos_para_hist = [anuncio] + comparables
     try:
