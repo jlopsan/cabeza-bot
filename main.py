@@ -31,6 +31,7 @@ from database import (
     registrar_usuario, obtener_tier,
     guardar_historico_batch,
     get_o_crear_usuario, puede_analizar, registrar_analisis, minutos_hasta_reset,
+    registrar_evento,
 )
 from config import FREE_ANALISIS_MAX, FREE_VENTANA_HORAS
 from scraper import (
@@ -930,6 +931,21 @@ def main():
         },
         fallbacks=[CommandHandler("cancelar", cancelar)],
     )
+
+    # Logger global de comandos en grupo -1 (corre antes que los handlers reales,
+    # no consume el update porque no hace ApplicationHandlerStop)
+    async def _log_cmd(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
+        msg = update.effective_message
+        user = update.effective_user
+        if not msg or not msg.text or not user:
+            return
+        cmd = msg.text.split()[0].lstrip("/").split("@")[0].lower()
+        try:
+            registrar_evento(user.id, cmd)
+        except Exception as e:
+            logger.warning(f"[EVENTO] No se pudo registrar: {e}")
+
+    app.add_handler(MessageHandler(filters.COMMAND, _log_cmd), group=-1)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("plan", cmd_plan))

@@ -121,6 +121,18 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hist_modelo ON historico_precios(marca, modelo)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_hist_fecha  ON historico_precios(capturado_at)")
+
+        # Eventos: una fila por uso de comando
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS eventos_comando (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id  INTEGER NOT NULL,
+                comando  TEXT    NOT NULL,
+                ts       TEXT    NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_evt_user ON eventos_comando(user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_evt_cmd  ON eventos_comando(comando)")
         conn.commit()
 
 
@@ -375,6 +387,39 @@ def minutos_hasta_reset(user_id: int) -> int:
     fin = inicio + timedelta(hours=FREE_VENTANA_HORAS)
     delta = fin - datetime.utcnow()
     return max(int(delta.total_seconds() // 60), 0)
+
+
+# ─── EVENTOS (uso de comandos) ─────────────────────────────────────────────
+
+def registrar_evento(user_id: int, comando: str):
+    """Guarda una fila por cada uso de comando."""
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO eventos_comando (user_id, comando, ts) VALUES (?, ?, ?)",
+            (user_id, comando, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+
+
+def stats_comandos_globales() -> list[dict]:
+    """Total de usos por comando, agregado de todos los usuarios."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT comando, COUNT(*) AS usos, COUNT(DISTINCT user_id) AS usuarios "
+            "FROM eventos_comando GROUP BY comando ORDER BY usos DESC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def stats_comandos_usuario(user_id: int) -> list[dict]:
+    """Usos por comando de un usuario concreto."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT comando, COUNT(*) AS usos FROM eventos_comando "
+            "WHERE user_id = ? GROUP BY comando ORDER BY usos DESC",
+            (user_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ─── SCANNER (canal gratuito) ──────────────────────────────────────────────
