@@ -52,18 +52,24 @@ async def _identificar_version(anuncio) -> dict:
     """
     system = (
         "Eres experto en motores de coches. Dado un anuncio, identifica la VERSIÓN "
-        "técnica exacta (cilindrada, código motor, CV, caja, combustible, trim). "
+        "técnica exacta (cilindrada, código motor, CV, caja, combustible, trim) "
+        "Y estima peso en vacío (tara) y MMA típicos de esa versión. "
         "Responde SOLO con JSON puro sin backticks: "
-        '{"version": "...", "combustible": "...", "caja": "...", "codigo_motor": "..."} '
+        '{"version":"...","combustible":"...","caja":"...","codigo_motor":"...",'
+        '"cv":int|null,"peso_vacio_kg":int|null,"mma_kg":int|null} '
         "Ejemplos: "
-        "Peugeot 208 PureTech 2018 descripción '110cv' → "
-        '{"version":"1.2 PureTech 110cv","combustible":"gasolina","caja":"manual","codigo_motor":"EB2DTS"}. '
-        "VW Golf 2017 descripción '1.4 TSI 150cv DSG' → "
-        '{"version":"1.4 TSI 150cv DSG","combustible":"gasolina","caja":"automatico","codigo_motor":"EA211"}. '
+        "Peugeot 208 PureTech 110cv 2018 → "
+        '{"version":"1.2 PureTech 110cv","combustible":"gasolina","caja":"manual",'
+        '"codigo_motor":"EB2DTS","cv":110,"peso_vacio_kg":1090,"mma_kg":1565}. '
+        "VW Golf 1.4 TSI 150cv DSG 2017 → "
+        '{"version":"1.4 TSI 150cv DSG","combustible":"gasolina","caja":"automatico",'
+        '"codigo_motor":"EA211","cv":150,"peso_vacio_kg":1320,"mma_kg":1830}. '
         "BMW 320d 2015 → "
-        '{"version":"2.0d 184cv","combustible":"diesel","caja":"automatico","codigo_motor":"N47/B47"}. '
+        '{"version":"2.0d 184cv","combustible":"diesel","caja":"automatico",'
+        '"codigo_motor":"N47/B47","cv":184,"peso_vacio_kg":1495,"mma_kg":2010}. '
         "Si la descripción es parca, deduce por año/modelo lo más probable. "
-        "Si no puedes afinar, pon strings vacíos."
+        "Si no sabes algún campo, usa string vacío para textos y null para enteros. "
+        "NUNCA inventes pesos: si no estás seguro, null."
     )
     user_msg = (
         f"Marca: {anuncio.marca}\n"
@@ -72,7 +78,15 @@ async def _identificar_version(anuncio) -> dict:
         f"Motor (Wallapop): {getattr(anuncio, 'motor', '') or '(sin datos)'}\n"
         f"Descripción: {(anuncio.descripcion or '')[:500] or '(vacía)'}"
     )
-    respuesta = await _llamar_ia(system, user_msg, max_tokens=150)
+    respuesta = await _llamar_ia(system, user_msg, max_tokens=250)
+
+    def _to_int(v):
+        try:
+            n = int(v)
+            return n if n > 0 else None
+        except (TypeError, ValueError):
+            return None
+
     try:
         data = json.loads(_limpiar_json(respuesta))
         return {
@@ -80,10 +94,14 @@ async def _identificar_version(anuncio) -> dict:
             "combustible": str(data.get("combustible", "")).strip(),
             "caja": str(data.get("caja", "")).strip(),
             "codigo_motor": str(data.get("codigo_motor", "")).strip(),
+            "cv": _to_int(data.get("cv")),
+            "peso_vacio_kg": _to_int(data.get("peso_vacio_kg")),
+            "mma_kg": _to_int(data.get("mma_kg")),
         }
     except Exception as e:
         logger.warning(f"[VERSION] Parse error: {e} | raw={respuesta!r}")
-        return {"version": "", "combustible": "", "caja": "", "codigo_motor": ""}
+        return {"version": "", "combustible": "", "caja": "", "codigo_motor": "",
+                "cv": None, "peso_vacio_kg": None, "mma_kg": None}
 
 
 # ── 2. Investigación multi-fuente via Tavily (4 queries en paralelo) ───────
@@ -812,6 +830,34 @@ def _bloque_motor_mas_barato(anuncio, comparables: list, version_info: dict) -> 
     )
 
 
+def _calcular_relacion_peso_potencia(version_info: dict) -> dict | None:
+    """Calcula kg/CV y CV/ton en vacío y a plena carga. None si faltan datos."""
+    cv   = version_info.get("cv")
+    tara = version_info.get("peso_vacio_kg")
+    mma  = version_info.get("mma_kg")
+    if not cv or not tara:
+        return None
+    out = {
+        "cv": cv,
+        "tara": tara,
+        "kg_por_cv_vacio":  round(tara / cv, 1),
+        "cv_por_ton_vacio": round(cv * 1000 / tara, 1),
+    }
+    if mma and mma > tara:
+        out["mma"] = mma
+        out["carga_util"] = mma - tara
+        out["kg_por_cv_carga"]  = round(mma / cv, 1)
+        out["cv_por_ton_carga"] = round(cv * 1000 / mma, 1)
+    r = out["kg_por_cv_vacio"]
+    if   r < 8:  cat = "deportivo"
+    elif r < 11: cat = "ágil"
+    elif r < 14: cat = "normal"
+    elif r < 17: cat = "justo"
+    else:        cat = "muy justo (sobre todo cargado)"
+    out["categoria"] = cat
+    return out
+
+
 async def generar_veredicto_analizar(
     anuncio, stats, comparables: list | None = None,
     fuentes_count: dict[str, int] | None = None,
@@ -886,7 +932,15 @@ async def generar_veredicto_analizar(
         "<b>⏳ VIDA ÚTIL ESTIMADA</b>\n"
         "1-2 frases evaluando los kilómetros actuales. Explica si son excesivos y el coche ya no merece la pena, o si da para 10 años más de uso (sé realista).\n\n"
         "<b>🐎 POTENCIA Y DINÁMICA</b>\n"
-        "1-2 frases evaluando si los caballos de esta versión son adecuados en relación potencia/peso para este modelo (experiencia de usuario, ¿se queda corto o va sobrado?).\n\n"
+        "Si en el input hay sección RELACIÓN PESO/POTENCIA con datos: "
+        "primera línea LITERAL con el cálculo: '<b>X CV · ~Y kg vacío · Z kg/CV</b> (categoría)'. "
+        "Si además hay datos cargado: segunda línea '<i>A tope de carga (W kg / Carga útil C kg): K kg/CV — pierde notablemente.</i>'. "
+        "Después 1-2 frases en lenguaje natural: si los caballos son adecuados, "
+        "qué tal con familia + maletas o cuesta arriba, y si el motor se queda corto cargado. "
+        "Si los datos vienen marcados como estimación, no menciones la palabra 'estimación' al usuario "
+        "(él no necesita saberlo, pero no des los kg como dato del anuncio). "
+        "Si NO hay datos suficientes, salta el cálculo y da solo la valoración cualitativa. "
+        "Para eléctricos matiza que el par instantáneo compensa el peso de batería.\n\n"
         "<b>💰 PRECIO vs MERCADO</b>\n"
         "2-3 frases. ¿Barato/justo/caro? Justifica con km, año y equipamiento detectado. "
         "Si la muestra mezcla Wallapop (particulares) y Coches.net (dealers) y la diferencia "
@@ -934,6 +988,33 @@ async def generar_veredicto_analizar(
     etiqueta = calcular_etiqueta_dgt(combustible, anuncio.año)
     zbe_txt = info_zbe(etiqueta)
 
+    # Relación peso/potencia (determinista, basada en estimación del LLM)
+    relacion = _calcular_relacion_peso_potencia(version_info)
+    if relacion:
+        linea1 = (
+            f"En vacío: {relacion['tara']} kg / {relacion['cv']} CV "
+            f"= {relacion['kg_por_cv_vacio']} kg/CV "
+            f"({relacion['cv_por_ton_vacio']} CV/ton) → {relacion['categoria']}"
+        )
+        if "mma" in relacion:
+            linea2 = (
+                f"A plena carga (MMA {relacion['mma']} kg, carga útil "
+                f"{relacion['carga_util']} kg): {relacion['kg_por_cv_carga']} kg/CV "
+                f"({relacion['cv_por_ton_carga']} CV/ton). "
+                "Pérdida de aceleración real con 5 personas + maletas notable."
+            )
+            relacion_txt = (
+                "RELACIÓN PESO/POTENCIA (estimación, NO del anuncio):\n"
+                f"  {linea1}\n  {linea2}\n\n"
+            )
+        else:
+            relacion_txt = (
+                "RELACIÓN PESO/POTENCIA (estimación, NO del anuncio):\n"
+                f"  {linea1}\n\n"
+            )
+    else:
+        relacion_txt = "RELACIÓN PESO/POTENCIA: datos insuficientes\n\n"
+
     desc_limpia = _limpiar_texto(anuncio.descripcion or "")
     user_msg = (
         "ANUNCIO:\n"
@@ -943,6 +1024,7 @@ async def generar_veredicto_analizar(
         f"Descripción: {desc_limpia or '(vacía)'}\n\n"
         "VERSIÓN IDENTIFICADA:\n"
         f"{version} | combustible={combustible} | caja={caja} | código motor={codigo}\n\n"
+        f"{relacion_txt}"
         "ETIQUETA DGT:\n"
         f"Etiqueta: {etiqueta}\n"
         f"ZBE: {zbe_txt}\n\n"
