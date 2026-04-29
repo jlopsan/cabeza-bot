@@ -1,84 +1,140 @@
-# 🎯 German Sniper Bot  v2
+# Coches con cabeza — Bot de análisis de coches usados
 
-Bot de Telegram para importadores profesionales de coches.
-Scrapa AutoScout24.de, cruza los resultados con precios de mercado reales
-de Wallapop España y calcula el beneficio bruto de cada operación.
+Bot de Telegram que analiza anuncios de coches usados en España.
+Scrapea Wallapop y Coches.net en tiempo real. Devuelve veredicto
+objetivo: precio vs mercado, red flags, etiqueta DGT, fiabilidad
+del modelo y qué preguntar antes de ir a verlo.
+
+Producto de **Juan Lopera · Coches con cabeza** ([juanlopera.es](https://juanlopera.es)).
 
 ---
 
-## Arranque rápido
+## Qué hace
 
-```bash
-pip install -r requirements.txt
-playwright install chromium
-export TELEGRAM_TOKEN="tu_token_aqui"
+- `/analizar <url>` — Analiza anuncio de Wallapop o Coches.net.
+- `/buscar` — Búsqueda con criterios (legacy, importación DE→ES).
+- Worker de misiones — Avisa cuando aparece un chollo.
 
-python main.py     # terminal 1 — bot Telegram
-python worker.py   # terminal 2 — monitoreo en segundo plano
-```
+Salida del análisis:
+- Precio vs mediana de comparables reales.
+- Score de confianza 🟢/🟡/🔴.
+- Red flags deterministas (5 reglas).
+- Etiqueta DGT + restricciones ZBE.
+- Investigación del modelo (Tavily — fiabilidad, problemas).
+- Bloque 🚨 si precio anómalamente bajo.
+- Alternativa motor más barata si aplica.
+- Botón de preguntas + checklist de inspección.
+
+---
+
+## Modelo freemium
+
+| Plan | Precio | Análisis |
+|------|--------|----------|
+| Free | 0€ | 3 totales |
+| Pack | 4,90€ pago único | 20 |
+| Pro  | 9,90€/mes | Ilimitados |
+
+Pagos por Stripe. Webhook activa el plan automáticamente.
+
+---
+
+## Stack
+
+- Python 3.11+
+- python-telegram-bot
+- playwright (Coches.net headed)
+- httpx (Wallapop API)
+- openai SDK → Groq (Llama 3.3 70B)
+- Tavily (investigación)
+- SQLite
+- APScheduler (worker)
+- stripe + fastapi + uvicorn (webhook pagos)
 
 ---
 
 ## Arquitectura
 
 ```
-german_sniper/
-├── main.py         Bot Telegram + ConversationHandler (máquina de estados)
-├── scraper.py      AutoScout24.de (Playwright) + Wallapop API (httpx)
-├── calculator.py   IEDMT + costes fijos + cálculo de beneficio (modo manual/auto)
-├── database.py     SQLite: misiones + oportunidades ya enviadas
-├── worker.py       Loop en segundo plano — notifica si beneficio ≥ 3.000€
-├── config.py       Tokens, costes, tramos fiscales, parámetros de negocio
+cabeza-bot/
+├── main.py        Bot Telegram + ConversationHandler
+├── scraper.py     Wallapop API + Coches.net Playwright
+├── ai.py          Parseo NL + veredictos IA
+├── calculator.py  Landing price + IEDMT (legacy DE→ES)
+├── database.py    SQLite: misiones, historico_precios, usuarios, pagos
+├── worker.py      Daemon misiones + health diario
+├── config.py      Variables de entorno
+├── dgt.py         Etiqueta DGT + ZBE (determinista)
+├── red_flags.py   5 reglas detección fraude
+├── webhook.py     FastAPI mínimo — webhooks Stripe
 └── requirements.txt
 ```
 
 ---
 
-## Dos modos de precio ES
+## Arranque
 
-| Modo | Cómo activarlo | Fuente del precio ES |
-|------|---------------|----------------------|
-| **Manual** | Escribe un número (ej: `32000`) | El usuario fija el precio |
-| **Auto** | Escribe `auto` | Wallapop API — promedio de las 5 ofertas más baratas reales |
-
-Ambos modos funcionan tanto en búsquedas en vivo como en misiones del worker.
-
----
-
-## Fórmula de negocio
+### Variables `.env`
 
 ```
-Landing Price  =  Precio_DE + IEDMT(CO₂%) + 1.200€ transporte + 350€ gestoría/ITV
-Beneficio      =  Precio_ES  -  Landing Price
-Notificar si   Beneficio ≥ 3.000€
+TELEGRAM_TOKEN=...
+GROQ_API_KEY=gsk_...
+TAVILY_API_KEY=...
+STRIPE_API_KEY=sk_test_...
+STRIPE_PRICE_PACK=price_...
+STRIPE_PRICE_PRO=price_...
+STRIPE_WEBHOOK_SEC=whsec_...
 ```
 
-### Tramos IEDMT (2024)
+Opcionales (con defaults):
+```
+AI_TIMEOUT_S=30
+ANALISIS_CACHE_TTL_S=1800
+HISTORICO_RETENCION_DIAS=180
+ENABLE_VISION=false
+ENABLE_COCHES_NET=true
+FREE_ANALISIS_MAX=3
+PAID_ANALISIS_MAX=20
+```
 
-| CO₂ (g/km)  | Tipo   |
-|-------------|--------|
-| ≤ 120       | 0 %    |
-| 121 – 159   | 4,75 % |
-| 160 – 199   | 9,75 % |
-| ≥ 200       | 14,75 %|
+### Instalación
+
+```bash
+pip install -r requirements.txt
+playwright install chromium
+```
+
+### Producción Linux
+
+```bash
+nohup xvfb-run python main.py > bot.log 2>&1 &
+nohup xvfb-run python worker.py > worker.log 2>&1 &
+nohup uvicorn webhook:app --host 0.0.0.0 --port 8080 > webhook.log 2>&1 &
+```
+
+### Local con Stripe CLI
+
+```bash
+stripe listen --forward-to localhost:8080/stripe/webhook
+```
 
 ---
 
-## Cruce DE ↔ ES (modo auto)
+## Roadmap (8 semanas)
 
-Cuando encuentra un coche con, p.ej., `Audi A5, 2019, 80.000 km`,
-lanza una búsqueda en Wallapop con:
-- Años: 2018 – 2020
-- Km: 60.000 – 100.000
-
-Aplica filtro anti-scam (descarta precios < 50% de la mediana o < 1.500€)
-y promedia los 5 más baratos del conjunto limpio.
+- ✅ Semana 0 — Identidad + landing + vídeo manifiesto.
+- ✅ Semana 1 — `/analizar <url>` v4.
+- 🔨 Semana 2 — Freemium + `/km_check`.
+- Semana 3-4 — Evaluador de fiabilidad.
+- Semana 5-6 — `/ideal` recomendador.
+- Semana 7 — `/tasar` + alertas chollos.
+- Semana 8 — Web pública con endpoints.
 
 ---
 
-## Actualizar selectores si la web cambia
+## Limitaciones conocidas
 
-| Web | Archivo | Dónde |
-|-----|---------|-------|
-| AutoScout24.de | `scraper.py` | dict `SELECTORS_DE` (línea ~30) |
-| Wallapop API   | `scraper.py` | clase `ScraperSpain`, constantes `_API_URL` + sección "Extraer precios" |
+- Coches.net frágil ante cambios de HTML.
+- Vision LLM desactivado (modelo decommissioned).
+- Sin portal de cliente Stripe — gestión manual de suscripciones.
+- Webhook requiere puerto 8080 accesible (o nginx proxy).
