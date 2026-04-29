@@ -114,7 +114,7 @@ MIN_BENEFICIO = 3_000
 
 # ─── FREEMIUM ────────────────────────────────────────────────────────────────
 FREE_ANALISIS_MAX  = int(os.getenv("FREE_ANALISIS_MAX", "3"))
-FREE_VENTANA_HORAS = int(os.getenv("FREE_VENTANA_HORAS", "2"))
+FREE_VENTANA_HORAS = int(os.getenv("FREE_VENTANA_HORAS", "3"))
 
 
 # ═════════════════════════════════════════════════════════════════════════════
