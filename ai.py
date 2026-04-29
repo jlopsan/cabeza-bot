@@ -68,8 +68,12 @@ async def _identificar_version(anuncio) -> dict:
         '{"version":"2.0d 184cv","combustible":"diesel","caja":"automatico",'
         '"codigo_motor":"N47/B47","cv":184,"peso_vacio_kg":1495,"mma_kg":2010}. '
         "Si la descripción es parca, deduce por año/modelo lo más probable. "
-        "Si no sabes algún campo, usa string vacío para textos y null para enteros. "
-        "NUNCA inventes pesos: si no estás seguro, null."
+        "Para los pesos: para CUALQUIER modelo popular europeo (VW, Peugeot, Renault, "
+        "Citroën, Opel, Ford, Seat, Skoda, Toyota, BMW, Audi, Mercedes, Hyundai, Kia, "
+        "Nissan, Mazda, Honda, Fiat, Dacia) DEBES dar estimación numérica de "
+        "peso_vacio_kg y mma_kg basándote en el segmento/versión similar — un margen "
+        "del ±10% es totalmente aceptable y útil. Solo usa null para marcas exóticas o "
+        "vehículos especiales (camiones, coches clásicos pre-1990, deportivos rarísimos)."
     )
     user_msg = (
         f"Marca: {anuncio.marca}\n"
@@ -87,21 +91,43 @@ async def _identificar_version(anuncio) -> dict:
         except (TypeError, ValueError):
             return None
 
+    def _cv_de_texto(*textos) -> int | None:
+        """Extrae CV de strings tipo '110cv', '110 CV', '110 hp'."""
+        for t in textos:
+            if not t:
+                continue
+            m = re.search(r"(\d{2,4})\s*(?:cv|hp|ps)\b", str(t), re.IGNORECASE)
+            if m:
+                n = int(m.group(1))
+                if 30 <= n <= 1500:
+                    return n
+        return None
+
     try:
         data = json.loads(_limpiar_json(respuesta))
-        return {
-            "version": str(data.get("version", "")).strip(),
+        version = str(data.get("version", "")).strip()
+        cv = _to_int(data.get("cv")) or _cv_de_texto(
+            version, getattr(anuncio, "motor", ""), anuncio.descripcion
+        )
+        info = {
+            "version": version,
             "combustible": str(data.get("combustible", "")).strip(),
             "caja": str(data.get("caja", "")).strip(),
             "codigo_motor": str(data.get("codigo_motor", "")).strip(),
-            "cv": _to_int(data.get("cv")),
+            "cv": cv,
             "peso_vacio_kg": _to_int(data.get("peso_vacio_kg")),
             "mma_kg": _to_int(data.get("mma_kg")),
         }
+        logger.info(
+            f"[VERSION] cv={info['cv']} tara={info['peso_vacio_kg']} "
+            f"mma={info['mma_kg']} version={info['version']!r}"
+        )
+        return info
     except Exception as e:
         logger.warning(f"[VERSION] Parse error: {e} | raw={respuesta!r}")
+        cv = _cv_de_texto(getattr(anuncio, "motor", ""), anuncio.descripcion)
         return {"version": "", "combustible": "", "caja": "", "codigo_motor": "",
-                "cv": None, "peso_vacio_kg": None, "mma_kg": None}
+                "cv": cv, "peso_vacio_kg": None, "mma_kg": None}
 
 
 # ── 2. Investigación multi-fuente via Tavily (4 queries en paralelo) ───────
