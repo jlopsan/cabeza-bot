@@ -54,7 +54,7 @@ ANTI_SCAM_FACTOR     = 0.50   # descarta precios < mediana * 0.50
 PRECIO_MEDIO_MUESTRA = 5      # N precios más baratos para el promedio
 
 # ─── BASE DE DATOS ───────────────────────────────────────────────────────────
-DB_PATH = os.getenv("DB_PATH", "german_sniper.db")
+DB_PATH = os.getenv("DB_PATH", "cabeza_bot.db")
 
 # ─── TAVILY (investigación experta del coche) ───────────────────────────────
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
