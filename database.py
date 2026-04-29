@@ -2,8 +2,8 @@
 import sqlite3
 import json
 import logging
-from datetime import datetime
-from config import DB_PATH
+from datetime import datetime, timedelta
+from config import DB_PATH, ALLOWED_USER_IDS, FREE_ANALISIS_MAX, FREE_VENTANA_HORAS
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +83,16 @@ def init_db():
                 updated_at  TEXT
             )
         """)
+        # Migración: contadores de freemium
+        for col, ddl in [
+            ("first_name",      "TEXT    DEFAULT ''"),
+            ("analisis_usados", "INTEGER DEFAULT 0"),
+            ("ventana_inicio",  "TEXT    DEFAULT ''"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE usuarios ADD COLUMN {col} {ddl}")
+            except sqlite3.OperationalError:
+                pass  # Ya existe
 
         # Ofertas ya publicadas en el canal (scanner)
         conn.execute("""
@@ -253,6 +263,120 @@ def obtener_tier(user_id: int) -> str:
     return u["tier"] if u else "free"
 
 
+# ─── FREEMIUM: límite de análisis por ventana ──────────────────────────────
+
+def get_o_crear_usuario(user_id: int, username: str = "",
+                        first_name: str = "") -> dict:
+    """Devuelve la fila de usuario; la crea si no existe."""
+    now = datetime.utcnow().isoformat()
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO usuarios "
+            "(user_id, username, first_name, tier, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'free', ?, ?)",
+            (user_id, username, first_name, now, now),
+        )
+        # Refrescar username/first_name si cambiaron (sin tocar contadores)
+        conn.execute(
+            "UPDATE usuarios SET username = ?, first_name = ?, updated_at = ? "
+            "WHERE user_id = ?",
+            (username, first_name, now, user_id),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM usuarios WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    return dict(row)
+
+
+def _ventana_expirada(ventana_inicio: str) -> bool:
+    """True si la ventana está vacía o han pasado >= FREE_VENTANA_HORAS."""
+    if not ventana_inicio:
+        return True
+    try:
+        inicio = datetime.fromisoformat(ventana_inicio)
+    except ValueError:
+        return True
+    return datetime.utcnow() - inicio >= timedelta(hours=FREE_VENTANA_HORAS)
+
+
+def puede_analizar(user_id: int) -> tuple[bool, int]:
+    """
+    Devuelve (puede, restantes).
+    - Whitelist (ALLOWED_USER_IDS) → ilimitado.
+    - Si la ventana ha expirado → reset contador a 0.
+    """
+    if ALLOWED_USER_IDS and user_id in ALLOWED_USER_IDS:
+        return True, 999
+
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT analisis_usados, ventana_inicio FROM usuarios WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return True, FREE_ANALISIS_MAX
+
+        usados = row["analisis_usados"] or 0
+        if _ventana_expirada(row["ventana_inicio"] or ""):
+            conn.execute(
+                "UPDATE usuarios SET analisis_usados = 0, ventana_inicio = '' "
+                "WHERE user_id = ?",
+                (user_id,),
+            )
+            conn.commit()
+            usados = 0
+
+    restantes = max(FREE_ANALISIS_MAX - usados, 0)
+    return usados < FREE_ANALISIS_MAX, restantes
+
+
+def registrar_analisis(user_id: int):
+    """Incrementa el contador. Whitelist no descuenta."""
+    if ALLOWED_USER_IDS and user_id in ALLOWED_USER_IDS:
+        return
+
+    now = datetime.utcnow().isoformat()
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT analisis_usados, ventana_inicio FROM usuarios WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return
+
+        ventana = row["ventana_inicio"] or ""
+        if _ventana_expirada(ventana):
+            ventana = now  # arranca nueva ventana
+            usados = 1
+        else:
+            usados = (row["analisis_usados"] or 0) + 1
+
+        conn.execute(
+            "UPDATE usuarios SET analisis_usados = ?, ventana_inicio = ?, updated_at = ? "
+            "WHERE user_id = ?",
+            (usados, ventana, now, user_id),
+        )
+        conn.commit()
+
+
+def minutos_hasta_reset(user_id: int) -> int:
+    """Minutos restantes hasta que la ventana actual expire. 0 si ya expiró."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT ventana_inicio FROM usuarios WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    if not row or not row["ventana_inicio"]:
+        return 0
+    try:
+        inicio = datetime.fromisoformat(row["ventana_inicio"])
+    except ValueError:
+        return 0
+    fin = inicio + timedelta(hours=FREE_VENTANA_HORAS)
+    delta = fin - datetime.utcnow()
+    return max(int(delta.total_seconds() // 60), 0)
+
+
 # ─── SCANNER (canal gratuito) ──────────────────────────────────────────────
 
 def scanner_ya_enviado(coche_id: str) -> bool:
@@ -273,6 +397,24 @@ def scanner_marcar_enviado(coche_id: str):
 
 
 # ─── HISTÓRICO DE PRECIOS ────────────────────────────────────────────────────
+
+def purgar_historico_antiguo(dias: int = 180) -> int:
+    """Elimina entradas de historico_precios anteriores a N días. Devuelve filas borradas."""
+    try:
+        with get_conn() as conn:
+            cur = conn.execute(
+                "DELETE FROM historico_precios WHERE capturado_at < datetime('now', ?)",
+                (f"-{dias} days",),
+            )
+            conn.commit()
+            n = cur.rowcount
+            if n:
+                logger.info(f"[HIST] Purgados {n} registros con más de {dias} días")
+            return n
+    except Exception as e:
+        logger.error(f"[HIST] Error en purgar_historico_antiguo: {e}")
+        return 0
+
 
 def guardar_historico_batch(anuncios: list) -> int:
     """

@@ -3,11 +3,162 @@ ai.py - Capa de IA usando Groq (gratis, sin tarjeta)
 Key gratis en: https://console.groq.com → API Keys
 .env: GROQ_API_KEY=gsk_...
 """
-import os, re, json, logging, asyncio
+import os, re, json, logging, asyncio, time, html as _html
 from openai import AsyncOpenAI
+from config import (
+    TAVILY_CACHE_TTL_HOURS,
+    TAVILY_DOMINIOS_FOROS,
+    TAVILY_DOMINIOS_FIABILIDAD,
+    TAVILY_DOMINIOS_ARTICULOS,
+    ENABLE_VISION, VISION_MODEL, VISION_MAX_FOTOS, VISION_TIMEOUT_S,
+    AI_TIMEOUT_S, ANALISIS_CACHE_TTL_S,
+)
 
 logger = logging.getLogger(__name__)
 VEREDICTOS = ("OK", "SOSPECHOSO", "DESCARTADO")
+
+# cache: (ts_epoch, dict) por (marca, modelo, año)
+_INVESTIGACION_CACHE: dict[str, tuple[float, dict]] = {}
+
+# cache de análisis completos por URL: (ts_epoch, html_str, contexto_qa)
+_ANALISIS_CACHE: dict[str, tuple[float, str, dict]] = {}
+
+
+def cache_get(url: str) -> tuple[str, dict, int] | None:
+    """Devuelve (html, contexto, mins_ago) si hay hit válido, o None."""
+    key = url.lower().split("?")[0].rstrip("/")
+    ahora = time.time()
+    if key in _ANALISIS_CACHE:
+        ts, html_txt, contexto = _ANALISIS_CACHE[key]
+        edad = ahora - ts
+        if edad < ANALISIS_CACHE_TTL_S:
+            return html_txt, contexto, int(edad / 60)
+    return None
+
+
+def cache_set(url: str, html_txt: str, contexto: dict):
+    """Guarda veredicto en caché 30 min."""
+    key = url.lower().split("?")[0].rstrip("/")
+    _ANALISIS_CACHE[key] = (time.time(), html_txt, contexto)
+
+
+# ── 1. Identificación de versión exacta del coche ──────────────────────────
+
+async def _identificar_version(anuncio) -> dict:
+    """
+    Identifica versión concreta del coche (motor, CV, caja, trim) usando IA
+    sobre marca/modelo/año/motor/descripción. Devuelve dict con claves:
+    version (str), combustible (str), caja (str), codigo_motor (str).
+    """
+    system = (
+        "Eres experto en motores de coches. Dado un anuncio, identifica la VERSIÓN "
+        "técnica exacta (cilindrada, código motor, CV, caja, combustible, trim). "
+        "Responde SOLO con JSON puro sin backticks: "
+        '{"version": "...", "combustible": "...", "caja": "...", "codigo_motor": "..."} '
+        "Ejemplos: "
+        "Peugeot 208 PureTech 2018 descripción '110cv' → "
+        '{"version":"1.2 PureTech 110cv","combustible":"gasolina","caja":"manual","codigo_motor":"EB2DTS"}. '
+        "VW Golf 2017 descripción '1.4 TSI 150cv DSG' → "
+        '{"version":"1.4 TSI 150cv DSG","combustible":"gasolina","caja":"automatico","codigo_motor":"EA211"}. '
+        "BMW 320d 2015 → "
+        '{"version":"2.0d 184cv","combustible":"diesel","caja":"automatico","codigo_motor":"N47/B47"}. '
+        "Si la descripción es parca, deduce por año/modelo lo más probable. "
+        "Si no puedes afinar, pon strings vacíos."
+    )
+    user_msg = (
+        f"Marca: {anuncio.marca}\n"
+        f"Modelo: {anuncio.modelo}\n"
+        f"Año: {anuncio.año}\n"
+        f"Motor (Wallapop): {getattr(anuncio, 'motor', '') or '(sin datos)'}\n"
+        f"Descripción: {(anuncio.descripcion or '')[:500] or '(vacía)'}"
+    )
+    respuesta = await _llamar_ia(system, user_msg, max_tokens=150)
+    try:
+        data = json.loads(_limpiar_json(respuesta))
+        return {
+            "version": str(data.get("version", "")).strip(),
+            "combustible": str(data.get("combustible", "")).strip(),
+            "caja": str(data.get("caja", "")).strip(),
+            "codigo_motor": str(data.get("codigo_motor", "")).strip(),
+        }
+    except Exception as e:
+        logger.warning(f"[VERSION] Parse error: {e} | raw={respuesta!r}")
+        return {"version": "", "combustible": "", "caja": "", "codigo_motor": ""}
+
+
+# ── 2. Investigación multi-fuente via Tavily (4 queries en paralelo) ───────
+
+async def _tavily_search(client, query: str, domains: list[str] | None, max_results: int) -> str:
+    """Ejecuta una búsqueda Tavily y devuelve snippets formateados."""
+    try:
+        kwargs = {"query": query, "search_depth": "basic", "max_results": max_results}
+        if domains:
+            kwargs["include_domains"] = domains
+        res = await client.search(**kwargs)
+        snippets = [
+            f"[{r['url']}] {(r.get('content') or '')[:250].strip()}"
+            for r in res.get("results", []) if r.get("content")
+        ]
+        return "\n".join(snippets) if snippets else ""
+    except Exception as e:
+        logger.warning(f"[INVESTIGAR] Error en query '{query[:60]}': {e}")
+        return ""
+
+
+async def investigar_coche(version_info: dict, marca: str, modelo: str, anno: int) -> dict:
+    """
+    Lanza 4 búsquedas Tavily en paralelo: foros, fiabilidad, artículos, alternativas.
+    Devuelve dict con 4 strings formateados para el prompt.
+    Cachea 24h por (marca, modelo, año).
+    """
+    vacio = {"foros": "", "fiabilidad": "", "articulos": "", "alternativas": ""}
+    api_key = os.getenv("TAVILY_API_KEY", "")
+    if not api_key:
+        return vacio
+
+    cache_key = f"{marca.lower()}_{modelo.lower()}_{anno}"
+    ahora = time.time()
+    ttl = TAVILY_CACHE_TTL_HOURS * 3600
+    if cache_key in _INVESTIGACION_CACHE:
+        ts, cached = _INVESTIGACION_CACHE[cache_key]
+        if ahora - ts < ttl:
+            logger.info(f"[INVESTIGAR] Cache hit para {marca} {modelo} {anno}")
+            return cached
+
+    try:
+        from tavily import AsyncTavilyClient
+        client = AsyncTavilyClient(api_key=api_key)
+        version = version_info.get("version", "") or ""
+
+        q_foros = f"{marca} {modelo} {version} problemas averías opiniones"
+        q_fiabilidad = f"{marca} {modelo} TÜV ADAC Dekra Pannenstatistik fiabilidad fallos"
+        q_articulos = f"{marca} {modelo} {anno} análisis prueba opinión"
+        q_alternativas = f"mejores alternativas {marca} {modelo} segmento fiabilidad similar precio"
+
+        foros, fiabilidad, articulos, alternativas = await asyncio.gather(
+            _tavily_search(client, q_foros, TAVILY_DOMINIOS_FOROS, 4),
+            _tavily_search(client, q_fiabilidad, TAVILY_DOMINIOS_FIABILIDAD, 4),
+            _tavily_search(client, q_articulos, TAVILY_DOMINIOS_ARTICULOS, 3),
+            _tavily_search(client, q_alternativas, None, 4),
+        )
+
+        resultado = {
+            "foros": foros,
+            "fiabilidad": fiabilidad,
+            "articulos": articulos,
+            "alternativas": alternativas,
+        }
+        _INVESTIGACION_CACHE[cache_key] = (ahora, resultado)
+        logger.info(
+            f"[INVESTIGAR] {marca} {modelo}: "
+            f"foros={len(foros.splitlines())}, fiab={len(fiabilidad.splitlines())}, "
+            f"arts={len(articulos.splitlines())}, alts={len(alternativas.splitlines())}"
+        )
+        return resultado
+    except Exception as e:
+        logger.warning(f"[INVESTIGAR] Error global Tavily: {e}")
+        return vacio
+
 
 def _client():
     return AsyncOpenAI(
@@ -15,20 +166,26 @@ def _client():
         base_url="https://api.groq.com/openai/v1",
     )
 
-async def _llamar_ia(system: str, user: str, max_tokens: int = 300) -> str:
+async def _llamar_ia(system: str, user: str, max_tokens: int = 3000) -> str:
     try:
-        resp = await _client().chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            max_tokens=max_tokens,
-            temperature=0.1,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user",   "content": user},
-            ],
+        resp = await asyncio.wait_for(
+            _client().chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                max_tokens=max_tokens,
+                temperature=0.1,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user",   "content": user},
+                ],
+            ),
+            timeout=AI_TIMEOUT_S,
         )
         text = resp.choices[0].message.content.strip()
         print(f"[AI RAW] {repr(text)}")
         return text
+    except asyncio.TimeoutError:
+        logger.error(f"[AI] Timeout ({AI_TIMEOUT_S}s) en llamada a Groq")
+        return ""
     except Exception as e:
         logger.error(f"[AI] Error Groq: {e}")
         return ""
@@ -38,6 +195,14 @@ def _limpiar_json(t: str) -> str:
     t = re.sub(r"\s*```$", "", t).strip()
     m = re.search(r"\{.*\}", t, re.DOTALL)
     return m.group(0) if m else t
+
+
+def _limpiar_texto(s: str, max_chars: int = 700) -> str:
+    """Normaliza texto de campo de anuncio antes de pasarlo a IA."""
+    s = (s or "").replace("\r\n", "\n").replace("\r", "\n")
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    return s.strip()[:max_chars]
 
 # ── Parseo de filtros ─────────────────────────────────────────────────────
 
@@ -425,64 +590,451 @@ async def parsear_modelo_nl(texto: str) -> dict:
 # EXTRA: VALIDAR PRECIO MEDIO DE WALLAPOP
 # ════════════════════════════════════════════════════════════════════════════
 
-async def generar_veredicto_analizar(anuncio, stats) -> str:
-    """
-    Genera el veredicto final humanizado para /analizar.
-    anuncio: Anuncio dataclass
-    stats: EstadisticaMercado dataclass
-    Devuelve texto en HTML de Telegram listo para enviar.
-    """
-    desv_pct = stats.desviacion_pct
+# ── Análisis visual de fotos (vision LLM) ─────────────────────────────────
 
-    if abs(desv_pct) <= 5:
-        emoji = "✅"
-        etiqueta = "Precio en línea con el mercado"
-    elif desv_pct < -5 and desv_pct >= -20:
-        emoji = "✅"
-        etiqueta = f"Precio un {abs(desv_pct):.0f}% por debajo de la mediana"
-    elif desv_pct < -20:
-        emoji = "⚠️"
-        etiqueta = f"Precio un {abs(desv_pct):.0f}% por debajo — merece investigar"
-    elif desv_pct > 5 and desv_pct <= 20:
-        emoji = "🟡"
-        etiqueta = f"Precio un {desv_pct:.0f}% por encima de la mediana"
+_DEFECTOS_VALIDOS = {
+    "golpe_chapa", "oxido", "neumatico_liso", "asiento_roto",
+    "salpicadero_dañado", "motor_sucio", "sin_revision", "otro",
+}
+
+
+async def _vision_una_foto(client, url: str, idx: int) -> dict | None:
+    """Analiza una foto y devuelve dict {defectos, estado_general, km_cuadro}."""
+    try:
+        resp = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=VISION_MODEL,
+                max_tokens=200,
+                temperature=0.1,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": (
+                            "Mira esta foto de un coche en venta. Devuelve SOLO JSON: "
+                            '{"defectos":["..."],"estado_general":"bueno|aceptable|malo",'
+                            '"km_cuadro":number_or_null,"alerta":"texto_corto_o_null"}. '
+                            "Etiquetas válidas para defectos: golpe_chapa, oxido, neumatico_liso, "
+                            "asiento_roto, salpicadero_dañado, motor_sucio, sin_revision, otro. "
+                            "km_cuadro solo si la foto muestra el cuentakilómetros. "
+                            "alerta: SOLO si ves algo grave (golpe estructural, óxido perforante)."
+                        )},
+                        {"type": "image_url", "image_url": {"url": url}},
+                    ],
+                }],
+            ),
+            timeout=VISION_TIMEOUT_S,
+        )
+        raw = resp.choices[0].message.content
+        data = json.loads(_limpiar_json(raw))
+        defectos = [d for d in (data.get("defectos") or []) if d in _DEFECTOS_VALIDOS]
+        return {
+            "defectos": defectos,
+            "estado_general": str(data.get("estado_general") or "").lower(),
+            "km_cuadro": data.get("km_cuadro") if isinstance(data.get("km_cuadro"), (int, float)) else None,
+            "alerta": (data.get("alerta") or None) if isinstance(data.get("alerta"), str) else None,
+        }
+    except asyncio.TimeoutError:
+        logger.warning(f"[VISION] Foto #{idx} timeout")
+    except Exception as e:
+        logger.warning(f"[VISION] Foto #{idx} error: {e}")
+    return None
+
+
+async def analizar_fotos(fotos: list[str], anuncio_km: int = 0) -> dict | None:
+    """
+    Analiza hasta VISION_MAX_FOTOS en paralelo. Devuelve {"texto": str, "alerta_km": str|None}
+    o None si no hay fotos / vision desactivada / todo falló.
+    """
+    if not ENABLE_VISION or not fotos:
+        return None
+    # Selección: 1ª, última, y hasta 2 al azar del medio
+    n_max = min(VISION_MAX_FOTOS, len(fotos))
+    seleccion = []
+    if len(fotos) <= n_max:
+        seleccion = list(fotos)
     else:
-        emoji = "🔴"
-        etiqueta = f"Precio un {desv_pct:.0f}% por encima — caro para el mercado"
+        seleccion = [fotos[0], fotos[-1]]
+        medio = fotos[1:-1]
+        if medio and n_max > 2:
+            paso = max(1, len(medio) // (n_max - 2))
+            seleccion += medio[::paso][: n_max - 2]
+    seleccion = seleccion[:n_max]
+
+    client = _client()
+    resultados = await asyncio.gather(
+        *[_vision_una_foto(client, u, i) for i, u in enumerate(seleccion)],
+        return_exceptions=False,
+    )
+    resultados = [r for r in resultados if r]
+    if not resultados:
+        return None
+
+    # Agregar
+    defectos_agg: dict[str, int] = {}
+    estados: list[str] = []
+    km_cuadro: int | None = None
+    alertas: list[str] = []
+    for r in resultados:
+        for d in r["defectos"]:
+            defectos_agg[d] = defectos_agg.get(d, 0) + 1
+        if r["estado_general"]:
+            estados.append(r["estado_general"])
+        if r["km_cuadro"] and km_cuadro is None:
+            km_cuadro = int(r["km_cuadro"])
+        if r["alerta"]:
+            alertas.append(r["alerta"])
+
+    # Texto sintético
+    partes: list[str] = []
+    if defectos_agg:
+        top = sorted(defectos_agg.items(), key=lambda x: -x[1])
+        partes.append("Detectado en fotos: " + ", ".join(d.replace("_", " ") for d, _ in top) + ".")
+    if estados:
+        peor = "malo" if "malo" in estados else ("aceptable" if "aceptable" in estados else "bueno")
+        partes.append(f"Estado general aparente: {peor}.")
+    if km_cuadro:
+        partes.append(f"Cuadro muestra ~{km_cuadro:,} km.")
+    if alertas:
+        partes.append("⚠️ " + " · ".join(alertas[:2]))
+    texto = " ".join(partes) if partes else "Sin defectos visibles claros."
+
+    # Cross-check km cuadro vs anuncio
+    alerta_km = None
+    if km_cuadro and anuncio_km and abs(km_cuadro - anuncio_km) / max(anuncio_km, 1) > 0.10:
+        alerta_km = (
+            f"El cuadro muestra ~{km_cuadro:,} km pero el anuncio dice {anuncio_km:,} km. "
+            "Diferencia >10% — pide explicación."
+        )
+
+    return {"texto": texto, "alerta_km": alerta_km}
+
+
+# ── Preguntas para el vendedor + checklist presencial ─────────────────────
+
+async def preguntas_y_checklist(version_info: dict, marca: str, modelo: str,
+                                  averias_resumen: str = "") -> dict | None:
+    """
+    Una llamada IA que devuelve {"preguntas": [...], "checklist": [...]}.
+    Personalizadas al motor identificado y a las averías típicas conocidas.
+    Devuelve None si la IA falla o el JSON está malformado.
+    """
+    version = version_info.get("version") or f"{marca} {modelo}"
+    codigo = version_info.get("codigo_motor") or ""
+    combustible = version_info.get("combustible") or ""
 
     system = (
-        "Eres Juan Lopera, experto en coches de segunda mano en España. "
-        "Escribe un veredicto BREVE (3-5 frases) sobre si este anuncio merece la pena. "
-        "Tono: directo, con datos, sin condescender. "
-        "Menciona el precio vs mercado, los km, el año. "
-        "Si hay algo raro en la descripción, dilo. "
-        "Termina con 1-2 cosas concretas que preguntar al vendedor. "
-        "Responde en español, sin emojis, sin JSON, solo texto plano."
+        "Eres un mecánico que ayuda a comprar coches usados. Genera preguntas "
+        "para el vendedor (cortas, copiables a WhatsApp) y un checklist para "
+        "revisar el coche en persona. TODO debe ser específico al motor y "
+        "averías típicas conocidas, no genérico. "
+        "Responde SOLO con JSON sin backticks: "
+        '{"preguntas": ["¿...?", ...6 items], "checklist": ["...", ...10 items]}. '
+        "Las preguntas empiezan con '¿' y terminan con '?'. "
+        "El checklist son acciones imperativas cortas (Arrancar en frío, "
+        "Comprobar fugas bajo el motor, etc.)."
     )
     user_msg = (
-        f"Anuncio: {anuncio.marca.title()} {anuncio.modelo.upper()} "
-        f"| Año: {anuncio.año} | Km: {anuncio.km:,} | Precio: {anuncio.precio:,.0f}€\n"
-        f"Descripción: {anuncio.descripcion[:400] or 'Sin descripción'}\n\n"
-        f"Mercado ({stats.n_comparables} comparables): "
-        f"mediana {stats.mediana:,.0f}€ · media {stats.media:,.0f}€ · "
-        f"desviación típica {stats.desviacion:,.0f}€\n"
-        f"Este anuncio está en el percentil {stats.percentil:.0f} "
-        f"({'más barato' if desv_pct < 0 else 'más caro'} que el {abs(desv_pct):.0f}% del mercado)"
+        f"Coche: {marca} {modelo}\n"
+        f"Versión: {version}\n"
+        f"Código motor: {codigo or '(sin datos)'}\n"
+        f"Combustible: {combustible or '(sin datos)'}\n"
+        f"Averías típicas conocidas (resumen): {averias_resumen[:600] or '(sin datos)'}"
+    )
+    raw = await _llamar_ia(system, user_msg, max_tokens=600)
+    if not raw:
+        return None
+    try:
+        data = json.loads(_limpiar_json(raw))
+        preguntas = [str(p).strip() for p in (data.get("preguntas") or []) if str(p).strip()][:8]
+        checklist = [str(c).strip() for c in (data.get("checklist") or []) if str(c).strip()][:12]
+        if not preguntas or not checklist:
+            return None
+        return {"preguntas": preguntas, "checklist": checklist}
+    except Exception as e:
+        logger.warning(f"[PREGUNTAS] Parse error: {e} | raw={raw!r}")
+        return None
+
+
+def _normalizar_motor(s: str) -> str:
+    """Extrae tokens clave del motor: cilindrada + tecnología + CV."""
+    s = s.lower()
+    tokens = []
+    for t in re.findall(r"\d+[.,]?\d*", s):
+        try:
+            v = float(t.replace(",", "."))
+            if 0.5 <= v <= 6.0:
+                tokens.append(f"{v:.1f}")
+            elif 50 <= v <= 600:
+                tokens.append(str(int(v)))
+        except ValueError:
+            pass
+    for kw in ("tsi", "tfsi", "tdi", "cdi", "hdi", "dci", "jtd", "tdci",
+               "gdi", "crdi", "vtec", "puretech", "bluehdi", "tce", "dig-t",
+               "mhev", "phev", "hybrid", "hibrido", "electric"):
+        if kw in s:
+            tokens.append(kw)
+    return " ".join(tokens)
+
+
+def _bloque_motor_mas_barato(anuncio, comparables: list, version_info: dict) -> str:
+    """Busca comparables con mismo motor normalizado y precio >=5% menor."""
+    motor_ref = _normalizar_motor(
+        version_info.get("version") or getattr(anuncio, "motor", "") or ""
+    )
+    if not motor_ref or anuncio.precio <= 0:
+        return ""
+    alternativas = []
+    for c in (comparables or []):
+        if c.precio <= 0 or c.precio >= anuncio.precio * 0.95:
+            continue
+        motor_c = _normalizar_motor(getattr(c, "motor", "") or "")
+        if not motor_c or motor_c != motor_ref:
+            continue
+        ahorro = anuncio.precio - c.precio
+        if ahorro < 300:
+            continue
+        alternativas.append((ahorro, c))
+    if not alternativas:
+        return ""
+    alternativas.sort(key=lambda x: -x[0])
+    lineas = []
+    for ahorro, c in alternativas[:2]:
+        linea = (
+            f"• {c.año} · {c.km:,} km · <b>{c.precio:,.0f}€</b> "
+            f"({_html.escape(c.provincia or '?')}) — {ahorro:,.0f}€ menos"
+        )
+        if c.url:
+            linea += f" <a href='{c.url}'>Ver anuncio</a>"
+        lineas.append(linea)
+    return (
+        "\n\n<b>💸 OPCIÓN MÁS BARATA CON EL MISMO MOTOR</b>\n"
+        + "\n".join(lineas)
     )
 
-    texto_ia = await _llamar_ia(system, user_msg, max_tokens=350)
 
-    resumen = (
-        f"{emoji} <b>{etiqueta}</b>\n\n"
-        f"<b>Datos del anuncio:</b>\n"
-        f"• Precio: <b>{anuncio.precio:,.0f}€</b>  ·  Mediana mercado: <b>{stats.mediana:,.0f}€</b>\n"
-        f"• Comparables encontrados: {stats.n_comparables}\n"
-        f"• Percentil de precio: {stats.percentil:.0f}/100\n\n"
+async def generar_veredicto_analizar(
+    anuncio, stats, comparables: list | None = None,
+    fuentes_count: dict[str, int] | None = None,
+) -> tuple[str, dict]:
+    """
+    Veredicto de experto: versión, precio, fiabilidad con score 0-100, averías
+    específicas del motor, equipamiento, alternativas, artículos y veredicto final.
+    Orquesta _identificar_version + investigar_coche (4 Tavily paralelos) + IA síntesis.
+    """
+    desv_pct = stats.desviacion_pct
+    comparables = comparables or []
+
+    # ── 1. Identificar versión exacta + investigar en paralelo ───────────────
+    logger.info(f"[VEREDICTO] Identificando versión de {anuncio.marca} {anuncio.modelo} {anuncio.año}")
+    version_info = await _identificar_version(anuncio)
+    logger.info(f"[VEREDICTO] Versión: {version_info.get('version', '(sin datos)')}")
+
+    # Investigación + análisis visual en paralelo
+    fotos_anuncio = getattr(anuncio, "fotos", None) or ([anuncio.foto] if anuncio.foto else [])
+    research, vision = await asyncio.gather(
+        investigar_coche(version_info, anuncio.marca, anuncio.modelo, anuncio.año),
+        analizar_fotos(fotos_anuncio, anuncio_km=anuncio.km),
     )
-    if texto_ia:
-        resumen += f"<i>{texto_ia}</i>"
 
-    return resumen
+    # ── 2. Muestra de comparables (reducida a 3 para payload más pequeño) ────
+    sample = sorted(comparables, key=lambda c: c.precio)[:3]
+    sample_txt = "\n".join(
+        f"  • {c.año} · {c.km:,}km · {c.precio:,.0f}€ "
+        f"({_html.escape(c.provincia or '?')}) — "
+        f"{_html.escape((c.descripcion or '').replace(chr(10), ' '))[:100].strip()}"
+        for c in sample
+    ) or "  (sin muestra disponible)"
+
+    # ── 3. Bloque INVESTIGACIÓN para el prompt ───────────────────────────────
+    def _seccion(titulo: str, contenido: str) -> str:
+        return f"\n\n=== {titulo} ===\n{contenido}" if contenido else ""
+
+    investigacion_txt = (
+        _seccion("FOROS (problemas reportados por usuarios)", research["foros"])
+        + _seccion("FIABILIDAD (TÜV / ADAC / Dekra / estudios)", research["fiabilidad"])
+        + _seccion("ARTÍCULOS Y RESEÑAS", research["articulos"])
+        + _seccion("ALTERNATIVAS SUGERIDAS POR LA WEB", research["alternativas"])
+    )
+
+    # ── 4. System prompt de 10 bloques con reglas duras ───────────────────────
+    system = (
+        "Eres Juan Lopera, experto en coches usados del mercado español. "
+        "Analizas anuncios y das un veredicto de EXPERTO, con datos por delante. "
+        "Tono directo, un poco incrédulo ante lo absurdo. Ni gurú ni payaso. "
+        "Respondes SOLO en HTML de Telegram (<b>, <i>, <a href=\"\">, saltos de línea). "
+        "NO uses markdown (nada de ** ni ``` ni #). Cero relleno ('en conclusión', 'en resumen').\n\n"
+        "REGLAS DURAS:\n"
+        "• Enlaces: usa SOLO URLs que aparezcan literalmente en la sección INVESTIGACIÓN. "
+        "Si una URL no está ahí, NO la inventes.\n"
+        "• Score fiabilidad 0-100: USA EL RANGO COMPLETO sin miedo. "
+        "Anclas de referencia (calibra con estas): "
+        "Lexus IS/ES/RX = 92-96 | Toyota Corolla/Yaris = 88-93 | "
+        "Honda Civic/Jazz = 82-88 | VW Golf 1.6 TDI = 68-74 | "
+        "Peugeot 208 1.2 PureTech EB2 (correa baño aceite) = 22-32 | "
+        "BMW N47 (cadena trasera) = 38-48 | VW 2.0 TSI EA888 (consumo aceite) = 45-55 | "
+        "Renault 1.2 TCe = 30-40 | DSG 7v mecatrónico seco = 40-50. "
+        "Si no hay datos en INVESTIGACIÓN, di 'datos insuficientes, score provisional ~50/100'. "
+        "NUNCA comprimas los scores hacia el centro — si es muy fiable, da 90+; si es notoriamente malo, da <35.\n"
+        "• Averías: menciona el problema famoso del motor concreto si aparece "
+        "(correa baño aceite PureTech EB2, consumo aceite EA888 TSI, cadena N47, "
+        "DSG 7v mecatrónico, etc.). Cita fuente de INVESTIGACIÓN si existe.\n"
+        "• Alternativas: si en INVESTIGACIÓN o tu conocimiento hay un modelo del "
+        "MISMO SEGMENTO Y RANGO DE PRECIO con mejor fiabilidad, dilo CLARO.\n\n"
+        "FORMATO EXACTO de 10 bloques en este orden:\n\n"
+        "<b>🎯 VERSIÓN IDENTIFICADA</b>\n"
+        "1 línea técnica: motor, CV, caja, combustible, código motor si aplica.\n\n"
+        "<b>⏳ VIDA ÚTIL ESTIMADA</b>\n"
+        "1-2 frases evaluando los kilómetros actuales. Explica si son excesivos y el coche ya no merece la pena, o si da para 10 años más de uso (sé realista).\n\n"
+        "<b>🐎 POTENCIA Y DINÁMICA</b>\n"
+        "1-2 frases evaluando si los caballos de esta versión son adecuados en relación potencia/peso para este modelo (experiencia de usuario, ¿se queda corto o va sobrado?).\n\n"
+        "<b>💰 PRECIO vs MERCADO</b>\n"
+        "2-3 frases. ¿Barato/justo/caro? Justifica con km, año y equipamiento detectado. "
+        "Si la muestra mezcla Wallapop (particulares) y Coches.net (dealers) y la diferencia "
+        "es notable, menciónalo (markup dealer vs precio particular).\n\n"
+        "<b>🛡️ FIABILIDAD · SCORE X/100 · ETIQUETA</b>\n"
+        "Sustituye X por el score numérico y ETIQUETA por una de estas según el score: "
+        "90+ EXCELENTE | 75-89 MUY FIABLE | 60-74 FIABLE | 45-59 REGULAR | 30-44 POCO FIABLE | <30 MUY POCO FIABLE. "
+        "2-3 frases justificando, SIN repetir el número (ya está en el título). "
+        "Cita TÜV/ADAC/Dekra o volumen de quejas en foros.\n\n"
+        "<b>🔧 AVERÍAS TÍPICAS DE ESTA VERSIÓN</b>\n"
+        "2-4 frases específicas al motor identificado (no al modelo genérico). "
+        "Termina con 1-2 cosas concretas a revisar al ir a verlo.\n\n"
+        "<b>🎁 EQUIPAMIENTO</b>\n"
+        "1-2 frases. Extras detectados en la descripción y si están a la altura del precio.\n\n"
+        "<b>🏷️ ETIQUETA DGT · ZBE</b>\n"
+        "Usa la etiqueta y el texto ZBE EXACTOS que aparecen en la sección 'ETIQUETA DGT' del input. "
+        "1-2 frases en lenguaje claro: di qué etiqueta lleva y dónde podrá circular.\n\n"
+        "<b>🔄 ALTERNATIVAS MEJORES</b>\n"
+        "2-3 modelos del mismo segmento/precio. Una línea por alternativa con pro/contra. "
+        "Si una tiene claramente mejor fiabilidad que éste, dilo sin rodeos.\n\n"
+        "<b>📰 ARTÍCULOS RECOMENDADOS</b>\n"
+        "2-3 enlaces <a href=\"URL\">título</a> con 1-line summary. URLs SOLO de INVESTIGACIÓN.\n\n"
+        "<b>✅ VEREDICTO</b>\n"
+        "Primero una etiqueta en negrita en su propia línea, OBLIGATORIAMENTE una de estas tres exactas:\n"
+        "<b>✅ RECOMENDABLE</b> — si merece la pena comprarlo.\n"
+        "<b>⚠️ NEGOCIAR PRECIO</b> — si puede ser buena compra bajando el precio.\n"
+        "<b>❌ NO RECOMENDABLE</b> — si hay razones claras para descartarlo.\n"
+        "REGLA DE ORO para elegir la etiqueta: la fiabilidad pesa MÁS que el precio. "
+        "Score < 40 → siempre <b>❌ NO RECOMENDABLE</b>, no importa lo barato que esté "
+        "(un coche barato con motor problemático sigue siendo una trampa). "
+        "Score 40-60 + precio caro → <b>⚠️ NEGOCIAR PRECIO</b>. "
+        "Score 40-60 + precio justo → <b>⚠️ NEGOCIAR PRECIO</b> o <b>❌ NO RECOMENDABLE</b> según averías. "
+        "Score > 60 + precio razonable → <b>✅ RECOMENDABLE</b>. "
+        "Después, en la línea siguiente, 1-2 frases explicando la razón principal."
+    )
+
+    # ── 5. User message ──────────────────────────────────────────────────────
+    version = version_info.get("version") or "(no identificada)"
+    codigo = version_info.get("codigo_motor") or "?"
+    combustible = version_info.get("combustible") or "?"
+    caja = version_info.get("caja") or "?"
+
+    # DGT
+    from dgt import calcular_etiqueta_dgt, info_zbe
+    etiqueta = calcular_etiqueta_dgt(combustible, anuncio.año)
+    zbe_txt = info_zbe(etiqueta)
+
+    desc_limpia = _limpiar_texto(anuncio.descripcion or "")
+    user_msg = (
+        "ANUNCIO:\n"
+        f"Coche: {anuncio.marca.title()} {anuncio.modelo.upper()}\n"
+        f"Año: {anuncio.año} | Km: {anuncio.km:,} | Precio: {anuncio.precio:,.0f}€\n"
+        f"Provincia: {anuncio.provincia or 'desconocida'}\n"
+        f"Descripción: {desc_limpia or '(vacía)'}\n\n"
+        "VERSIÓN IDENTIFICADA:\n"
+        f"{version} | combustible={combustible} | caja={caja} | código motor={codigo}\n\n"
+        "ETIQUETA DGT:\n"
+        f"Etiqueta: {etiqueta}\n"
+        f"ZBE: {zbe_txt}\n\n"
+        f"MERCADO ({stats.n_comparables} comparables):\n"
+        f"Mediana {stats.mediana:,.0f}€ | Media {stats.media:,.0f}€ | "
+        f"Desv. típica {stats.desviacion:,.0f}€\n"
+        f"Percentil del anuncio: {stats.percentil:.0f}/100 ({desv_pct:+.1f}% vs mediana)\n"
+        f"Fuentes: Wallapop {(fuentes_count or {}).get('wallapop', 0)} (particulares) · "
+        f"Coches.net {(fuentes_count or {}).get('coches.net', 0)} (dealers)\n\n"
+        f"MUESTRA DE COMPARABLES (3 más baratos):\n{sample_txt}"
+        f"{investigacion_txt}"
+    )
+
+    texto_ia = await _llamar_ia(system, user_msg, max_tokens=1500)
+
+    p = int(stats.percentil)
+    if p <= 25:
+        posicion_txt = f"Más barato que el {100 - p}% del mercado 🟢"
+    elif p <= 50:
+        posicion_txt = f"Por debajo de la media ({100 - p}% son más caros) 🟢"
+    elif p <= 75:
+        posicion_txt = f"Por encima de la media ({p}% son más baratos) 🟡"
+    else:
+        posicion_txt = f"Más caro que el {p}% del mercado 🔴"
+
+    cabecera_datos = (
+        f"<b>📊 Resumen de mercado</b>\n"
+        f"• Precio anuncio: <b>{anuncio.precio:,.0f}€</b>  ·  "
+        f"Mediana: <b>{stats.mediana:,.0f}€</b>  ({desv_pct:+.1f}%)\n"
+        f"• Comparables analizados: {stats.n_comparables}\n"
+        f"• {posicion_txt}\n"
+        f"{'─' * 30}\n\n"
+    )
+
+    # Precio anormalmente bajo (B1)
+    bloque_precio_anomalo = ""
+    if stats.mediana > 0 and anuncio.precio > 0 and anuncio.precio < stats.mediana * 0.40:
+        pct = round((1 - anuncio.precio / stats.mediana) * 100)
+        bloque_precio_anomalo = (
+            f"🚨 <b>PRECIO ANORMALMENTE BAJO</b>\n"
+            f"Este anuncio cuesta un {pct}% menos que la mediana del mercado. "
+            "Casos típicos: estafa, golpe estructural oculto, urgencia real del vendedor, "
+            "error tipográfico. Pide vídeo en directo y verifica DNI antes de mover dinero.\n\n"
+        )
+
+    # Señales de alerta (lógica determinista)
+    from red_flags import detectar_red_flags
+    flags = detectar_red_flags(anuncio, stats)
+    if vision and vision.get("alerta_km"):
+        flags.append(vision["alerta_km"])
+    bloque_flags = ""
+    if flags:
+        bloque_flags = "<b>🚩 SEÑALES DE ALERTA</b>\n" + "\n".join(f"• {f}" for f in flags) + "\n\n"
+
+    # Análisis visual
+    bloque_fotos = ""
+    if vision and vision.get("texto"):
+        bloque_fotos = f"<b>📸 ANÁLISIS DE FOTOS</b>\n{vision['texto']}\n\n"
+
+    cuerpo = texto_ia or "⚠️ No pude generar el análisis IA."
+    # Alternativa más barata con mismo motor (B2)
+    bloque_motor = _bloque_motor_mas_barato(anuncio, comparables, version_info)
+    html_veredicto = (
+        bloque_precio_anomalo
+        + cabecera_datos
+        + bloque_flags
+        + bloque_fotos
+        + cuerpo
+        + bloque_motor
+    )
+    contexto = {
+        "marca": anuncio.marca,
+        "modelo": anuncio.modelo,
+        "version_info": version_info,
+        "foros": (research.get("foros", "") or "")[:600],
+    }
+    return html_veredicto, contexto
+
+
+def formatear_qa(qa: dict) -> str:
+    """Formatea el dict {preguntas, checklist} como HTML para Telegram."""
+    if not qa:
+        return ""
+    preguntas_html = "\n".join(f"{i}. {p}" for i, p in enumerate(qa["preguntas"], 1))
+    checklist_html = "\n".join(f"☐ {c}" for c in qa["checklist"])
+    return (
+        "<b>💬 PREGUNTAS PARA EL VENDEDOR</b>\n"
+        "<i>(cópiate y mándalas por WhatsApp)</i>\n"
+        f"{preguntas_html}\n\n"
+        "<b>📋 CHECKLIST PARA VER EL COCHE</b>\n"
+        f"{checklist_html}"
+    )
 
 
 async def validar_precio_mercado(marca: str, modelo: str, año: int, km: int,

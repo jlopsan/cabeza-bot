@@ -8,7 +8,9 @@
 #   - Control de acceso por tiers (free / pro / sniper)
 #   - Restricción por ALLOWED_USER_IDS
 #
+import html
 import logging
+import time
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -20,18 +22,22 @@ from config import TELEGRAM_TOKEN, TOP_RESULTS, MIN_BENEFICIO, ALLOWED_USER_IDS
 from ai import (
     parsear_filtros_nl, parsear_modelo_nl, enriquecer_coches,
     texto_analisis, validar_precio_mercado, filtrar_por_extras,
-    generar_veredicto_analizar,
+    generar_veredicto_analizar, preguntas_y_checklist, formatear_qa,
+    cache_get, cache_set,
 )
 from database import (
     init_db, crear_mision, eliminar_mision,
     obtener_misiones_usuario, pausar_mision, activar_mision,
     registrar_usuario, obtener_tier,
     guardar_historico_batch,
+    get_o_crear_usuario, puede_analizar, registrar_analisis, minutos_hasta_reset,
 )
+from config import FREE_ANALISIS_MAX, FREE_VENTANA_HORAS
 from scraper import (
     buscar_y_cruzar, buscar_coches_alemania,
-    obtener_anuncio_wallapop, buscar_comparables_wallapop,
+    obtener_anuncio_por_url, buscar_comparables_todas,
 )
+from collections import Counter
 from calculator import (
     formato_tarjeta,
     calcular_sniper_score, formato_sniper_score,
@@ -91,26 +97,26 @@ def _tier_puede(tier: str, feature: str) -> bool:
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    allowed, tier = _check_access(user.id, user.username or "")
+    allowed, _tier = _check_access(user.id, user.username or "")
     if not allowed:
         await update.message.reply_text("⛔ No tienes acceso a este bot.")
         return
 
-    tier_emoji = {"free": "🆓", "pro": "⭐", "sniper": "🎯", "admin": "👑"}.get(tier, "🆓")
+    get_o_crear_usuario(user.id, user.username or "", user.first_name or "")
 
     await update.message.reply_text(
-        f"🎯 <b>German Sniper Bot v3</b>\n"
-        f"{tier_emoji} Tu plan: <b>{tier.upper()}</b>\n\n"
-        f"Busco coches en <b>AutoScout24</b> y <b>mobile.de</b>, calculo el coste "
-        f"real de importación y lo cruzo con precios de <b>Wallapop</b> y <b>coches.net</b> "
-        f"para encontrar las mejores oportunidades.\n\n"
-        f"<b>Comandos:</b>\n"
-        f"• /analizar &lt;url&gt; — Analiza un anuncio de Wallapop\n"
-        f"• /buscar — Busca coches en Alemania para importar\n"
-        f"• /calcular — Calculadora inversa (¿precio máx en DE?)\n"
-        f"• /misiones — Ver misiones activas\n"
-        f"• /plan — Ver tu plan y límites\n"
-        f"• /cancelar — Cancelar operación en curso",
+        "Hola 👋\n\n"
+        "Soy <b>Cabeza Bot</b>.\n\n"
+        "Analizo anuncios de coches usados en España en tiempo real: "
+        "precio vs mercado, red flags, etiqueta DGT, historial del modelo.\n\n"
+        f"En fase beta. Tienes {FREE_ANALISIS_MAX} análisis gratuitos "
+        f"cada {FREE_VENTANA_HORAS} horas.\n\n"
+        "/analizar &lt;url&gt; — Analiza un anuncio de Wallapop o Coches.net\n"
+        "/plan — Ver cuántos análisis te quedan\n\n"
+        "<b>Actualizaciones en:</b>\n"
+        "• YouTube: @juanloperaes\n"
+        "• Instagram: @juanlopera.es\n"
+        "• TikTok: @juanlopera.es",
         parse_mode="HTML",
     )
 
@@ -121,27 +127,40 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    allowed, tier = _check_access(user.id, user.username or "")
+    allowed, _tier = _check_access(user.id, user.username or "")
     if not allowed:
         await update.message.reply_text("⛔ No tienes acceso a este bot.")
         return
 
-    limits = TIER_LIMITS.get(tier, TIER_LIMITS["free"])
-    busq = limits["busquedas_dia"]
-    mis = limits["misiones"]
-    sniper = "✅" if limits["sniper"] else "❌"
+    get_o_crear_usuario(user.id, user.username or "", user.first_name or "")
+    _puede, restantes = puede_analizar(user.id)
+    usados = max(FREE_ANALISIS_MAX - restantes, 0) if restantes <= FREE_ANALISIS_MAX else 0
+
+    mins = minutos_hasta_reset(user.id)
+    if mins <= 0:
+        cuando = "ahora (ventana nueva al próximo análisis)"
+    else:
+        h, m = divmod(mins, 60)
+        cuando = f"{h}h {m}min" if h else f"{m} min"
+
+    if ALLOWED_USER_IDS and user.id in ALLOWED_USER_IDS:
+        cuerpo = "🔓 Acceso ilimitado (beta).\n\n"
+    else:
+        cuerpo = (
+            f"🔍 Análisis usados: <b>{usados}/{FREE_ANALISIS_MAX}</b>\n"
+            f"⏳ Reset en: <b>{cuando}</b>\n\n"
+        )
 
     await update.message.reply_text(
-        f"📋 <b>Tu plan: {tier.upper()}</b>\n\n"
-        f"🔍 Búsquedas/día: <b>{'ilimitadas' if busq == -1 else busq}</b>\n"
-        f"📡 Misiones activas: <b>{'ilimitadas' if mis == -1 else mis}</b>\n"
-        f"🎯 Modo Sniper (alertas 3 min): {sniper}\n\n"
-        f"{'─' * 30}\n"
-        f"<b>Planes disponibles:</b>\n"
-        f"🆓 <b>FREE</b> — 3 búsquedas/día, 1 misión\n"
-        f"⭐ <b>PRO</b> — 50 búsquedas/día, 5 misiones\n"
-        f"🎯 <b>SNIPER</b> — Ilimitado + alertas cada 3 min\n\n"
-        f"Para cambiar de plan, contacta al admin.",
+        "📋 <b>Tu uso</b>\n\n"
+        f"{cuerpo}"
+        "🚀 <b>Próximamente:</b>\n"
+        "• Plan ilimitado por suscripción mensual\n"
+        "• Más herramientas: /tasar, /ideal, alertas de chollos\n\n"
+        "En fase beta. Actualizaciones en:\n"
+        "• YouTube: @juanloperaes\n"
+        "• Instagram: @juanlopera.es\n"
+        "• TikTok: @juanlopera.es",
         parse_mode="HTML",
     )
 
@@ -571,6 +590,26 @@ async def callback_misiones(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(f"⚠️ No se pudo eliminar la misión #{mid}.")
 
 
+async def _enviar_largo(msg, texto: str, parse_mode: str = "HTML", **kwargs):
+    """Edita msg con texto; si excede 4000 chars, lo divide en mensajes adicionales."""
+    LIMITE = 4000
+    if len(texto) <= LIMITE:
+        await msg.edit_text(texto, parse_mode=parse_mode, **kwargs)
+        return
+    partes = []
+    while len(texto) > LIMITE:
+        corte = texto.rfind("\n\n", 0, LIMITE)
+        if corte < 200:
+            corte = LIMITE
+        partes.append(texto[:corte])
+        texto = texto[corte:].lstrip()
+    if texto:
+        partes.append(texto)
+    await msg.edit_text(partes[0], parse_mode=parse_mode, **kwargs)
+    for parte in partes[1:]:
+        await msg.reply_text(parte, parse_mode=parse_mode, **kwargs)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # /analizar <url> — semana 1
 # ════════════════════════════════════════════════════════════════════════════
@@ -585,122 +624,217 @@ async def cmd_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ No tienes acceso a este bot.")
         return
 
+    # ── Gating freemium: 3 análisis cada FREE_VENTANA_HORAS ────────────────
+    get_o_crear_usuario(user.id, user.username or "", user.first_name or "")
+    puede, restantes = puede_analizar(user.id)
+    if not puede:
+        mins = minutos_hasta_reset(user.id)
+        h, m = divmod(mins, 60)
+        cuando = f"{h}h {m}min" if h else f"{m} min"
+        await update.message.reply_text(
+            f"⛔ <b>Has usado tus {FREE_ANALISIS_MAX} análisis gratuitos.</b>\n\n"
+            "Cada análisis cuesta dinero real (scraping + IA). "
+            "Por eso hay un tope mientras estoy en beta — si no, el bot se "
+            "queda sin gasolina y no puedo mantenerlo abierto.\n\n"
+            f"⏳ Tu límite se resetea en <b>{cuando}</b>.\n\n"
+            "🚀 Pronto podrás desbloquear <b>análisis ilimitados</b> "
+            "por una suscripción mensual. Estoy terminándolo.",
+            parse_mode="HTML",
+        )
+        return
+    if restantes == 1:
+        await update.message.reply_text(
+            f"ℹ️ Te queda <b>1 análisis</b> en esta ventana de "
+            f"{FREE_VENTANA_HORAS}h.",
+            parse_mode="HTML",
+        )
+
     # Extraer URL del mensaje (funciona con /analizar <url> y texto libre)
     texto = update.message.text or ""
-    url_match = re.search(r"https?://[^\s]+wallapop[^\s]+", texto)
+    # Acepta URLs tipo:
+    #   https://es.wallapop.com/item/...
+    #   https://wallapop.com/item/...        (compartir desde app móvil)
+    #   http(s)://(cualquier_subdominio.)wallapop.(com|es)/...
+    url_match = re.search(
+        r"https?://(?:[\w-]+\.)*(?:wallapop\.[a-z]{2,}|coches\.net)/\S+",
+        texto,
+        re.IGNORECASE,
+    )
     if not url_match:
         await update.message.reply_text(
-            "🔍 Pégame la URL del anuncio de Wallapop.\n"
-            "Ej: <code>/analizar https://es.wallapop.com/item/seat-ibiza-123456789</code>",
+            "🔍 Pégame la URL del anuncio (Wallapop o Coches.net).\n"
+            "• <code>/analizar https://es.wallapop.com/item/...</code>\n"
+            "• <code>/analizar https://www.coches.net/...-kovn.aspx</code>",
             parse_mode="HTML",
         )
         return
 
-    url = url_match.group(0).rstrip(")")
+    url = url_match.group(0).rstrip(",.;:)]}>'\"")
+
+    # ── B3: caché 30 min por URL ─────────────────────────────────────────────
+    cached = cache_get(url)
+    if cached:
+        veredicto_cache, contexto_cache, mins_ago = cached
+        msg = await update.message.reply_text("⏳ Recuperando análisis…")
+        prefijo = f"<i>♻️ Análisis cacheado hace {mins_ago} min</i>\n\n"
+        await _enviar_largo(msg, prefijo + veredicto_cache,
+                            parse_mode="HTML", disable_web_page_preview=True)
+        if contexto_cache:
+            ctx.user_data["analisis_qa_ctx"] = contexto_cache
+            teclado = InlineKeyboardMarkup([[
+                InlineKeyboardButton("💬 Sí, dame preguntas + checklist", callback_data="qa:si"),
+                InlineKeyboardButton("No, gracias", callback_data="qa:no"),
+            ]])
+            await update.message.reply_text(
+                "¿Quieres que te prepare <b>preguntas para el vendedor</b> y un "
+                "<b>checklist</b> para cuando vayas a verlo en persona?",
+                parse_mode="HTML", reply_markup=teclado,
+            )
+        return
+
     msg = await update.message.reply_text("⏳ Extrayendo datos del anuncio…")
-
-    # ── 1. Extraer anuncio objetivo ──────────────────────────────────────────
     try:
-        anuncio = await obtener_anuncio_wallapop(url)
-    except Exception as e:
-        logger.error(f"[BOT] Error extrayendo anuncio: {e}")
-        anuncio = None
+        # ── 1. Extraer anuncio objetivo ──────────────────────────────────────
+        try:
+            anuncio = await obtener_anuncio_por_url(url)
+        except Exception as e:
+            logger.error(f"[BOT] Error extrayendo anuncio: {e}")
+            anuncio = None
 
-    if not anuncio or anuncio.precio <= 0:
+        if not anuncio or anuncio.precio <= 0:
+            await msg.edit_text(
+                "😔 No pude extraer los datos del anuncio.\n"
+                "• Comprueba que la URL sea de Wallapop o Coches.net y el anuncio siga activo.\n"
+                "• A veces Wallapop bloquea temporalmente. Prueba en 1 min."
+            )
+            return
+
+        marca  = anuncio.marca  or "desconocida"
+        modelo = anuncio.modelo or "desconocido"
+        año    = anuncio.año    or 0
+        km     = anuncio.km     or 0
+
         await msg.edit_text(
-            "😔 No pude extraer los datos del anuncio.\n"
-            "• Comprueba que la URL sea de Wallapop y el anuncio siga activo.\n"
-            "• A veces Wallapop bloquea temporalmente. Prueba en 1 min."
-        )
-        return
-
-    marca  = anuncio.marca  or "desconocida"
-    modelo = anuncio.modelo or "desconocido"
-    año    = anuncio.año    or 0
-    km     = anuncio.km     or 0
-
-    await msg.edit_text(
-        f"✅ Anuncio encontrado: <b>{marca.title()} {modelo.upper()}</b> "
-        f"{año} · {km:,} km · <b>{anuncio.precio:,.0f}€</b>\n\n"
-        f"⏳ Buscando comparables en Wallapop…",
-        parse_mode="HTML",
-    )
-
-    # ── 2. Buscar comparables ────────────────────────────────────────────────
-    try:
-        comparables = await buscar_comparables_wallapop(marca, modelo, año, km, n=30)
-    except Exception as e:
-        logger.error(f"[BOT] Error buscando comparables: {e}")
-        comparables = []
-
-    # Excluir el propio anuncio de los comparables
-    comparables = [c for c in comparables if c.item_id != anuncio.item_id]
-
-    # Guardar anuncio objetivo + comparables en histórico
-    todos_para_hist = [anuncio] + comparables
-    try:
-        guardar_historico_batch(todos_para_hist)
-    except Exception as e:
-        logger.warning(f"[BOT] Error guardando histórico: {e}")
-
-    # ── 3. Estadística de mercado ────────────────────────────────────────────
-    from models import EstadisticaMercado
-
-    precios_comp = [c.precio for c in comparables if c.precio > 0]
-
-    if len(precios_comp) < 3:
-        await msg.edit_text(
-            f"⚠️ Solo encontré {len(precios_comp)} comparable(s) para "
-            f"<b>{marca.title()} {modelo.upper()}</b> con esos parámetros.\n"
-            f"No hay datos suficientes para un veredicto fiable. Prueba un modelo más común.",
+            f"✅ Anuncio encontrado: <b>{html.escape(marca.title())} "
+            f"{html.escape(modelo.upper())}</b> "
+            f"{año} · {km:,} km · <b>{anuncio.precio:,.0f}€</b>\n\n"
+            f"⏳ Buscando comparables en Wallapop y Coches.net…",
             parse_mode="HTML",
         )
-        return
 
-    mediana   = _stats.median(precios_comp)
-    media     = _stats.mean(precios_comp)
-    desviacion = _stats.stdev(precios_comp) if len(precios_comp) > 1 else 0.0
-    precios_ord = sorted(precios_comp)
-    pos_menor   = sum(1 for p in precios_ord if p < anuncio.precio)
-    percentil   = round((pos_menor / len(precios_ord)) * 100)
-    desv_pct    = round(((anuncio.precio - mediana) / mediana) * 100, 1) if mediana else 0.0
+        # ── 2. Buscar comparables (multi-fuente) ─────────────────────────────
+        try:
+            comparables = await buscar_comparables_todas(marca, modelo, año, km, n=30)
+        except Exception as e:
+            logger.error(f"[BOT] Error buscando comparables: {e}")
+            comparables = []
 
-    stats = EstadisticaMercado(
-        n_comparables=len(precios_comp),
-        mediana=round(mediana, 0),
-        media=round(media, 0),
-        desviacion=round(desviacion, 0),
-        percentil=percentil,
-        desviacion_pct=desv_pct,
-        precios=precios_ord,
-    )
+        comparables = [c for c in comparables if c.item_id != anuncio.item_id]
+        fuentes_count = dict(Counter(c.fuente for c in comparables))
+        logger.info(f"[BOT] Comparables por fuente: {fuentes_count}")
 
-    await msg.edit_text(
-        f"📊 {stats.n_comparables} comparables encontrados. "
-        f"Mediana: <b>{stats.mediana:,.0f}€</b>\n"
-        f"⏳ Generando veredicto con IA…",
-        parse_mode="HTML",
-    )
+        # A6: filtrar histórico (precio>0, año>1990)
+        historico = [a for a in ([anuncio] + comparables) if a.precio > 0 and a.año > 1990]
+        try:
+            guardar_historico_batch(historico)
+        except Exception as e:
+            logger.warning(f"[BOT] Error guardando histórico: {e}")
 
-    # ── 4. Veredicto IA ──────────────────────────────────────────────────────
-    try:
-        veredicto = await generar_veredicto_analizar(anuncio, stats)
-    except Exception as e:
-        logger.error(f"[BOT] Error generando veredicto: {e}")
-        veredicto = f"⚠️ No pude generar veredicto IA.\nPrecio: {anuncio.precio:,.0f}€ · Mediana: {stats.mediana:,.0f}€"
+        # ── 3. Estadística de mercado ────────────────────────────────────────
+        from models import EstadisticaMercado
 
-    cabecera = (
-        f"🔍 <b>{marca.title()} {modelo.upper()} {año}</b>\n"
-        f"📍 {anuncio.provincia or 'España'}  ·  {km:,} km  ·  "
-        f"<a href='{url}'>Ver anuncio</a>\n"
-        f"{'─' * 30}\n\n"
-    )
+        precios_comp = [c.precio for c in comparables if c.precio > 0]
 
-    await msg.edit_text(
-        cabecera + veredicto,
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
+        if len(precios_comp) < 3:
+            await msg.edit_text(
+                f"⚠️ Solo encontré {len(precios_comp)} comparable(s) para "
+                f"<b>{html.escape(marca.title())} {html.escape(modelo.upper())}</b> con esos parámetros.\n"
+                f"No hay datos suficientes para un veredicto fiable. Prueba un modelo más común.",
+                parse_mode="HTML",
+            )
+            return
+
+        mediana    = _stats.median(precios_comp)
+        media      = _stats.mean(precios_comp)
+        desviacion = _stats.stdev(precios_comp) if len(precios_comp) > 1 else 0.0
+        precios_ord = sorted(precios_comp)
+        pos_menor   = sum(1 for p in precios_ord if p < anuncio.precio)
+        percentil   = round((pos_menor / len(precios_ord)) * 100)
+        desv_pct    = round(((anuncio.precio - mediana) / mediana) * 100, 1) if mediana else 0.0
+
+        stats = EstadisticaMercado(
+            n_comparables=len(precios_comp),
+            mediana=round(mediana, 0),
+            media=round(media, 0),
+            desviacion=round(desviacion, 0),
+            percentil=percentil,
+            desviacion_pct=desv_pct,
+            precios=precios_ord,
+        )
+
+        await msg.edit_text(
+            f"📊 {stats.n_comparables} comparables encontrados. "
+            f"Mediana: <b>{stats.mediana:,.0f}€</b>\n"
+            f"⏳ Generando veredicto con IA…",
+            parse_mode="HTML",
+        )
+
+        # ── 4. Veredicto IA ──────────────────────────────────────────────────
+        contexto_qa = None
+        try:
+            veredicto, contexto_qa = await generar_veredicto_analizar(
+                anuncio, stats, comparables,
+                fuentes_count=fuentes_count,
+            )
+        except Exception as e:
+            logger.error(f"[BOT] Error generando veredicto: {e}")
+            veredicto = (
+                f"⚠️ No pude generar veredicto IA.\n"
+                f"Precio: {anuncio.precio:,.0f}€ · Mediana: {stats.mediana:,.0f}€"
+            )
+
+        # Guardar en caché (B3)
+        if contexto_qa:
+            try:
+                cache_set(url, veredicto, contexto_qa)
+            except Exception:
+                pass
+
+        cabecera = (
+            f"🔍 <b>{html.escape(marca.title())} {html.escape(modelo.upper())} {año}</b>\n"
+            f"📍 {html.escape(anuncio.provincia or 'España')}  ·  {km:,} km  ·  "
+            f"<a href='{url}'>Ver anuncio</a>\n"
+            f"{'─' * 30}\n\n"
+        )
+
+        await _enviar_largo(
+            msg, cabecera + veredicto,
+            parse_mode="HTML", disable_web_page_preview=True,
+        )
+
+        # Registrar consumo SOLO al terminar el análisis con éxito
+        registrar_analisis(user.id)
+
+        # ── 5. Oferta opcional: preguntas vendedor + checklist ───────────────
+        if contexto_qa:
+            ctx.user_data["analisis_qa_ctx"] = contexto_qa
+            teclado = InlineKeyboardMarkup([[
+                InlineKeyboardButton("💬 Sí, dame preguntas + checklist", callback_data="qa:si"),
+                InlineKeyboardButton("No, gracias", callback_data="qa:no"),
+            ]])
+            await update.message.reply_text(
+                "¿Quieres que te prepare <b>preguntas para el vendedor</b> y un "
+                "<b>checklist</b> para cuando vayas a verlo en persona?",
+                parse_mode="HTML",
+                reply_markup=teclado,
+            )
+
+    except Exception:
+        logger.error("[BOT] Excepción no capturada en cmd_analizar", exc_info=True)
+        try:
+            await msg.edit_text("😔 Algo se rompió en el análisis. Reintenta en 1 min.")
+        except Exception:
+            pass
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -713,13 +847,64 @@ async def cancelar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# Callback: preguntas vendedor + checklist (post /analizar)
+# ════════════════════════════════════════════════════════════════════════════
+
+async def callback_qa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    eleccion = (query.data or "").split(":", 1)[-1]
+
+    if eleccion == "no":
+        await query.edit_message_text("👍 Perfecto, sin preguntas.")
+        return
+
+    contexto = ctx.user_data.get("analisis_qa_ctx")
+    if not contexto:
+        await query.edit_message_text(
+            "⚠️ No tengo el contexto del último análisis. Vuelve a lanzar /analizar."
+        )
+        return
+
+    await query.edit_message_text("⏳ Preparando preguntas y checklist…")
+    qa = await preguntas_y_checklist(
+        contexto["version_info"],
+        contexto["marca"],
+        contexto["modelo"],
+        averias_resumen=contexto.get("foros", ""),
+    )
+    if not qa:
+        await query.edit_message_text(
+            "😔 No pude generar las preguntas en este momento. Inténtalo otra vez."
+        )
+        return
+
+    texto = formatear_qa(qa)
+    await query.edit_message_text(texto, parse_mode="HTML", disable_web_page_preview=True)
+    ctx.user_data.pop("analisis_qa_ctx", None)
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ════════════════════════════════════════════════════════════════════════════
+
+async def error_handler(update, context):
+    """Manejador global de errores."""
+    logger.error(f"Exception while handling an update: {context.error}", exc_info=context.error)
+    
+    # Si es un conflicto de polling, informar al usuario
+    if hasattr(context.error, 'message') and 'terminated by other getUpdates' in str(context.error):
+        logger.critical("⚠️  CONFLICTO DE POLLING: Otra instancia del bot está ejecutándose.")
+        logger.critical("   Solución: Detén todos los procesos de Python y vuelve a iniciar.")
+
 
 def main():
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_TOKEN no configurado. Revisa tu archivo .env")
         return
+    
+    logger.info("🔄 Eliminando webhook anterior (si existe) para evitar conflictos...")
+    
     init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
@@ -748,16 +933,23 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("plan", cmd_plan))
-    app.add_handler(CommandHandler("misiones", mis_misiones))
     app.add_handler(CommandHandler("analizar", cmd_analizar))
-    app.add_handler(conv_buscar)
-    app.add_handler(conv_calcular)
-    app.add_handler(CallbackQueryHandler(callback_misiones, pattern=r"^(pausar|activar|eliminar)_\d+$"))
+    # Ocultos en beta — código intacto, solo sin handler en Telegram:
+    # app.add_handler(CommandHandler("misiones", mis_misiones))
+    # app.add_handler(conv_buscar)
+    # app.add_handler(conv_calcular)
+    # app.add_handler(CallbackQueryHandler(callback_misiones, pattern=r"^(pausar|activar|eliminar)_\d+$"))
+    app.add_handler(CallbackQueryHandler(callback_qa, pattern=r"^qa:(si|no)$"))
+    
+    # Manejador global de errores
+    app.add_error_handler(error_handler)
 
     logger.info("🎯 German Sniper Bot v3 iniciado")
     logger.info("  Fuentes DE: AutoScout24 + mobile.de | Fuentes ES: Wallapop + coches.net")
     logger.info("  Features: Sniper Score, Calculadora Inversa, Modo Sniper, Tiers")
-    app.run_polling()
+    
+    # drop_pending_updates=True descarta actualizaciones pendientes para evitar conflictos
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":

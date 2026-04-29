@@ -1,0 +1,8 @@
+python-telegram-bot
+playwright
+httpx
+apscheduler  
+openai        
+SQLAlchemy    
+python-dotenv
+google

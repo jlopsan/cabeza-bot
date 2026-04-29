@@ -1098,9 +1098,17 @@ class ScraperWallapop:
             "latitude": WALLAPOP_LATITUDE, "longitude": WALLAPOP_LONGITUDE,
             "distance": WALLAPOP_DISTANCE, "order_by": "newest",
             "category_id": 100, "section_type": "organic_search_results",
-            "min_year": año - año_tolerancia, "max_year": año + año_tolerancia,
-            "max_km": km + km_tolerancia, "items_count": n,
+            "items_count": n,
         }
+        if año > 0:
+            params["min_year"] = año - año_tolerancia
+            params["max_year"] = año + año_tolerancia
+        else:
+            logger.info("[ES] año no detectado, busco sin filtro temporal")
+        if km > 0:
+            params["max_km"] = km + km_tolerancia
+        else:
+            logger.info("[ES] km no detectado, busco sin filtro de km")
 
         data = await self._fetch(params)
         items = self._extraer_items(data)
@@ -1153,14 +1161,22 @@ class ScraperWallapop:
             desc_raw = desc_raw.get("original") or desc_raw.get("text") or ""
         descripcion = str(desc_raw)[:1500]
 
-        # Foto: images[].urls.medium (nueva) o images[].medium (vieja)
+        # Foto principal + galería completa
         foto = ""
+        fotos: list[str] = []
         imgs = content.get("images") or []
-        if isinstance(imgs, list) and imgs:
-            urls = imgs[0].get("urls") or imgs[0]
-            foto = urls.get("medium") or urls.get("original") or urls.get("small") or ""
+        if isinstance(imgs, list):
+            for it in imgs:
+                urls = it.get("urls") or it
+                u = urls.get("medium") or urls.get("original") or urls.get("small")
+                if u:
+                    fotos.append(u)
+            if fotos:
+                foto = fotos[0]
         elif isinstance(imgs, dict):
             foto = imgs.get("medium") or ""
+            if foto:
+                fotos = [foto]
 
         # Localización
         loc = content.get("location") or {}
@@ -1185,6 +1201,11 @@ class ScraperWallapop:
         modelo = str(ta.get("model") or
                      cars.get("model") or "").lower().strip()
 
+        engine = str(ta.get("engine") or ta.get("fuel_type") or
+                     cars.get("engine") or cars.get("fuel_type") or "").strip()
+        cv = ta.get("horsepower") or ta.get("power") or cars.get("horsepower") or ""
+        motor = f"{engine} {cv}cv".strip(" cv") if engine or cv else ""
+
         return Anuncio(
             item_id=item_id,
             fuente="wallapop",
@@ -1197,6 +1218,8 @@ class ScraperWallapop:
             descripcion=descripcion[:1500],
             url=url,
             foto=foto,
+            motor=motor,
+            fotos=fotos,
             capturado_at=_dt.now(_tz.utc).isoformat(),
         )
 
@@ -1208,6 +1231,490 @@ class ScraperWallapop:
 class ScraperCochesNet:
     nombre = "coches.net"
     SEARCH_URL = "https://www.coches.net/segunda-mano/"
+
+    # Selectores tolerantes (orden = prioridad). Si uno falla, prueba el siguiente.
+    CARD_SELECTORS = [
+        "article[class*='mt-CardAd']",
+        "div[class*='mt-CardAd']",
+        "article:has(a[href*='/coches-segunda-mano/'])",
+        "div[class*='CardAd']",
+    ]
+    PRICE_SELECTORS = [
+        "[class*='mt-CardAdPrice'] strong",
+        "[class*='mt-CardAdPrice']",
+        "strong[class*='price']",
+        "span[class*='price']",
+        "[data-test*='price']",
+    ]
+    LINK_SELECTORS = [
+        "a[href*='/coches-segunda-mano/']",
+        "a[class*='mt-CardAd-titleLink']",
+        "h2 a, h3 a",
+    ]
+
+    def acepta_url(self, url: str) -> bool:
+        return "coches.net" in (url or "").lower()
+
+    # ── API pública unificada (capa fuente-agnóstica) ────────────────────────
+    async def buscar_comparables(
+        self, marca: str, modelo: str, año: int, km: int, n: int = 20,
+    ) -> list:
+        for backend in (self._buscar_playwright,):
+            try:
+                items = await backend(marca, modelo, año, km, n)
+                if len(items) >= 3:
+                    logger.info(f"[coches.net] {backend.__name__} OK: {len(items)} items")
+                    return items
+                logger.warning(
+                    f"[coches.net] {backend.__name__} devolvió {len(items)} (<3)"
+                )
+            except Exception as e:
+                logger.warning(f"[coches.net] {backend.__name__} falló: {e}")
+        return []
+
+    async def obtener_anuncio(self, url: str):
+        """Extrae datos de un anuncio individual de coches.net por URL."""
+        from models import Anuncio
+        from datetime import datetime as _dt, timezone as _tz
+
+        # Coches.net SOLO renderiza la SPA si el UA es Chrome reciente sobre
+        # Windows/Mac. Firefox/Linux UAs disparan su anti-bot y devuelve HTML
+        # mínimo (~8 KB) sin precio real.
+        user_agent = next(
+            (ua for ua in USER_AGENTS if "Chrome/" in ua and ("Windows" in ua or "Macintosh" in ua)),
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        )
+        proxy_cfg = {"server": random.choice(PROXIES)} if PROXIES else None
+        async with async_playwright() as p:
+            # Headless es detectado por coches.net (devuelve 8 KB sin precio).
+            # Usamos headless=False; en producción Linux usa xvfb-run.
+            try:
+                browser = await p.chromium.launch(headless=False)
+            except Exception as _e:
+                _emsg = str(_e).lower()
+                if any(x in _emsg for x in ("missing x", "display", "x11", "cannot open")):
+                    logger.error(
+                        "[coches.net] Sin display disponible — "
+                        "usa xvfb-run o pon ENABLE_COCHES_NET=false"
+                    )
+                else:
+                    logger.error(f"[coches.net] Error lanzando browser: {_e}")
+                return None
+            context = await _nuevo_contexto_stealth(browser, user_agent, proxy_cfg, locale="es-ES")
+            await context.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+            )
+            page = await context.new_page()
+            try:
+                logger.info(f"[coches.net] Anuncio individual: {url}")
+                await page.goto(url, timeout=30_000, wait_until="domcontentloaded")
+                await asyncio.sleep(random.uniform(2.5, 3.5))
+
+                for sel in ["button#didomi-notice-agree-button",
+                             "button:has-text('Aceptar')",
+                             "button:has-text('Aceptar todo')"]:
+                    try:
+                        btn = page.locator(sel).first
+                        if await btn.is_visible(timeout=2_000):
+                            await btn.click()
+                            await asyncio.sleep(1.0)
+                            break
+                    except Exception:
+                        continue
+
+                # Espera a que la SPA renderice el bloque de detalle (con precio).
+                # Si no aparece en 12s, asumimos que la página fue bloqueada.
+                try:
+                    await page.wait_for_selector(
+                        "h1, [class*='DetailHead'], [class*='priceMain'], [class*='DetailPrice']",
+                        timeout=12_000,
+                    )
+                except Exception:
+                    logger.warning("[coches.net] Timeout esperando bloque de detalle")
+
+                texto = ""
+                try:
+                    texto = await page.locator("body").inner_text(timeout=5_000)
+                except Exception:
+                    pass
+                html = ""
+                try:
+                    html = await page.content()
+                except Exception:
+                    pass
+
+                # Sanity check: si el HTML es muy pequeño la SPA no renderizó.
+                if len(html) < 50_000:
+                    logger.error(
+                        f"[coches.net] HTML solo {len(html)} bytes — coches.net "
+                        "bloqueó el render. No puedo extraer este anuncio."
+                    )
+                    return None
+
+                # Precio: SOLO dentro del header de detalle. Coger el PRIMER
+                # candidato real (el grande mostrado al usuario), filtrando
+                # cuotas mensuales y precios de banners/related.
+                precio = 0.0
+                for psel in ["[class*='mt-DetailHead-priceMain']",
+                             "[class*='priceMain']",
+                             "[class*='DetailPrice'] strong",
+                             "[class*='DetailHead'] strong",
+                             "[class*='DetailHead'] [class*='price']"]:
+                    try:
+                        loc = page.locator(psel)
+                        n = min(await loc.count(), 5)
+                        for i in range(n):
+                            t = (await loc.nth(i).inner_text()).strip()
+                            low = t.lower()
+                            if "/mes" in low or "mes" in low.split() or "cuota" in low:
+                                continue
+                            v = _parse_numero(t)
+                            if v >= 1000:
+                                precio = v
+                                break
+                        if precio > 0:
+                            break
+                    except Exception:
+                        continue
+
+                # Fallback regex SOLO dentro del bloque de detalle (jamás en aside ni footer)
+                if precio <= 0:
+                    head_text = ""
+                    for hsel in ("[class*='DetailHead']", "main", "article"):
+                        try:
+                            head_text = await page.locator(hsel).first.inner_text(timeout=2_000)
+                            if head_text:
+                                break
+                        except Exception:
+                            continue
+                    for m in re.finditer(r"(\d{1,3}(?:\.\d{3})+)\s*€", head_text or ""):
+                        # Saltar si va seguido de "/mes" o precedido de "cuota"
+                        ctx_after = (head_text or "")[m.end():m.end()+10].lower()
+                        ctx_before = (head_text or "")[max(0, m.start()-30):m.start()].lower()
+                        if "/mes" in ctx_after or "mes" in ctx_after.split() or "cuota" in ctx_before:
+                            continue
+                        v = float(m.group(1).replace(".", ""))
+                        if 1000 <= v <= 5_000_000:
+                            precio = v
+                            break
+
+                # Título
+                titulo = ""
+                for tsel in ["h1", "[class*='DetailHead-titleMain']", "[class*='title']"]:
+                    try:
+                        el = page.locator(tsel).first
+                        if await el.count() > 0:
+                            titulo = (await el.inner_text()).strip()
+                            if titulo:
+                                break
+                    except Exception:
+                        continue
+
+                # Descripción
+                descripcion = ""
+                for dsel in ["[class*='DetailDescription']",
+                             "[class*='description']",
+                             "section:has(h2:has-text('Descripción'))"]:
+                    try:
+                        el = page.locator(dsel).first
+                        if await el.count() > 0:
+                            descripcion = (await el.inner_text()).strip()
+                            if descripcion:
+                                break
+                    except Exception:
+                        continue
+
+                # Año / km del bloque de specs
+                anno = 0
+                m = re.search(r"\b(19[89]\d|20[0-3]\d)\b", titulo + " " + texto)
+                if m:
+                    anno = int(m.group(1))
+                kms = 0
+                m = re.search(r"([\d\.]+)\s*km", texto, re.IGNORECASE)
+                if m:
+                    try:
+                        kms = int(m.group(1).replace(".", ""))
+                    except ValueError:
+                        pass
+
+                # Marca/modelo: prioridad path limpio /km-0/seat/ibiza/provincia/...
+                # Si el path solo tiene un slug largo terminado en .aspx, usar IA sobre el título.
+                marca = ""
+                modelo = ""
+                provincia = ""
+                try:
+                    raw = url.split("coches.net/", 1)[1].split("?")[0].split("#")[0]
+                    skip = {"km-0", "segunda-mano", "ocasion", "ocasión", "coches", ""}
+                    parts = [p for p in raw.split("/") if p and p not in skip]
+                    # Path limpio si los 2 primeros segmentos son cortos (no slug.aspx)
+                    if (len(parts) >= 2
+                            and not parts[0].endswith(".aspx")
+                            and "-" not in parts[0]
+                            and len(parts[0]) <= 20
+                            and len(parts[1]) <= 30):
+                        marca = parts[0]
+                        modelo = parts[1]
+                        if len(parts) >= 3 and not parts[2].endswith(".aspx"):
+                            provincia = parts[2].replace("-", " ").title()
+                except Exception:
+                    pass
+
+                # Fallback: extraer marca/modelo del título con IA
+                if (not marca or not modelo) and titulo:
+                    try:
+                        from ai import parsear_modelo_nl
+                        parsed = await parsear_modelo_nl(titulo)
+                        marca = marca or parsed.get("marca", "")
+                        modelo = modelo or parsed.get("modelo", "")
+                    except Exception as e:
+                        logger.warning(f"[coches.net] parsear_modelo_nl falló: {e}")
+
+                # Provincia: si vacío, intenta sacarla del slug ('en-madrid')
+                if not provincia:
+                    m = re.search(r"-en-([a-z\-]+?)-\d", url, re.IGNORECASE)
+                    if m:
+                        provincia = m.group(1).replace("-", " ").title()
+
+                # Foto principal + galería
+                foto = ""
+                fotos: list[str] = []
+                try:
+                    for gsel in ("[class*='gallery'] img",
+                                 "[class*='Gallery'] img",
+                                 "img[src*='cochesnet']",
+                                 "img"):
+                        loc = page.locator(gsel)
+                        n = await loc.count()
+                        if n == 0:
+                            continue
+                        for i in range(min(n, 12)):
+                            el = loc.nth(i)
+                            src = (await el.get_attribute("src")
+                                   or await el.get_attribute("data-src") or "")
+                            if src and src.startswith("http") and src not in fotos:
+                                fotos.append(src)
+                        if len(fotos) >= 3:
+                            break
+                    if fotos:
+                        foto = fotos[0]
+                except Exception:
+                    pass
+
+                # item_id desde la URL (último número largo antes de -kovn.aspx)
+                item_id = ""
+                m = re.search(r"(\d{6,})", url)
+                if m:
+                    item_id = m.group(1)
+                if not item_id:
+                    item_id = _generar_id("coches.net", titulo[:60], precio, url)
+
+                if precio <= 0 or not (marca or titulo):
+                    logger.error(f"[coches.net] No pude extraer datos mínimos de {url}")
+                    return None
+
+                return Anuncio(
+                    item_id=item_id,
+                    fuente="coches.net",
+                    marca=(marca or "").lower(),
+                    modelo=(modelo or "").lower(),
+                    año=anno,
+                    km=kms,
+                    precio=precio,
+                    provincia=provincia,
+                    descripcion=(descripcion or titulo)[:1500],
+                    url=url,
+                    foto=foto,
+                    motor=titulo[:120],
+                    fotos=fotos,
+                    capturado_at=_dt.now(_tz.utc).isoformat(),
+                )
+            except Exception as e:
+                logger.error(f"[coches.net] obtener_anuncio falló: {e}")
+                return None
+            finally:
+                await browser.close()
+
+    # ── Backend Playwright ────────────────────────────────────────────────────
+    async def _buscar_playwright(
+        self, marca: str, modelo: str, año: int, km: int, n: int,
+    ) -> list:
+        query_es = _construir_query_es(marca, modelo, {})
+        url = f"{self.SEARCH_URL}?MakeModelGeneralSearch={query_es}"
+        url += "&OrderTypeId=Price&OrderAsc=True"
+        if año:
+            url += f"&MinYear={año - AÑO_TOLERANCIA}&MaxYear={año + AÑO_TOLERANCIA}"
+        if km:
+            url += f"&MaxKms={km + KM_TOLERANCIA}"
+
+        user_agent = random.choice(USER_AGENTS)
+        proxy_cfg = {"server": random.choice(PROXIES)} if PROXIES else None
+        anuncios: list = []
+
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await _nuevo_contexto_stealth(browser, user_agent, proxy_cfg, locale="es-ES")
+            await context.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+            )
+            page = await context.new_page()
+            try:
+                logger.info(f"[coches.net] URL items: {url}")
+                await page.goto(url, timeout=30_000, wait_until="domcontentloaded")
+                await asyncio.sleep(random.uniform(2.0, 3.5))
+
+                for sel in ["button#didomi-notice-agree-button",
+                             "button:has-text('Aceptar')",
+                             "button:has-text('Aceptar todo')"]:
+                    try:
+                        btn = page.locator(sel).first
+                        if await btn.is_visible(timeout=2_000):
+                            await btn.click()
+                            await asyncio.sleep(0.8)
+                            break
+                    except Exception:
+                        continue
+
+                # Localizar tarjetas con cascada de selectores
+                cards = None
+                for csel in self.CARD_SELECTORS:
+                    cs = page.locator(csel)
+                    if await cs.count() >= 3:
+                        cards = cs
+                        logger.info(f"[coches.net] Cards selector: '{csel}' n={await cs.count()}")
+                        break
+
+                if cards is None:
+                    logger.warning("[coches.net] Sin selector de cards aplicable")
+                    return []
+
+                total = min(await cards.count(), n)
+                for i in range(total):
+                    try:
+                        a = await self._extraer_card(cards.nth(i), marca, modelo)
+                        if a and a.precio > 0 and a.url:
+                            anuncios.append(a)
+                    except Exception as e:
+                        logger.debug(f"[coches.net] card {i} skip: {e}")
+
+            except Exception as e:
+                logger.error(f"[coches.net] Playwright error: {e}")
+            finally:
+                await browser.close()
+
+        logger.info(f"[coches.net] {len(anuncios)} anuncios extraídos")
+        return anuncios
+
+    async def _extraer_card(self, card, marca: str, modelo: str):
+        from models import Anuncio
+        from datetime import datetime as _dt, timezone as _tz
+
+        # Texto crudo del card → fallback para año/km
+        texto = ""
+        try:
+            texto = await card.inner_text()
+        except Exception:
+            pass
+
+        # Precio
+        precio = 0.0
+        for psel in self.PRICE_SELECTORS:
+            try:
+                el = card.locator(psel).first
+                if await el.count() > 0:
+                    val = _parse_numero(await el.inner_text())
+                    if val > 500:
+                        precio = val
+                        break
+            except Exception:
+                continue
+        if precio <= 0:
+            m = re.search(r"(\d{1,3}(?:\.\d{3})+)\s*€", texto)
+            if m:
+                precio = float(m.group(1).replace(".", ""))
+
+        # URL
+        href = ""
+        for lsel in self.LINK_SELECTORS:
+            try:
+                el = card.locator(lsel).first
+                if await el.count() > 0:
+                    href = await el.get_attribute("href") or ""
+                    if href:
+                        break
+            except Exception:
+                continue
+        if href and href.startswith("/"):
+            href = f"https://www.coches.net{href}"
+
+        item_id = ""
+        if href:
+            m = re.search(r"(\d{5,})", href)
+            item_id = m.group(1) if m else _generar_id("coches.net", texto[:60], precio, href)
+        else:
+            item_id = _generar_id("coches.net", texto[:60], precio, "")
+
+        # Año (regex sobre texto del card)
+        anno = 0
+        m = re.search(r"\b(19[89]\d|20[0-3]\d)\b", texto)
+        if m:
+            anno = int(m.group(1))
+
+        # Kilómetros
+        kms = 0
+        m = re.search(r"([\d\.]+)\s*km", texto, re.IGNORECASE)
+        if m:
+            try:
+                kms = int(m.group(1).replace(".", ""))
+            except ValueError:
+                pass
+
+        # Provincia (heurística: línea con coma o tras año/km)
+        provincia = ""
+        for line in (texto or "").split("\n"):
+            line = line.strip()
+            if line and not re.search(r"\d", line) and 3 <= len(line) <= 40:
+                provincia = line
+                break
+
+        # Foto
+        foto = ""
+        try:
+            img = card.locator("img").first
+            if await img.count() > 0:
+                foto = await img.get_attribute("src") or await img.get_attribute("data-src") or ""
+        except Exception:
+            pass
+
+        # Descripción (título h2/h3 si existe; si no, primera línea)
+        desc = ""
+        for tsel in ("h2", "h3", "[class*='title']"):
+            try:
+                el = card.locator(tsel).first
+                if await el.count() > 0:
+                    desc = (await el.inner_text()).strip()
+                    if desc:
+                        break
+            except Exception:
+                continue
+        if not desc:
+            desc = (texto or "").split("\n")[0][:120]
+
+        return Anuncio(
+            item_id=item_id,
+            fuente="coches.net",
+            marca=marca.strip().lower(),
+            modelo=modelo.strip().lower(),
+            año=anno,
+            km=kms,
+            precio=precio,
+            provincia=provincia,
+            descripcion=desc[:1500],
+            url=href,
+            foto=foto,
+            motor="",
+            capturado_at=_dt.now(_tz.utc).isoformat(),
+        )
 
     async def buscar_precios(self, marca: str, modelo: str, año: int, km: int,
                               filtros: dict | None = None) -> dict:
@@ -1365,29 +1872,47 @@ async def buscar_precio_mercado_es(
 def _extraer_item_id_wallapop(url: str) -> str | None:
     """
     Extrae el item_id de una URL de Wallapop.
-    https://es.wallapop.com/item/seat-ibiza-1020293871 → '1020293871'
+    Soporta múltiples formatos:
+      https://es.wallapop.com/item/seat-ibiza-1020293871           → '1020293871'
+      https://wallapop.com/item/audi-a3-2012-1244995621?utm_...    → '1244995621'  (share móvil)
+      https://es.wallapop.com/item/seat-ibiza-1020293871/          → '1020293871'
+      https://es.wallapop.com/item/1020293871                      → '1020293871'
     """
-    m = re.search(r"-(\d{6,})$", url.rstrip("/").split("?")[0])
+    # Quitar query/fragmento y barras finales
+    clean = url.split("?")[0].split("#")[0].rstrip("/")
+    # Caso 1: el último segmento del path termina en -<números> (con slug)
+    last = clean.rsplit("/", 1)[-1]
+    m = re.search(r"(\d{6,})$", last)
     if m:
         return m.group(1)
-    # Fallback: último segmento del path
-    slug = url.rstrip("/").split("/")[-1].split("?")[0]
-    return slug if slug else None
+    # Fallback: último segmento si es puramente numérico
+    if last.isdigit():
+        return last
+    return last or None
 
 
 async def obtener_anuncio_wallapop(url: str):
     """
     Extrae los datos de un anuncio individual de Wallapop por URL.
     Devuelve Anuncio o None si no se puede extraer.
+    Normaliza URLs tipo 'wallapop.com/...' (share de la app móvil) a 'es.wallapop.com/...'.
     """
     item_id = _extraer_item_id_wallapop(url)
     if not item_id:
         logger.error(f"[ES] No se pudo extraer item_id de: {url}")
         return None
-    # Limpiar URL: quitar query params pero conservar el slug completo
-    url_limpia = url.split("?")[0].rstrip("/")
-    logger.info(f"[ES] Obteniendo anuncio Wallapop item_id={item_id}")
+    # Limpiar URL: quitar query/fragment y barras finales
+    url_limpia = url.split("?")[0].split("#")[0].rstrip("/")
+    # Normalizar dominio: wallapop.com → es.wallapop.com (para que la navegación funcione)
+    url_limpia = re.sub(
+        r"^(https?://)(?:www\.)?wallapop\.(com|es)",
+        r"\1es.wallapop.\2",
+        url_limpia,
+        flags=re.IGNORECASE,
+    )
+    logger.info(f"[ES] Obteniendo anuncio Wallapop item_id={item_id} url={url_limpia}")
     return await ScraperWallapop().obtener_item(item_id, url_pagina=url_limpia)
+
 
 
 async def buscar_comparables_wallapop(
@@ -1405,6 +1930,82 @@ async def buscar_comparables_wallapop(
         keywords = _normalizar_keywords_es(marca, modelo)
     logger.info(f"[ES] Buscando comparables: '{keywords}' año={año} km={km}")
     return await ScraperWallapop().buscar_items(keywords, año, km, n=n)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# CAPA UNIFICADA MULTI-FUENTE  (Wallapop + Coches.net en paralelo)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _dedupe_anuncios(items: list) -> list:
+    """Dedupe cross-fuente por (precio±200€, año±1, km±2000)."""
+    vistos: list[tuple[float, int, int]] = []
+    unicos = []
+    for a in items:
+        key = (a.precio, a.km or 0, a.año or 0)
+        if any(abs(v[0] - key[0]) < 200 and abs(v[1] - key[1]) < 2000 and abs(v[2] - key[2]) <= 1
+               for v in vistos):
+            continue
+        vistos.append(key)
+        unicos.append(a)
+    return unicos
+
+
+def _fuentes_activas() -> list:
+    """Devuelve scrapers ES habilitados respetando flags de config."""
+    fuentes = []
+    if ENABLE_WALLAPOP:
+        fuentes.append(ScraperWallapop())
+    if ENABLE_COCHES_NET:
+        fuentes.append(ScraperCochesNet())
+    return fuentes
+
+
+async def obtener_anuncio_por_url(url: str):
+    """
+    Resuelve la URL al scraper que la acepta y extrae el Anuncio.
+    Por compatibilidad sigue usando obtener_anuncio_wallapop para Wallapop.
+    """
+    if "wallapop" in (url or "").lower():
+        return await obtener_anuncio_wallapop(url)
+    for f in _fuentes_activas():
+        if hasattr(f, "acepta_url") and f.acepta_url(url):
+            try:
+                return await f.obtener_anuncio(url)
+            except Exception as e:
+                logger.error(f"[{f.nombre}] obtener_anuncio falló: {e}")
+                return None
+    return None
+
+
+async def buscar_comparables_todas(
+    marca: str, modelo: str, año: int, km: int, n: int = 20,
+) -> list:
+    """
+    Lanza en paralelo las búsquedas de comparables en todas las fuentes ES
+    activas. Devuelve lista mergeada y deduplicada de Anuncio.
+    """
+    tareas, fuentes = [], []
+    if ENABLE_WALLAPOP:
+        tareas.append(buscar_comparables_wallapop(marca, modelo, año, km, n=n))
+        fuentes.append("wallapop")
+    if ENABLE_COCHES_NET:
+        tareas.append(ScraperCochesNet().buscar_comparables(marca, modelo, año, km, n=n))
+        fuentes.append("coches.net")
+    if not tareas:
+        return []
+
+    resultados = await asyncio.gather(*tareas, return_exceptions=True)
+    items: list = []
+    for nombre, r in zip(fuentes, resultados):
+        if isinstance(r, list):
+            items.extend(r)
+            logger.info(f"[ES] {nombre}: {len(r)} comparables")
+        else:
+            logger.warning(f"[ES] {nombre} falló: {r}")
+
+    dedup = _dedupe_anuncios(items)
+    logger.info(f"[ES] Total comparables: {len(items)} → {len(dedup)} tras dedup")
+    return dedup
 
 
 async def buscar_y_cruzar(

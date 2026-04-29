@@ -1,0 +1,39 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git init *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('scraper.py', encoding='utf-8'\\).read\\(\\)\\); print\\('sintaxis OK'\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('scraper.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(pip install *)",
+      "Bash(python -c \"import ai; print\\('OK'\\)\")",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:ms-mt--api-web.spain.advgo.net)",
+      "WebFetch(domain:web.gw.coches.net)",
+      "Bash(curl -s 'https://web.gw.coches.net/semantic/search/?hasPhoto=false&wwa=false&MakeIds%5B0%5D=39&ModelIds%5B0%5D=2&pageSize=3' -H 'accept: application/json' -H 'origin: https://www.coches.net' -H 'referer: https://www.coches.net/' -H 'x-adevinta-channel: web-desktop' -H 'x-schibsted-tenant: coches' -H 'user-agent: Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/147.0.0.0 Safari/537.36')",
+      "Bash(curl -s 'https://web.gw.coches.net/semantic/search/?hasPhoto=false&wwa=false&MakeIds%5B0%5D=39&ModelIds%5B0%5D=2&pageSize=2' -H 'accept: application/json' -H 'origin: https://www.coches.net' -H 'referer: https://www.coches.net/' -H 'x-adevinta-channel: web-desktop' -H 'x-schibsted-tenant: coches' -H 'user-agent: Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/147.0.0.0 Safari/537.36')",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('TOP KEYS:', list\\(d.keys\\(\\)\\)\\); print\\('LEN:', len\\(str\\(d\\)\\)\\)\")",
+      "Bash(curl -s 'https://web.gw.coches.net/semantic/search/?hasPhoto=false&wwa=false&MakeIds%5B0%5D=39&ModelIds%5B0%5D=2&pageSize=3' -H 'accept: application/json' -H 'origin: https://www.coches.net' -H 'referer: https://www.coches.net/' -H 'x-adevinta-channel: web-desktop' -H 'x-schibsted-tenant: coches' -H 'user-agent: Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/147.0.0.0 Safari/537.36' -D /tmp/headers.txt)",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(json.dumps\\(d, indent=2\\)[:3000]\\)\")",
+      "Read(//tmp/**)",
+      "Bash(curl -s 'https://web.gw.coches.net/semantic/listing/?hasPhoto=false&wwa=false&MakeIds%5B0%5D=39&ModelIds%5B0%5D=2&pageSize=3' -H 'accept: application/json' -H 'origin: https://www.coches.net' -H 'referer: https://www.coches.net/' -H 'x-adevinta-channel: web-desktop' -H 'x-schibsted-tenant: coches' -H 'user-agent: Mozilla/5.0')",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('TOP KEYS:', list\\(d.keys\\(\\)\\)\\); print\\(json.dumps\\(d, indent=2\\)[:2500]\\)\")",
+      "Bash(curl -s 'https://web.gw.coches.net/semantic/items?hasPhoto=false&wwa=false&MakeIds%5B0%5D=39&ModelIds%5B0%5D=2&pageSize=2' -H 'accept: application/json' -H 'origin: https://www.coches.net' -H 'referer: https://www.coches.net/' -H 'x-adevinta-channel: web-desktop' -H 'x-schibsted-tenant: coches' -H 'user-agent: Mozilla/5.0')",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('TOP KEYS:', list\\(d.keys\\(\\)\\)\\); print\\(json.dumps\\(d, indent=2\\)[:3500]\\)\")",
+      "Bash(curl -s -i \"https://api.coches.net/v1/announcements?MakeIds%5B0%5D=39&ModelIds%5B0%5D=2&pageSize=2\" -H 'accept: application/json, text/plain, */*' -H 'origin: https://www.coches.net' -H 'referer: https://www.coches.net/' -H 'x-adevinta-channel: web-desktop' -H 'x-schibsted-tenant: coches' -H 'user-agent: Mozilla/5.0')",
+      "Bash(curl -s \"https://www.coches.net/seat/ibiza/segunda-mano/\" -H 'user-agent: Mozilla/5.0 \\(Windows NT 10.0; Win64; x64\\) AppleWebKit/537.36 \\(KHTML, like Gecko\\) Chrome/147.0.0.0 Safari/537.36' -L)",
+      "Bash(python -c \"import scraper, ai, main, worker; print\\('OK imports'\\)\")",
+      "Bash(python -c \"import scraper, main; print\\('OK'\\)\")",
+      "Bash(python -c \"import scraper; print\\('OK'\\)\")",
+      "Bash(python -c \"import ai, scraper, main, worker, dgt, red_flags; print\\('OK'\\)\")",
+      "WebFetch(domain:console.groq.com)",
+      "Bash(python -c \"import main, ai; print\\('OK'\\)\")",
+      "Bash(python -c \"from config import USER_AGENTS; print\\(repr\\(USER_AGENTS[0]\\)\\)\")",
+      "Bash(python -c \"import main; import database; import config; print\\('OK'\\)\")"
+    ]
+  }
+}

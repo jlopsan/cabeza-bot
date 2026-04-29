@@ -1,0 +1,6 @@
+.env
+german_sniper.db
+logs/
+__pycache__/
+*.pyc
+.playwright/
