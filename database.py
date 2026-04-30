@@ -411,6 +411,56 @@ def stats_comandos_globales() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def resumen_stats() -> dict:
+    """Resumen agregado para /stats: usuarios, eventos, top comandos, top usuarios."""
+    with get_conn() as conn:
+        total_usuarios = conn.execute("SELECT COUNT(*) FROM usuarios").fetchone()[0]
+        nuevos_hoy = conn.execute(
+            "SELECT COUNT(*) FROM usuarios WHERE DATE(created_at) = DATE('now')"
+        ).fetchone()[0]
+        nuevos_7d = conn.execute(
+            "SELECT COUNT(*) FROM usuarios WHERE DATE(created_at) >= DATE('now','-7 day')"
+        ).fetchone()[0]
+        total_eventos = conn.execute("SELECT COUNT(*) FROM eventos_comando").fetchone()[0]
+        eventos_hoy = conn.execute(
+            "SELECT COUNT(*) FROM eventos_comando WHERE DATE(ts) = DATE('now')"
+        ).fetchone()[0]
+        activos_hoy = conn.execute(
+            "SELECT COUNT(DISTINCT user_id) FROM eventos_comando WHERE DATE(ts) = DATE('now')"
+        ).fetchone()[0]
+        activos_7d = conn.execute(
+            "SELECT COUNT(DISTINCT user_id) FROM eventos_comando "
+            "WHERE DATE(ts) >= DATE('now','-7 day')"
+        ).fetchone()[0]
+        top_cmd = conn.execute(
+            "SELECT comando, COUNT(*) usos, COUNT(DISTINCT user_id) usuarios "
+            "FROM eventos_comando GROUP BY comando ORDER BY usos DESC LIMIT 10"
+        ).fetchall()
+        top_users = conn.execute(
+            "SELECT u.user_id, COALESCE(NULLIF(u.username,''), u.first_name, '?') AS nombre, "
+            "COUNT(e.id) AS usos "
+            "FROM usuarios u LEFT JOIN eventos_comando e ON e.user_id = u.user_id "
+            "GROUP BY u.user_id HAVING usos > 0 ORDER BY usos DESC LIMIT 10"
+        ).fetchall()
+        ult_dias = conn.execute(
+            "SELECT DATE(ts) dia, COUNT(*) usos, COUNT(DISTINCT user_id) usuarios "
+            "FROM eventos_comando WHERE DATE(ts) >= DATE('now','-6 day') "
+            "GROUP BY dia ORDER BY dia DESC"
+        ).fetchall()
+    return {
+        "total_usuarios": total_usuarios,
+        "nuevos_hoy": nuevos_hoy,
+        "nuevos_7d": nuevos_7d,
+        "total_eventos": total_eventos,
+        "eventos_hoy": eventos_hoy,
+        "activos_hoy": activos_hoy,
+        "activos_7d": activos_7d,
+        "top_comandos": [dict(r) for r in top_cmd],
+        "top_usuarios": [dict(r) for r in top_users],
+        "ultimos_dias": [dict(r) for r in ult_dias],
+    }
+
+
 def stats_comandos_usuario(user_id: int) -> list[dict]:
     """Usos por comando de un usuario concreto."""
     with get_conn() as conn:

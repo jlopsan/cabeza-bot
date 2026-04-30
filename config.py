@@ -10,6 +10,9 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 ALLOWED_USER_IDS: list[int] = [
     int(x) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip()
 ]
+ADMIN_USER_IDS: list[int] = [
+    int(x) for x in os.getenv("ADMIN_USER_IDS", "").split(",") if x.strip()
+]
 
 # ─── SCRAPING GENERAL ────────────────────────────────────────────────────────
 USER_AGENTS = [

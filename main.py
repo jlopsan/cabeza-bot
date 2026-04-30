@@ -18,7 +18,7 @@ from telegram.ext import (
     ConversationHandler, filters, ContextTypes,
 )
 
-from config import TELEGRAM_TOKEN, TOP_RESULTS, MIN_BENEFICIO, ALLOWED_USER_IDS
+from config import TELEGRAM_TOKEN, TOP_RESULTS, MIN_BENEFICIO, ALLOWED_USER_IDS, ADMIN_USER_IDS
 from ai import (
     parsear_filtros_nl, parsear_modelo_nl, enriquecer_coches,
     texto_analisis, validar_precio_mercado, filtrar_por_extras,
@@ -31,7 +31,7 @@ from database import (
     registrar_usuario, obtener_tier,
     guardar_historico_batch,
     get_o_crear_usuario, puede_analizar, registrar_analisis, minutos_hasta_reset,
-    registrar_evento,
+    registrar_evento, resumen_stats,
 )
 from config import FREE_ANALISIS_MAX, FREE_VENTANA_HORAS
 from scraper import (
@@ -899,6 +899,46 @@ async def error_handler(update, context):
         logger.critical("   Solución: Detén todos los procesos de Python y vuelve a iniciar.")
 
 
+async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Resumen de uso. Solo admins."""
+    user = update.effective_user
+    if not ADMIN_USER_IDS or user.id not in ADMIN_USER_IDS:
+        await update.message.reply_text("⛔ No autorizado.")
+        return
+
+    s = resumen_stats()
+
+    top_cmd = "\n".join(
+        f"  • /{html.escape(r['comando'])} — {r['usos']} usos · {r['usuarios']} u"
+        for r in s["top_comandos"]
+    ) or "  (vacío)"
+
+    top_users = "\n".join(
+        f"  • <code>{r['user_id']}</code> {html.escape(str(r['nombre']))[:20]} — {r['usos']}"
+        for r in s["top_usuarios"]
+    ) or "  (vacío)"
+
+    dias = "\n".join(
+        f"  • {r['dia']} — {r['usos']} usos · {r['usuarios']} u"
+        for r in s["ultimos_dias"]
+    ) or "  (vacío)"
+
+    msg = (
+        "📊 <b>Stats globales</b>\n\n"
+        f"👥 Usuarios: <b>{s['total_usuarios']}</b>  "
+        f"(+{s['nuevos_hoy']} hoy · +{s['nuevos_7d']} 7d)\n"
+        f"⚡ Eventos: <b>{s['total_eventos']}</b>  ({s['eventos_hoy']} hoy)\n"
+        f"🟢 Activos hoy: <b>{s['activos_hoy']}</b>  ·  7d: <b>{s['activos_7d']}</b>\n\n"
+        "<b>Top comandos</b>\n"
+        f"{top_cmd}\n\n"
+        "<b>Top usuarios</b>\n"
+        f"{top_users}\n\n"
+        "<b>Últimos 7 días</b>\n"
+        f"{dias}"
+    )
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+
 def main():
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_TOKEN no configurado. Revisa tu archivo .env")
@@ -950,6 +990,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("plan", cmd_plan))
     app.add_handler(CommandHandler("analizar", cmd_analizar))
+    app.add_handler(CommandHandler("stats", cmd_stats))
     # Ocultos en beta — código intacto, solo sin handler en Telegram:
     # app.add_handler(CommandHandler("misiones", mis_misiones))
     # app.add_handler(conv_buscar)
