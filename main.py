@@ -144,8 +144,8 @@ async def cmd_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         h, m = divmod(mins, 60)
         cuando = f"{h}h {m}min" if h else f"{m} min"
 
-    if ALLOWED_USER_IDS and user.id in ALLOWED_USER_IDS:
-        cuerpo = "🔓 Acceso ilimitado (beta).\n\n"
+    if user.id in ADMIN_USER_IDS:
+        cuerpo = "🔓 Acceso ilimitado (admin).\n\n"
     else:
         cuerpo = (
             f"🔍 Análisis usados: <b>{usados}/{FREE_ANALISIS_MAX}</b>\n"
@@ -627,7 +627,10 @@ async def cmd_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── Gating freemium: 3 análisis cada FREE_VENTANA_HORAS ────────────────
     get_o_crear_usuario(user.id, user.username or "", user.first_name or "")
+    es_admin = user.id in ADMIN_USER_IDS
     puede, restantes = puede_analizar(user.id)
+    if es_admin:
+        puede, restantes = True, FREE_ANALISIS_MAX
     if not puede:
         mins = minutos_hasta_reset(user.id)
         h, m = divmod(mins, 60)
@@ -814,7 +817,8 @@ async def cmd_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
         # Registrar consumo SOLO al terminar el análisis con éxito
-        registrar_analisis(user.id)
+        if not es_admin:
+            registrar_analisis(user.id)
 
         # ── 5. Oferta opcional: preguntas vendedor + checklist ───────────────
         if contexto_qa:
