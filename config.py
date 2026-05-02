@@ -59,6 +59,11 @@ PRECIO_MEDIO_MUESTRA = 5      # N precios más baratos para el promedio
 # ─── BASE DE DATOS ───────────────────────────────────────────────────────────
 DB_PATH = os.getenv("DB_PATH", "cabeza_bot.db")
 
+# ─── IA (SambaNova - Llama 4 Maverick) ──────────────────────────────────────
+SAMBANOVA_API_KEY  = os.getenv("SAMBANOVA_API_KEY", "")
+SAMBANOVA_BASE_URL = os.getenv("SAMBANOVA_BASE_URL", "https://api.sambanova.ai/v1")
+AI_MODEL           = os.getenv("AI_MODEL", "Llama-4-Maverick-17B-128E-Instruct")
+
 # ─── TAVILY (investigación experta del coche) ───────────────────────────────
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
 TAVILY_CACHE_TTL_HOURS      = 24
@@ -118,6 +123,11 @@ MIN_BENEFICIO = 3_000
 # ─── FREEMIUM ────────────────────────────────────────────────────────────────
 FREE_ANALISIS_MAX  = int(os.getenv("FREE_ANALISIS_MAX", "3"))
 FREE_VENTANA_HORAS = int(os.getenv("FREE_VENTANA_HORAS", "3"))
+
+# ─── /ideal ──────────────────────────────────────────────────────────────────
+IDEAL_TOP_N          = int(os.getenv("IDEAL_TOP_N", "3"))
+IDEAL_CANDIDATOS_MAX = int(os.getenv("IDEAL_CANDIDATOS_MAX", "5"))
+IDEAL_KM_AÑO_MAX     = int(os.getenv("IDEAL_KM_ANO_MAX", "25000"))
 
 
 # ═════════════════════════════════════════════════════════════════════════════

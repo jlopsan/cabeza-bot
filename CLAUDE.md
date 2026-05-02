@@ -40,7 +40,7 @@ no vía web de usuario.
 - python-telegram-bot (bot UI — única interfaz de usuario)
 - playwright (scraping AutoScout24 + Coches.net headed)
 - httpx (scraping Wallapop API)
-- openai SDK apuntando a Groq (Llama 3.3 70B)
+- openai SDK apuntando a SambaNova (Llama 4 Maverick)
 - SQLite (persistencia)
 - APScheduler (worker periódico)
 - stripe (pagos — pendiente de integrar)
@@ -63,13 +63,13 @@ no vía web de usuario.
 
 ### Semana 0 — Identidad, landing, vídeo manifiesto ✅ HECHO
 ### Semana 1 — `/analizar <url>` ✅ HECHO (v4 en producción)
-### Semana 2 — Sistema freemium + `/km_check` ← SEMANA ACTUAL
-### Semana 3 — Evaluador de fiabilidad (parte 1)
-### Semana 4 — Evaluador de fiabilidad (parte 2)
-### Semana 5 — `/ideal` Recomendador (parte 1)
-### Semana 6 — `/ideal` Recomendador (parte 2)
-### Semana 7 — `/tasar` + alertas de chollos
-### Semana 8 — Web pública con endpoints del bot
+### Semana 2 — `/ideal` Recomendador ✅ HECHO
+### Semana 3 — `/comparar` Comparador
+### Semana 4 — `/tasar` Tasar coche con precio real de mercado
+### Semana 5 — `/alertas` Alertas de chollos
+### Semana 6 — `/importar_alemania`
+### Semana 7 — Web pública con endpoints del bot
+### Semana 8 — Planes de pago
 
 ## Reglas innegociables del desarrollo
 
@@ -411,7 +411,7 @@ URL → extractor regex (wallapop|coches.net)
 Variables en `.env`:
 ```
 TELEGRAM_TOKEN=...
-GROQ_API_KEY=gsk_...
+SAMBANOVA_API_KEY=...
 TAVILY_API_KEY=...
 STRIPE_API_KEY=sk_test_...     (sk_live_... en producción)
 STRIPE_PRICE_PACK=price_...

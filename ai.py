@@ -1,7 +1,7 @@
 """
-ai.py - Capa de IA usando Groq (gratis, sin tarjeta)
-Key gratis en: https://console.groq.com → API Keys
-.env: GROQ_API_KEY=gsk_...
+ai.py - Capa de IA usando SambaNova (Llama 4 Maverick).
+Key en: https://cloud.sambanova.ai → API Keys
+.env: SAMBANOVA_API_KEY=...
 """
 import os, re, json, logging, asyncio, time, html as _html
 from openai import AsyncOpenAI
@@ -12,6 +12,8 @@ from config import (
     TAVILY_DOMINIOS_ARTICULOS,
     ENABLE_VISION, VISION_MODEL, VISION_MAX_FOTOS, VISION_TIMEOUT_S,
     AI_TIMEOUT_S, ANALISIS_CACHE_TTL_S,
+    IDEAL_CANDIDATOS_MAX,
+    SAMBANOVA_API_KEY, SAMBANOVA_BASE_URL, AI_MODEL,
 )
 
 logger = logging.getLogger(__name__)
@@ -204,17 +206,84 @@ async def investigar_coche(version_info: dict, marca: str, modelo: str, anno: in
         return vacio
 
 
+# Cache: (tamaño, tramo_presupuesto) → (ts, snippets_str)
+_IDEAL_TAVILY_CACHE: dict[str, tuple[float, str]] = {}
+
+
+async def _tavily_modelos_para_perfil(perfil: dict) -> str:
+    """
+    Busca en Tavily 2 queries con el perfil del usuario para obtener
+    modelos REALES disponibles en su rango. Cacheado por (tamaño, presupuesto/2k).
+    Devuelve string con snippets formateados o vacío.
+    """
+    api_key = os.getenv("TAVILY_API_KEY", "")
+    if not api_key:
+        return ""
+
+    tamaño = perfil.get("tamaño") or ""
+    presup = perfil.get("presupuesto_max") or 0
+    if not tamaño or not presup:
+        return ""
+
+    # Clave de caché por tamaño + tramo de 2k (granularidad razonable)
+    tramo = (presup // 2000) * 2000
+    cache_key = f"{tamaño}_{tramo}"
+    ahora = time.time()
+    ttl = TAVILY_CACHE_TTL_HOURS * 3600
+    if cache_key in _IDEAL_TAVILY_CACHE:
+        ts, cached = _IDEAL_TAVILY_CACHE[cache_key]
+        if ahora - ts < ttl:
+            logger.info(f"[IDEAL_TAVILY] Cache hit: {cache_key}")
+            return cached
+
+    # Mapeo legible para queries
+    _TAM = {
+        "urbano": "coche urbano pequeño segmento A",
+        "compacto": "coche compacto segmento B",
+        "berlina": "berlina compacta segmento C",
+        "suv_compacto": "SUV compacto",
+        "suv_grande": "SUV grande 5 plazas",
+        "familiar": "coche familiar ranchera/SW",
+        "monovolumen": "monovolumen 7 plazas",
+    }
+    desc_tam = _TAM.get(tamaño, tamaño)
+
+    try:
+        from tavily import AsyncTavilyClient
+        client = AsyncTavilyClient(api_key=api_key)
+
+        q1 = f"mejor {desc_tam} segunda mano España {presup} euros qué modelo comprar"
+        q2 = f"{desc_tam} usado {presup}€ fiable comparativa modelos recomendados"
+
+        s1, s2 = await asyncio.gather(
+            _tavily_search(client, q1, None, 5),
+            _tavily_search(client, q2, None, 5),
+        )
+        resultado = (s1 + "\n" + s2).strip()
+        _IDEAL_TAVILY_CACHE[cache_key] = (ahora, resultado)
+        logger.info(f"[IDEAL_TAVILY] {cache_key}: {len(resultado.splitlines())} snippets")
+        return resultado
+    except Exception as e:
+        logger.warning(f"[IDEAL_TAVILY] Error: {e}")
+        return ""
+
+
 def _client():
     return AsyncOpenAI(
-        api_key=os.getenv("GROQ_API_KEY", ""),
-        base_url="https://api.groq.com/openai/v1",
+        api_key=SAMBANOVA_API_KEY,
+        base_url=SAMBANOVA_BASE_URL,
     )
 
-async def _llamar_ia(system: str, user: str, max_tokens: int = 3000) -> str:
+async def _llamar_ia(
+    system: str,
+    user: str,
+    max_tokens: int = 3000,
+    model: str = AI_MODEL,
+) -> str:
     try:
         resp = await asyncio.wait_for(
             _client().chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model=model,
                 max_tokens=max_tokens,
                 temperature=0.1,
                 messages=[
@@ -225,13 +294,13 @@ async def _llamar_ia(system: str, user: str, max_tokens: int = 3000) -> str:
             timeout=AI_TIMEOUT_S,
         )
         text = resp.choices[0].message.content.strip()
-        print(f"[AI RAW] {repr(text)}")
+        print(f"[AI RAW] model={model} {repr(text)}")
         return text
     except asyncio.TimeoutError:
-        logger.error(f"[AI] Timeout ({AI_TIMEOUT_S}s) en llamada a Groq")
+        logger.error(f"[AI] Timeout ({AI_TIMEOUT_S}s) model={model}")
         return ""
     except Exception as e:
-        logger.error(f"[AI] Error Groq: {e}")
+        logger.error(f"[AI] Error SambaNova model={model}: {e}")
         return ""
 
 def _limpiar_json(t: str) -> str:
@@ -239,6 +308,58 @@ def _limpiar_json(t: str) -> str:
     t = re.sub(r"\s*```$", "", t).strip()
     m = re.search(r"\{.*\}", t, re.DOTALL)
     return m.group(0) if m else t
+
+
+async def validar_anuncios_modelo(
+    marca_buscada: str,
+    modelo_buscado: str,
+    anuncios: list,
+) -> list[int]:
+    """
+    Layer 1: batch-valida que los anuncios corresponden a marca+modelo buscado.
+    Devuelve índices válidos (0-based). Fallback conservador si falla.
+    """
+    if not anuncios:
+        return []
+
+    batch = anuncios[:15]
+    lineas = []
+    for i, a in enumerate(batch):
+        titulo = (getattr(a, "titulo", "") or "").strip()
+        desc_corta = (a.descripcion or "")[:100].replace("\n", " ").strip()
+        texto = titulo or desc_corta or f"{a.marca} {a.modelo}"
+        lineas.append(f"{i}: {texto}")
+
+    objetivo = f"{marca_buscada.title()} {modelo_buscado.title()}"
+    system = (
+        f"Validador de anuncios de coches. Se buscó: '{objetivo}'. "
+        "Dado este batch (índice: texto del anuncio), devuelve SOLO un array JSON "
+        "con los índices de los anuncios que SÍ son el modelo buscado. "
+        "Si no estás seguro, inclúyelo. Solo excluye los claramente diferentes. "
+        "Responde ÚNICAMENTE con un JSON array de enteros, ej: [0,1,3]. Sin explicación."
+    )
+
+    respuesta = await _llamar_ia(
+        system, "\n".join(lineas),
+        max_tokens=60,
+    )
+
+    try:
+        m = re.search(r"\[[\d,\s]*\]", respuesta or "")
+        if not m:
+            logger.warning(f"[VALIDAR] No array en respuesta para {objetivo}: {respuesta!r}")
+            return list(range(len(batch)))
+        indices = json.loads(m.group(0))
+        validos = [int(i) for i in indices if isinstance(i, int) and 0 <= i < len(batch)]
+        if not validos:
+            return list(range(len(batch)))
+        n_drop = len(batch) - len(validos)
+        if n_drop > 0:
+            logger.info(f"[VALIDAR] {objetivo}: {len(batch)} → {len(validos)} válidos ({n_drop} descartados)")
+        return validos
+    except Exception as e:
+        logger.warning(f"[VALIDAR] Error parseando respuesta: {e}. Pass-through.")
+        return list(range(len(batch)))
 
 
 def _limpiar_texto(s: str, max_chars: int = 700) -> str:
@@ -1178,3 +1299,375 @@ async def validar_precio_mercado(marca: str, modelo: str, año: int, km: int,
         return r
     except Exception:
         return {"valido": True, "confianza": 50, "comentario": "Error validación"}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# /ideal — Recomendador de coche usado
+# ══════════════════════════════════════════════════════════════════════════════
+
+_IDEAL_HUECOS_TODOS = [
+    "presupuesto_max", "uso", "plazas_min", "tamaño",
+    "combustible", "duracion_uso", "marcas_evitar"
+]
+
+_TAMAÑOS_VALIDOS = {
+    "urbano", "compacto", "berlina",
+    "suv_compacto", "suv_grande", "familiar", "monovolumen",
+}
+
+# Mapeo duracion_uso → km_max razonable (un coche dura ~250k km bien mantenido)
+DURACION_USO_A_KM_MAX = {
+    "corta":        200_000,   # 1-3 años: cualquier coche válido
+    "media":        130_000,   # 5 años: necesita margen de vida útil
+    "larga":         80_000,   # 10+ años: bajos km para que dure
+    "primer_coche": 180_000,   # asequible, no obsesionarse con km
+}
+
+
+async def parsear_perfil_ideal(texto: str) -> dict:
+    """
+    Convierte lenguaje natural del usuario en un perfil técnico JSON.
+    Devuelve el perfil con una clave 'huecos' indicando qué preguntar aún.
+    """
+    vacio = {
+        "carrocerias": None, "presupuesto_max": None, "plazas_min": None,
+        "uso": None, "combustible": None, "etiqueta_dgt_min": None,
+        "duracion_uso": None, "km_max": None, "tamaño": None,
+        "cv_min": None, "marcas_evitar": [],
+        "huecos": list(_IDEAL_HUECOS_TODOS),
+    }
+    if not texto or not texto.strip():
+        return vacio
+
+    system = (
+        "Extrae el perfil ideal de coche usado del usuario en España. "
+        "El usuario probablemente NO sabe de coches. Interpreta lo que quiere decir. "
+        "Responde SOLO JSON puro sin backticks:\n"
+        '{"carrocerias":["suv"|"familiar"|"berlina"|"coupe"|"monovolumen"|"cabrio"|"pickup"] o null,'
+        '"presupuesto_max":int o null,'
+        '"plazas_min":int o null,'
+        '"uso":"ciudad"|"autopista"|"mixto"|"offroad" o null,'
+        '"combustible":["gasolina"|"diesel"|"hibrido"|"electrico"] o null,'
+        '"etiqueta_dgt_min":"0"|"ECO"|"C"|"B" o null,'
+        '"duracion_uso":"corta"|"media"|"larga"|"primer_coche" o null,'
+        '"km_max":int o null,'
+        '"cv_min":int o null,'
+        '"tamaño":"urbano"|"compacto"|"berlina"|"suv_compacto"|"suv_grande"|"familiar"|"monovolumen" o null,'
+        '"marcas_evitar":[],'
+        '"huecos":["presupuesto_max","uso","plazas_min","tamaño","combustible","duracion_uso","marcas_evitar"]}\n\n'
+        'Reglas de inferencia:\n'
+        '"grande"/"familiar"/"para la familia" → carrocerias=["suv","familiar","monovolumen"], plazas_min=5\n'
+        '"rápido" → cv_min=130; "muy rápido"/"deportivo" → cv_min=200\n'
+        '"ciudad"/"urbano" → uso=ciudad; "viajes"/"autopista"/"carretera" → uso=autopista\n'
+        '"ZBE"/"pegatina"/"Madrid Central"/"ECO" → etiqueta_dgt_min=ECO, combustible=[hibrido,electrico]\n'
+        '"voy mucho por ciudad"/"para ir a trabajar al centro" → uso=ciudad, '
+        'si NO menciona combustible: combustible=[hibrido,electrico]\n'
+        '"barato"/"económico" → no añadir cv_min; esperar presupuesto_max\n'
+        'Si menciona presupuesto explícito ("15000€", "máximo 20k") → presupuesto_max=ese valor\n'
+        '\nReglas duracion_uso (cuánto tiempo lo va a tener):\n'
+        '"primer coche"/"empiezo a conducir"/"recién carnet" → duracion_uso="primer_coche"\n'
+        '"que me dure"/"para muchos años"/"10 años"/"que aguante" → duracion_uso="larga"\n'
+        '"unos años"/"5 años"/"luego cambio"/"y luego vendo" → duracion_uso="media"\n'
+        '"poco tiempo"/"1-2 años"/"temporal"/"de paso" → duracion_uso="corta"\n'
+        'Solo pon km_max si el usuario menciona km explícitos ("máximo 100k km").\n'
+        '\nReglas tamaño (DECISIVO para qué modelos sugerir):\n'
+        '"primer coche"/"recién carnet" → tamaño="urbano" si presup<7000, "compacto" si 7000≤presup<11000\n'
+        '"familia"/"niños"/"sillita"/"para la familia" → tamaño="familiar" o "monovolumen" si plazas>=7\n'
+        '"SUV pequeño"/"crossover" → tamaño="suv_compacto"\n'
+        '"SUV grande"/"todoterreno"/"4x4" → tamaño="suv_grande"\n'
+        '"berlina"/"sedán"/"tipo Octavia/Golf" → tamaño="berlina"\n'
+        '"ciudad"/"para aparcar"/"pequeño"/"urbano" → tamaño="urbano"\n'
+        'Si NO hay pistas claras de tamaño, déjalo null (se preguntará).\n'
+        '\nhuecos: lista SOLO los campos null/vacíos, en orden: '
+        'presupuesto_max, uso, plazas_min, tamaño, combustible, duracion_uso, marcas_evitar'
+    )
+    respuesta = await _llamar_ia(system, texto.strip()[:400], max_tokens=300)
+    if not respuesta:
+        return vacio
+    try:
+        raw = json.loads(_limpiar_json(respuesta))
+
+        def _int(v):
+            try:
+                n = int(v)
+                return n if n > 0 else None
+            except (TypeError, ValueError):
+                return None
+
+        duracion = raw.get("duracion_uso") or None
+        if duracion not in DURACION_USO_A_KM_MAX:
+            duracion = None
+        km_max_raw = _int(raw.get("km_max"))
+        # Si hay duracion pero no km explícito, derivar
+        km_final = km_max_raw or (DURACION_USO_A_KM_MAX.get(duracion) if duracion else None)
+
+        tamaño = raw.get("tamaño") or None
+        if tamaño not in _TAMAÑOS_VALIDOS:
+            tamaño = None
+
+        perfil = {
+            "carrocerias":     raw.get("carrocerias") or None,
+            "presupuesto_max": _int(raw.get("presupuesto_max")),
+            "plazas_min":      _int(raw.get("plazas_min")),
+            "uso":             raw.get("uso") or None,
+            "combustible":     raw.get("combustible") or None,
+            "etiqueta_dgt_min": raw.get("etiqueta_dgt_min") or None,
+            "duracion_uso":    duracion,
+            "km_max":          km_final,
+            "tamaño":          tamaño,
+            "cv_min":          _int(raw.get("cv_min")),
+            "marcas_evitar":   raw.get("marcas_evitar") or [],
+        }
+
+        # Inferencia automática de tamaño cuando NO viene del LLM pero hay pistas fuertes
+        if perfil["tamaño"] is None:
+            plazas = perfil.get("plazas_min") or 0
+            presup = perfil.get("presupuesto_max") or 0
+            carro  = perfil.get("carrocerias") or []
+            duracion_p = perfil.get("duracion_uso")
+            if plazas >= 7 or "monovolumen" in carro:
+                perfil["tamaño"] = "monovolumen"
+            elif "familiar" in carro:
+                perfil["tamaño"] = "familiar"
+            elif "suv" in carro:
+                perfil["tamaño"] = "suv_grande" if plazas >= 7 else "suv_compacto"
+            elif duracion_p == "primer_coche" and 0 < presup < 7000:
+                perfil["tamaño"] = "urbano"
+            elif duracion_p == "primer_coche" and 7000 <= presup < 11000:
+                perfil["tamaño"] = "compacto"
+
+        huecos_raw = raw.get("huecos") or _IDEAL_HUECOS_TODOS
+        # Recalcular: si tras la inferencia tamaño quedó fijado, sacarlo de huecos
+        huecos = [h for h in _IDEAL_HUECOS_TODOS if h in huecos_raw]
+        if perfil["tamaño"] is not None and "tamaño" in huecos:
+            huecos.remove("tamaño")
+        elif perfil["tamaño"] is None and "tamaño" not in huecos:
+            huecos.append("tamaño")
+        perfil["huecos"] = huecos
+
+        logger.info(f"[IDEAL] Perfil parseado: {perfil}")
+        return perfil
+    except Exception as e:
+        logger.warning(f"[IDEAL] Error parseando perfil: {e} — raw: {respuesta!r}")
+        return vacio
+
+
+async def sugerir_modelos_candidatos(
+    perfil: dict,
+    evitar: list[str] | None = None,
+    feedback: str = "",
+) -> list[dict]:
+    """
+    Dado un perfil de comprador, devuelve 3-5 modelos concretos disponibles
+    en el mercado de segunda mano español.
+    Retorna list[{marca, modelo, año_min, año_max, motivo}].
+
+    `evitar`: lista "marca modelo" rechazados en intentos previos (no repetir).
+    `feedback`: mensaje del validador con qué problema corregir.
+    """
+    # Buscar en Tavily modelos reales del mercado para este perfil (cacheado)
+    tavily_ctx = await _tavily_modelos_para_perfil(perfil)
+
+    system = (
+        "Eres experto en coches usados en España. Sugiere 3-5 modelos concretos "
+        "abundantes en Wallapop y coches.net. Responde SOLO JSON puro:\n"
+        '[{"marca":"...","modelo":"...","año_min":int,"año_max":int,"motivo":"..."}]\n\n'
+
+        "═══ PRINCIPIO FUNDAMENTAL ═══\n"
+        "AJUSTA EL AÑO al presupuesto+tamaño. Si el presupuesto solo da para un coche viejo, "
+        "sugiere uno viejo. NUNCA sugieras un modelo nuevo si el presupuesto no llega. "
+        "Mejor un Hyundai ix35 2011 que un Tucson 2020 imposible de pagar.\n"
+        "Mediana del modelo+año debe estar al 70-100% del presupuesto.\n\n"
+
+        "═══ REGLAS ═══\n"
+        "- Si tamaño está fijado en perfil, SOLO sugerir de ese tamaño.\n"
+        "- Prioriza fiabilidad: Toyota, Kia, Mazda, Skoda, Hyundai, Honda, Lexus.\n"
+        "- duracion_uso=larga: SOLO Toyota, Lexus, Mazda, Honda, Subaru.\n"
+        "- combustible=[hibrido,electrico] o etiqueta_dgt_min=ECO: solo modelos con esa motorización REAL "
+        "(Toyota Corolla HV, Yaris HV, Kia Niro HV, Hyundai Ioniq, Auris HV, Renault Zoe, Nissan Leaf). "
+        "Si el segmento+presupuesto NO admite hybrid moderno (ej: SUV grande con 8k), IGNORA el filtro hybrid "
+        "y sugiere diésel/gasolina del segmento — NUNCA inventes hybrids inexistentes.\n"
+        "- plazas_min>=7: solo monovolúmenes/SUV grandes 7p (Alhambra, Sharan, Touran, S-Max, Carnival).\n"
+        "- marcas_evitar: NUNCA esas marcas.\n"
+        f"- Devuelve entre 3 y {IDEAL_CANDIDATOS_MAX} modelos.\n"
+        "- motivo: 1 frase CONCRETA (no 'buen coche', sino 'fiable y barato de seguro')."
+    )
+
+    if tavily_ctx:
+        system += (
+            "\n\n═══ CONTEXTO REAL DEL MERCADO (búsqueda en internet hoy) ═══\n"
+            "Usa estos snippets como PRINCIPAL fuente de qué modelos son razonables "
+            "para el presupuesto del usuario. Tienen información real de precios y modelos "
+            "actuales en venta. Confía más en estos datos que en tu memoria.\n\n"
+            f"{tavily_ctx[:3000]}"
+        )
+
+    if evitar:
+        system += f"\n\n═══ NO SUGIERAS estos modelos (rechazados): {', '.join(evitar)} ═══"
+    if feedback:
+        system += (
+            f"\n\n═══ FEEDBACK del validador: {feedback} ═══\n"
+            "Corrige el problema. Sugiere modelos diferentes que sí encajen."
+        )
+    perfil_txt = json.dumps(
+        {k: v for k, v in perfil.items() if k not in ("huecos",) and v is not None and v != []},
+        ensure_ascii=False,
+    )
+    respuesta = await _llamar_ia(system, perfil_txt, max_tokens=500)
+    if not respuesta:
+        return []
+    try:
+        m = re.search(r"\[.*\]", respuesta, re.DOTALL)
+        if not m:
+            return []
+        candidatos = json.loads(m.group(0))
+        result = []
+        for c in candidatos:
+            if not c.get("marca") or not c.get("modelo"):
+                continue
+            result.append({
+                "marca":    str(c["marca"]).lower().strip(),
+                "modelo":   str(c["modelo"]).lower().strip(),
+                "año_min":  int(c.get("año_min", 2015)),
+                "año_max":  int(c.get("año_max", 2022)),
+                "motivo":   str(c.get("motivo", "")),
+            })
+        nombres = [f"{c['marca']} {c['modelo']}" for c in result]
+        logger.info(f"[IDEAL] Candidatos: {nombres}")
+        return result[:IDEAL_CANDIDATOS_MAX]
+    except Exception as e:
+        logger.warning(f"[IDEAL] Error candidatos: {e}")
+        return []
+
+
+async def validar_candidatos_perfil(
+    perfil: dict,
+    candidatos: list[dict],
+) -> dict:
+    """
+    Verifica que los candidatos sugeridos encajan con el perfil.
+    Devuelve {"ok": bool, "problema": str, "modelos_a_evitar": [str]}.
+    Conservador: en fallo retorna ok=True.
+    """
+    if not candidatos:
+        return {"ok": True, "problema": "", "modelos_a_evitar": []}
+
+    perfil_min = {
+        k: v for k, v in perfil.items()
+        if k in ("presupuesto_max", "plazas_min", "tamaño", "duracion_uso",
+                 "uso", "combustible", "etiqueta_dgt_min", "marcas_evitar")
+        and v is not None and v != []
+    }
+    cand_txt = "\n".join(
+        f"- {c['marca'].title()} {c['modelo'].title()} ({c['año_min']}-{c['año_max']})"
+        for c in candidatos
+    )
+
+    system = (
+        "Eres verificador conservador de recomendaciones de coches usados en España. "
+        "Tu trabajo es SOLO detectar errores graves y obvios, no opinar sobre gustos. "
+        "Por defecto, ok=true. Solo marca ok=false si encuentras un error CLARO.\n\n"
+        "REFERENCIAS DE SEGMENTO (ten esto MUY claro antes de validar):\n"
+        "- Urbanos (segmento A): Kia Picanto, Hyundai i10, Toyota Aygo, Citroën C1, "
+        "  Peugeot 107/108, Renault Twingo, VW Up!, Skoda Citigo, Seat Mii, Fiat Panda, "
+        "  Dacia Sandero. NO son SUV, NO son segmento C/D.\n"
+        "- Compactos (segmento B): Seat Ibiza, VW Polo, Skoda Fabia, Hyundai i20, "
+        "  Toyota Yaris, Mazda 2, Ford Fiesta, Renault Clio, Peugeot 208, Opel Corsa.\n"
+        "- Berlinas (C/D): Octavia, Leon, Golf, i30, Ceed, Corolla, Mazda 3, Focus.\n"
+        "- SUVs: Tucson, Sportage, Qashqai, Ateca, Karoq, T-Roc, Kuga, 3008, CX-5, RAV4.\n\n"
+        "Marca ok=false SOLO en estos casos OBVIOS:\n"
+        "(a) Marca aparece en marcas_evitar del perfil.\n"
+        "(b) Modelo claramente fuera de presupuesto (ej: Tucson 2020 con presup=6000€).\n"
+        "(c) Modelo claramente del segmento equivocado (ej: tamaño=urbano y sugieren un SUV).\n"
+        "(d) plazas_min=7 y sugieren un coche de 5 plazas claramente.\n\n"
+        "Si dudas, ok=true. NUNCA marques ok=false con TODOS los candidatos a evitar — "
+        "eso es señal de error tuyo, no de los candidatos.\n\n"
+        "Responde SOLO JSON: "
+        '{"ok":true|false,"problema":"frase concreta y específica","modelos_a_evitar":["Marca Modelo",...]}'
+    )
+    user = f"PERFIL: {json.dumps(perfil_min, ensure_ascii=False)}\n\nMODELOS:\n{cand_txt}"
+
+    respuesta = await _llamar_ia(system, user, max_tokens=200)
+    if not respuesta:
+        return {"ok": True, "problema": "", "modelos_a_evitar": []}
+    try:
+        data = json.loads(_limpiar_json(respuesta))
+        ok = bool(data.get("ok", True))
+        evitar = [str(m).lower() for m in (data.get("modelos_a_evitar") or [])]
+        problema = str(data.get("problema", ""))[:200]
+        # Salvaguarda: si rechaza TODOS los candidatos, es señal de alucinación del 8B
+        if not ok and len(evitar) >= len(candidatos):
+            logger.warning(
+                f"[IDEAL] Validador rechaza el 100% ({len(evitar)}/{len(candidatos)}) "
+                f"— probable alucinación, ignorando. Problema: {problema}"
+            )
+            return {"ok": True, "problema": "", "modelos_a_evitar": []}
+        return {"ok": ok, "problema": problema, "modelos_a_evitar": evitar}
+    except Exception as e:
+        logger.warning(f"[IDEAL] Error validar_candidatos_perfil: {e} — raw: {respuesta!r}")
+        return {"ok": True, "problema": "", "modelos_a_evitar": []}
+
+
+async def generar_veredicto_ideal(perfil: dict, top3: list, medianas: dict) -> str:
+    """
+    Genera HTML Telegram con el resumen del Top 3 del /ideal.
+    top3: list[Anuncio]; medianas: {"marca modelo": float}
+    """
+    if not top3:
+        return "😔 No encontré anuncios que encajen con tu perfil."
+
+    def _safe(s: str, max_len: int = 60) -> str:
+        """Limita longitud y elimina contenido inyectado en campos de anuncios."""
+        return re.sub(r"[<>\[\]{}]", "", str(s or ""))[:max_len].strip()
+
+    anuncios_txt = []
+    for i, a in enumerate(top3, 1):
+        mediana = next((v for k, v in medianas.items() if a.marca.lower() in k and a.modelo.lower() in k), 0)
+        if mediana > 0:
+            diff_pct = round((mediana - a.precio) / mediana * 100)
+            precio_txt = f"{a.precio:,.0f}€ ({'+' if diff_pct > 0 else ''}{diff_pct}% vs mediana)"
+        else:
+            precio_txt = f"{a.precio:,.0f}€"
+        anuncios_txt.append(
+            f"#{i}: {_safe(a.marca).title()} {_safe(a.modelo).upper()} {a.año} "
+            f"| {a.km:,} km | {precio_txt} | {_safe(a.provincia) or 'España'}"
+        )
+
+    perfil_txt = json.dumps(
+        {k: v for k, v in perfil.items() if k not in ("huecos",) and v is not None and v != []},
+        ensure_ascii=False,
+    )
+    system = (
+        "Eres experto en coches usados en España con 20 años de experiencia. "
+        "El usuario YA VE precio, km y año — NO los repitas. "
+        "Tu valor: lo que el usuario NO sabe sobre estos modelos. "
+        "Responde en HTML Telegram (<b>, <i>, saltos de línea). Máximo 850 chars.\n\n"
+        "ESTRUCTURA OBLIGATORIA (3 bloques, sin encabezados extra):\n\n"
+        "<b>🔬 Comparativa</b>\n"
+        "Por cada modelo (#1, #2, #3): 1 frase con su punto fuerte real "
+        "Y su punto débil conocido. Sé MUY concreto: no 'buena fiabilidad' sino "
+        "'motor 2.0 TDI con problemas de inyectores pasados los 150k' o "
+        "'caja CVT cara de reparar en talleres no oficiales'. "
+        "Si es híbrido, menciona batería. Si es diésel antiguo, menciona FAP/DPF.\n\n"
+        "<b>🏆 Mi elección</b>\n"
+        "1-2 frases. Qué modelo elegirías y por qué concreto "
+        "(no 'mejor equilibrio' — sé específico: motor, uso, coste de mantenimiento).\n\n"
+        "<b>🔍 Al verlo revisar</b>\n"
+        "2-3 puntos específicos para el modelo elegido "
+        "(no genéricos: 'revisar cadena distribución en motor X', "
+        "'comprobar historial cambios aceite', 'verificar que turbo no humea en frío').\n\n"
+        "Sin saludos. Sin repetir datos. Solo conocimiento del dominio."
+    )
+    user_msg = f"PERFIL COMPRADOR:\n{perfil_txt}\n\nTOP 3 ENCONTRADOS:\n" + "\n".join(anuncios_txt)
+    resultado = await _llamar_ia(system, user_msg, max_tokens=750)
+    if resultado:
+        return resultado
+    # Fallback sin IA
+    lineas = []
+    for i, a in enumerate(top3):
+        lineas.append(
+            f"{'🥇🥈🥉'[i]} <b>{_html.escape(a.marca.title())} "
+            f"{_html.escape(a.modelo.upper())}</b> {a.año} · "
+            f"{a.km:,} km · <b>{a.precio:,.0f}€</b>"
+        )
+    return "\n".join(lineas)

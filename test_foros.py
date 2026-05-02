@@ -50,9 +50,9 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
     load_dotenv()
     
-    if not os.getenv("GROQ_API_KEY"):
-        print("❌ Error: GROQ_API_KEY no configurada en .env")
-        print("   Consigue una API key gratis en: https://console.groq.com")
+    if not os.getenv("SAMBANOVA_API_KEY"):
+        print("❌ Error: SAMBANOVA_API_KEY no configurada en .env")
+        print("   Consigue una API key en: https://cloud.sambanova.ai")
         sys.exit(1)
     
     asyncio.run(test_buscar_problemas())

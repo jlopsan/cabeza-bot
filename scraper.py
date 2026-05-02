@@ -1088,15 +1088,16 @@ class ScraperWallapop:
     async def buscar_items(
         self, keywords: str, año: int, km: int, n: int = 30,
         km_tolerancia: int = 20_000, año_tolerancia: int = 1,
+        order_by: str = "newest",
     ) -> list:
         """
         Busca anuncios en Wallapop y devuelve lista de Anuncio.
-        Usa order_by=newest para evitar listings con precio=0 de concesionarios.
+        order_by: "newest" (default) o "price_low_to_high" para sondear baratos.
         """
         params = {
             "keywords": keywords, "source": "search_box",
             "latitude": WALLAPOP_LATITUDE, "longitude": WALLAPOP_LONGITUDE,
-            "distance": WALLAPOP_DISTANCE, "order_by": "newest",
+            "distance": WALLAPOP_DISTANCE, "order_by": order_by,
             "category_id": 100, "section_type": "organic_search_results",
             "items_count": n,
         }
@@ -1206,6 +1207,8 @@ class ScraperWallapop:
         cv = ta.get("horsepower") or ta.get("power") or cars.get("horsepower") or ""
         motor = f"{engine} {cv}cv".strip(" cv") if engine or cv else ""
 
+        titulo = str(content.get("title") or "").strip()[:200]
+
         return Anuncio(
             item_id=item_id,
             fuente="wallapop",
@@ -1219,6 +1222,7 @@ class ScraperWallapop:
             url=url,
             foto=foto,
             motor=motor,
+            titulo=titulo,
             fotos=fotos,
             capturado_at=_dt.now(_tz.utc).isoformat(),
         )
@@ -1713,6 +1717,7 @@ class ScraperCochesNet:
             url=href,
             foto=foto,
             motor="",
+            titulo=desc[:200],
             capturado_at=_dt.now(_tz.utc).isoformat(),
         )
 
@@ -1930,6 +1935,28 @@ async def buscar_comparables_wallapop(
         keywords = _normalizar_keywords_es(marca, modelo)
     logger.info(f"[ES] Buscando comparables: '{keywords}' año={año} km={km}")
     return await ScraperWallapop().buscar_items(keywords, año, km, n=n)
+
+
+async def sondear_precio_modelo(
+    marca: str, modelo: str, n: int = 5,
+) -> list[float]:
+    """
+    Devuelve los N precios más baratos del modelo en Wallapop, ordenados ASC.
+    Sondeo ligero para saber si un modelo entra en presupuesto antes de hacer
+    el scraping completo. Si falla o no hay resultados, devuelve [].
+    """
+    keywords = f"{marca.strip().title()} {modelo.strip().title()}"
+    try:
+        items = await ScraperWallapop().buscar_items(
+            keywords, año=0, km=0, n=n,
+            order_by="price_low_to_high",
+        )
+        precios = sorted([a.precio for a in items if a.precio > 0])
+        logger.info(f"[SONDEO] {keywords}: {len(precios)} precios, min={precios[0] if precios else 0:.0f}€")
+        return precios
+    except Exception as e:
+        logger.warning(f"[SONDEO] {keywords} falló: {e}")
+        return []
 
 
 # ════════════════════════════════════════════════════════════════════════════

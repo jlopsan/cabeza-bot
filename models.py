@@ -16,6 +16,7 @@ class Anuncio:
     url: str
     foto: str = ""
     motor: str = ""
+    titulo: str = ""
     fotos: list[str] = field(default_factory=list)
     capturado_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
 
