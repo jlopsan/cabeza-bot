@@ -22,6 +22,9 @@ from telegram.ext import (
 )
 
 from config import TELEGRAM_TOKEN, TOP_RESULTS, MIN_BENEFICIO, ALLOWED_USER_IDS, ADMIN_USER_IDS
+from config import IDEAL_TOP_N, IDEAL_KM_AÑO_MAX
+from config import STRIPE_API_KEY, STRIPE_PRICE_PACK, STRIPE_PRICE_PRO
+from permisos import requiere_acceso
 from ai import (
     parsear_filtros_nl, parsear_modelo_nl, enriquecer_coches,
     texto_analisis, validar_precio_mercado, filtrar_por_extras,
@@ -32,7 +35,7 @@ from ai import (
 from database import (
     init_db, crear_mision, eliminar_mision,
     obtener_misiones_usuario, pausar_mision, activar_mision,
-    registrar_usuario, obtener_tier,
+    registrar_usuario, obtener_tier, obtener_usuario,
     guardar_historico_batch,
     get_o_crear_usuario, puede_analizar, registrar_analisis, minutos_hasta_reset,
     registrar_evento, resumen_stats,
@@ -760,9 +763,6 @@ async def _core_analisis(url: str, source_msg, ctx, es_admin: bool, user_id: int
             parse_mode="HTML", disable_web_page_preview=True,
         )
 
-        if not es_admin:
-            registrar_analisis(user_id)
-
         if contexto_qa:
             ctx.user_data["analisis_qa_ctx"] = contexto_qa
             teclado = InlineKeyboardMarkup([[
@@ -788,6 +788,7 @@ async def _core_analisis(url: str, source_msg, ctx, es_admin: bool, user_id: int
 # /analizar <url> — semana 1
 # ════════════════════════════════════════════════════════════════════════════
 
+@requiere_acceso("/analizar")
 async def cmd_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     allowed, _tier = _check_access(user.id, user.username or "")
@@ -795,32 +796,7 @@ async def cmd_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ No tienes acceso a este bot.")
         return
 
-    get_o_crear_usuario(user.id, user.username or "", user.first_name or "")
     es_admin = user.id in ADMIN_USER_IDS
-    puede, restantes = puede_analizar(user.id)
-    if es_admin:
-        puede, restantes = True, FREE_ANALISIS_MAX
-    if not puede:
-        mins = minutos_hasta_reset(user.id)
-        h, m = divmod(mins, 60)
-        cuando = f"{h}h {m}min" if h else f"{m} min"
-        await update.message.reply_text(
-            f"⛔ <b>Has usado tus {FREE_ANALISIS_MAX} análisis gratuitos.</b>\n\n"
-            "Cada análisis cuesta dinero real (scraping + IA). "
-            "Por eso hay un tope mientras estoy en beta — si no, el bot se "
-            "queda sin gasolina y no puedo mantenerlo abierto.\n\n"
-            f"⏳ Tu límite se resetea en <b>{cuando}</b>.\n\n"
-            "🚀 Pronto podrás desbloquear <b>análisis ilimitados</b> "
-            "por una suscripción mensual. Estoy terminándolo.",
-            parse_mode="HTML",
-        )
-        return
-    if restantes == 1:
-        await update.message.reply_text(
-            f"ℹ️ Te queda <b>1 análisis</b> en esta ventana de "
-            f"{FREE_VENTANA_HORAS}h.",
-            parse_mode="HTML",
-        )
 
     texto = update.message.text or ""
     url_match = _re.search(
@@ -1680,6 +1656,45 @@ async def callback_ideal_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     await _core_analisis(url, query.message, ctx, es_admin, user.id)
 
 
+async def callback_ideal_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Callback: pulsar Analizar #N en el resultado de /ideal."""
+    query = update.callback_query
+    await query.answer()
+
+    partes = (query.data or "").split(":")
+    if len(partes) < 2:
+        return
+    try:
+        idx = int(partes[1])
+    except ValueError:
+        return
+    urls = ctx.user_data.get("ideal_urls", [])
+    if idx >= len(urls):
+        await query.message.reply_text("⚠️ No encontré la URL del anuncio.")
+        return
+
+    url  = urls[idx]
+    user = update.effective_user
+
+    es_admin = user.id in ADMIN_USER_IDS
+    puede, _ = puede_analizar(user.id)
+    if es_admin:
+        puede = True
+    if not puede:
+        mins = minutos_hasta_reset(user.id)
+        h, m = divmod(mins, 60)
+        cuando = f"{h}h {m}min" if h else f"{m} min"
+        await query.message.reply_text(
+            f"⛔ <b>Has agotado tus análisis gratuitos.</b>\n"
+            f"⏳ Reset en {cuando}.",
+            parse_mode="HTML",
+        )
+        return
+
+    await _core_analisis(url, query.message, ctx, es_admin, user.id)
+
+
+@requiere_acceso("/ideal", registrar=False)
 async def cmd_ideal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     allowed, _tier = _check_access(user.id, user.username or "")
@@ -1687,21 +1702,7 @@ async def cmd_ideal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ No tienes acceso a este bot.")
         return ConversationHandler.END
 
-    get_o_crear_usuario(user.id, user.username or "", user.first_name or "")
     es_admin = user.id in ADMIN_USER_IDS
-    puede, restantes = puede_analizar(user.id)
-    if es_admin:
-        puede, restantes = True, FREE_ANALISIS_MAX
-    if not puede:
-        mins = minutos_hasta_reset(user.id)
-        h, m = divmod(mins, 60)
-        cuando = f"{h}h {m}min" if h else f"{m} min"
-        await update.message.reply_text(
-            f"⛔ <b>Has usado tus {FREE_ANALISIS_MAX} análisis gratuitos.</b>\n\n"
-            f"⏳ Tu límite se resetea en <b>{cuando}</b>.",
-            parse_mode="HTML",
-        )
-        return ConversationHandler.END
 
     # Limpiar estado anterior
     for k in [k for k in ctx.user_data if k.startswith("ideal_") or k == "hueco_actual"]:
@@ -1746,6 +1747,39 @@ async def cmd_ideal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["ideal_huecos"] = list(perfil.get("huecos", _IDEAL_HUECOS_ORDEN))
 
     return await _ideal_avanzar(update.message, ctx)
+
+
+async def callback_ideal_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Callback para los botones 'Analizar #N' del resultado /ideal."""
+    query = update.callback_query
+    await query.answer()
+
+    partes = (query.data or "").split(":")
+    if len(partes) < 2:
+        return
+    idx = int(partes[1])
+    urls = ctx.user_data.get("ideal_urls", [])
+    if idx >= len(urls):
+        await query.edit_message_text("⚠️ No encontré la URL del anuncio.")
+        return
+
+    url  = urls[idx]
+    user = update.effective_user
+
+    get_o_crear_usuario(user.id, user.username or "", user.first_name or "")
+    es_admin = user.id in ADMIN_USER_IDS
+    puede, restantes = puede_analizar(user.id)
+    if es_admin:
+        puede = True
+    if not puede:
+        from permisos import _construir_info, _enviar_paywall
+        info = _construir_info(user.id, puede, restantes)
+        await _enviar_paywall(update, info, "/analizar")
+        return
+
+    await _core_analisis(url, query.message, ctx, es_admin, user.id)
+    if not es_admin:
+        registrar_analisis(user.id)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1840,6 +1874,58 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="HTML")
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# Callback: botones de pago (paywall → Stripe Checkout)
+# ════════════════════════════════════════════════════════════════════════════
+
+async def callback_pago(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    import stripe
+    stripe.api_key = STRIPE_API_KEY
+
+    es_pack  = query.data == "pagar_pack"
+    price_id = STRIPE_PRICE_PACK if es_pack else STRIPE_PRICE_PRO
+    mode     = "payment" if es_pack else "subscription"
+
+    if not price_id:
+        await query.message.reply_text(
+            "⚠️ Los pagos todavía no están activados. "
+            "Escríbeme a juanloperasanchez@gmail.com y te lo resuelvo."
+        )
+        return
+
+    try:
+        session = stripe.checkout.Session.create(
+            payment_method_types=["card"],
+            line_items=[{"price": price_id, "quantity": 1}],
+            mode=mode,
+            success_url="https://juanlopera.es?pago=ok",
+            cancel_url="https://juanlopera.es",
+            metadata={"telegram_user_id": str(query.from_user.id)},
+            subscription_data=(
+                {"metadata": {"telegram_user_id": str(query.from_user.id)}}
+                if mode == "subscription" else None
+            ),
+            locale="es",
+            expires_at=int(time.time()) + 1800,
+        )
+        await query.message.reply_text(
+            f"🔗 <b>Completa el pago aquí:</b>\n\n{session.url}\n\n"
+            "Cuando pagues el bot se activa automáticamente.\n"
+            "<i>El enlace expira en 30 minutos.</i>",
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        logger.error(f"[PAGO] Error Stripe: {e}")
+        await query.message.reply_text(
+            "⚠️ Error generando el enlace de pago. "
+            "Escríbeme a juanloperasanchez@gmail.com y lo resuelvo."
+        )
+
+
 def main():
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_TOKEN no configurado. Revisa tu archivo .env")
@@ -1913,7 +1999,8 @@ def main():
     # app.add_handler(conv_calcular)
     # app.add_handler(CallbackQueryHandler(callback_misiones, pattern=r"^(pausar|activar|eliminar)_\d+$"))
     app.add_handler(CallbackQueryHandler(callback_qa, pattern=r"^qa:(si|no)$"))
-    
+    app.add_handler(CallbackQueryHandler(callback_pago, pattern=r"^pagar_(pack|pro)$"))
+
     # Manejador global de errores
     app.add_error_handler(error_handler)
 

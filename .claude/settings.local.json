@@ -7,7 +7,11 @@
       "Bash(python -c \":*)",
       "Bash(python -c \"import models; import ast; ast.parse\\(open\\('main.py'\\).read\\(\\)\\); ast.parse\\(open\\('scraper.py'\\).read\\(\\)\\); ast.parse\\(open\\('ai.py'\\).read\\(\\)\\); ast.parse\\(open\\('database.py'\\).read\\(\\)\\); print\\('OK - sin errores de sintaxis'\\)\")",
       "Bash(python -c ' *)",
-      "Bash(python -c \"from config import DB_PATH; print\\('DB_PATH:', DB_PATH\\)\")"
+      "Bash(python -c \"from config import DB_PATH; print\\('DB_PATH:', DB_PATH\\)\")",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\0021746\\\\Documents\\\\Personal\\\\cabeza-bot\" -Recurse)",
+      "Bash(Select-Object FullName)",
+      "PowerShell(head -50)",
+      "Bash(python -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) or print\\(f'{f} OK'\\) for f in ['database.py','config.py','permisos.py','webhook.py']]\")"
     ]
   }
 }
