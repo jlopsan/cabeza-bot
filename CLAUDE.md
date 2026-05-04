@@ -58,18 +58,20 @@ no vía web de usuario.
 - `dgt.py`: etiqueta DGT + ZBE determinista
 - `red_flags.py`: 5 reglas deterministas de detección de fraude
 - `webhook.py`: servidor FastAPI mínimo SOLO para recibir webhooks de Stripe
+- `permisos.py`: decorator `@requiere_acceso(comando)` y mapa `COSTE_COMANDO`
 
 ## Hoja de ruta: 8 semanas
 
 ### Semana 0 — Identidad, landing, vídeo manifiesto ✅ HECHO
 ### Semana 1 — `/analizar <url>` ✅ HECHO (v4 en producción)
 ### Semana 2 — `/ideal` Recomendador ✅ HECHO
-### Semana 3 — `/comparar` Comparador
-### Semana 4 — `/tasar` Tasar coche con precio real de mercado
-### Semana 5 — `/alertas` Alertas de chollos
-### Semana 6 — `/importar_alemania`
-### Semana 7 — Web pública con endpoints del bot
-### Semana 8 — Planes de pago
+### Semana 3 — Sistema freemium con Stripe (TAREA ACTUAL)
+### Semana 4 — `/comparar` Comparador
+### Semana 5 — `/tasar` Tasar coche con precio real de mercado
+### Semana 6 — `/alertas` Alertas de chollos
+### Semana 7 — `/importar_alemania` (puerto del /buscar antiguo)
+### Semana 8 — Web pública con endpoints del bot
+### Semana 9-10 — Telegram Stars como método de pago secundario (opcional)
 
 ## Reglas innegociables del desarrollo
 
@@ -86,258 +88,115 @@ no vía web de usuario.
 
 ---
 
-## TAREA ACTUAL: Sistema freemium (Semana 2, prioridad máxima)
+## SISTEMA FREEMIUM — Plan A (implementado, Semana 3) ✅
 
-El bot tiene que estar en producción con límites de uso y opción de pago
-antes del próximo vídeo. La gente que vea el vídeo debe poder probarlo
-gratis un número limitado de veces y luego pagar para seguir.
-
-### Modelo de negocio
+### Modelo de negocio definitivo
 
 ```
-Plan FREE:   3 análisis totales (no por día — para siempre)
-Plan PAID:   20 análisis por 4.90€ (pago único, se suman al contador)
-Plan PRO:    Ilimitado por 9.90€/mes (suscripción mensual)
+Plan FREE:   3 acciones/día (reset medianoche UTC, combinadas entre todos los comandos)
+Plan PAID:   30 acciones por 4.90€  (pago único, sin caducidad, se acumulan)
+Plan PRO:    Ilimitado por 9.90€/mes (suscripción recurrente)
 ```
 
-### Tablas SQLite nuevas en `database.py`
+**Por qué estos números:**
+- 3 al día (no 3 cada 3h): el free anterior permitía 24/día en la práctica.
+  "Al día" es más simple de comunicar y genera retención (el user vuelve mañana).
+- 30 en pack (no 20): cubre el ciclo completo de compra (20-40 anuncios en 2-4 semanas).
+  Sin caducidad: quien compra coche cada 3 años no quiere que le caduquen créditos.
+- `/ideal` gratis en free: es la killer feature. Se vira, sale en vídeos, crea efecto WOW.
+  Cuando haya señal de demanda premium, se sube a paid/pro sin tocar BD ni decorator.
+- Precios sub-5€ y sub-10€: psicología de precio, funcionan.
 
-Añadir a `init_db()` sin tocar las tablas existentes:
+### Diseño técnico (implementado)
 
+**BD: créditos unificados** — tabla `usuarios` con dos columnas nuevas:
 ```sql
-CREATE TABLE IF NOT EXISTS usuarios (
-    user_id         INTEGER PRIMARY KEY,
-    username        TEXT    DEFAULT '',
-    first_name      TEXT    DEFAULT '',
-    plan            TEXT    DEFAULT 'free',  -- 'free' | 'paid' | 'pro'
-    analisis_free   INTEGER DEFAULT 0,       -- usados del plan free (max 3)
-    analisis_mes    INTEGER DEFAULT 0,       -- usados este mes (pro)
-    analisis_pack   INTEGER DEFAULT 0,       -- usados del pack paid (max 20)
-    mes_actual      TEXT    DEFAULT '',      -- 'YYYY-MM' para reset mensual pro
-    created_at      TEXT,
-    updated_at      TEXT
-);
-
-CREATE TABLE IF NOT EXISTS pagos (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id     INTEGER NOT NULL,
-    stripe_id   TEXT,                        -- checkout session ID de Stripe
-    concepto    TEXT,                        -- 'pack_20' | 'pro_mes'
-    importe     REAL,
-    estado      TEXT    DEFAULT 'pendiente', -- 'pendiente' | 'completado'
-    created_at  TEXT
-);
+creditos_disponibles  INTEGER DEFAULT 3   -- se descuenta con cada acción
+ultimo_reset_diario   TEXT    DEFAULT ''  -- ISO timestamp del último reset
 ```
+El reset es diario (medianoche UTC). No hay ventana de horas.
 
-### Funciones nuevas en `database.py`
-
+**Mapa de costes en `permisos.py`:**
 ```python
-def get_o_crear_usuario(user_id: int, username: str = "",
-                        first_name: str = "") -> dict:
-    """Devuelve el usuario o lo crea con plan free."""
+COSTE_COMANDO = {
+    "/analizar": 1,
+    "/ideal":    1,
+    "/comparar": 1,   # semana 4
+    "/tasar":    1,   # semana 5
+    "/alertas":  1,   # semana 6 — puede subir a 5 sin tocar BD
+}
+```
+Hoy todo cuesta 1. Para añadir un comando nuevo: una línea en este dict
++ `@requiere_acceso("/nuevo")` en el handler. Nada más.
 
-def puede_analizar(user_id: int) -> tuple[bool, int, str]:
-    """
-    Devuelve (puede_analizar, analisis_restantes, plan).
-    Gestiona reset mensual para plan pro.
-    Lógica:
-      - free: puede si analisis_free < FREE_ANALISIS_MAX (3)
-      - paid: puede si analisis_pack < PAID_ANALISIS_MAX (20)
-      - pro:  puede siempre (reset analisis_mes cada mes nuevo)
-    """
+**Flujo de créditos:**
+- `free`: reset automático si `ultimo_reset_diario` es de ayer o antes.
+  Bloquea si `creditos_disponibles < coste`.
+- `paid`: descuenta de `creditos_disponibles` (sin caducidad).
+  Cuando llega a 0 → vuelve a `free` con reset limpio.
+  Si recarga otro pack → se acumulan (actuales + 30).
+- `pro`: siempre pasa, no descuenta nada.
 
-def registrar_analisis(user_id: int):
-    """Incrementa el contador correcto según el plan del usuario."""
+**Funciones clave en `database.py`:**
+- `puede_usar(user_id, coste)` → `(bool, restantes)`
+- `registrar_uso(user_id, coste)` — descuenta según tier
+- `registrar_analisis(user_id)` — alias de `registrar_uso(user_id, 1)` (compatibilidad)
+- `puede_analizar(user_id)` — alias de `puede_usar(user_id, 1)` (compatibilidad)
+- `activar_plan(user_id, concepto, stripe_id, ...)` — idempotente via stripe_id
+  - `concepto='pack_30'` → tier='paid', acumula créditos
+  - `concepto='pro_mes'` → tier='pro'
+- `desactivar_pro(user_id)` — webhook cancelación → free con 3 créditos
+- `pago_ya_procesado(stripe_id)` → bool (idempotencia Stripe)
 
-def activar_plan(user_id: int, concepto: str, stripe_id: str = ""):
-    """
-    Activa el plan tras pago confirmado por Stripe.
-    concepto='pack_20' → plan='paid', analisis_pack=0
-    concepto='pro_mes' → plan='pro', analisis_mes=0, mes_actual=hoy
-    Guarda el pago en tabla pagos con estado='completado'.
-    Si ya era 'paid' y compra otro pack, suma los análisis restantes.
-    """
+**Variables de entorno (`config.py`):**
+```
+STRIPE_API_KEY=sk_test_...      (sk_live_... en producción)
+STRIPE_PRICE_PACK=price_...     (producto "Pack 30 acciones", pago único, 4.90€)
+STRIPE_PRICE_PRO=price_...      (producto "Pro mensual", recurrente, 9.90€/mes)
+STRIPE_WEBHOOK_SEC=whsec_...    (del stripe CLI o del dashboard)
+FREE_CREDITOS_DIA=3             (default 3, configurable por env)
+PAID_CREDITOS_PACK=30           (default 30, configurable por env)
 ```
 
-### Check de límite en `main.py` — cmd_analizar
+### Cómo se ata el pago al usuario de Telegram
 
-Al principio de `cmd_analizar`, ANTES de cualquier scraping:
+1. User pulsa botón "Pagar" → `callback_pago` llama `stripe.checkout.Session.create`
+   con `metadata={"telegram_user_id": "123456"}`.
+2. Stripe devuelve URL única → bot la manda al chat (expira en 30 min).
+3. User paga en el navegador con tarjeta (test: `4242 4242 4242 4242`).
+4. Stripe envía `checkout.session.completed` al webhook.
+5. `webhook.py` comprueba idempotencia, llama `activar_plan()`.
+6. Bot envía mensaje de confirmación al user vía `api.telegram.org/sendMessage`.
 
-```python
-user = update.effective_user
-get_o_crear_usuario(user.id, user.username or "", user.first_name or "")
-puede, restantes, plan = puede_analizar(user.id)
+Para PRO: metadata se propaga a la suscripción con `subscription_data.metadata`,
+así las renovaciones (`invoice.payment_succeeded`) también traen el user_id.
 
-if not puede:
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("💳 20 análisis — 4.90€", callback_data="pagar_pack"),
-        InlineKeyboardButton("🚀 Ilimitado — 9.90€/mes", callback_data="pagar_pro"),
-    ]])
-    await update.message.reply_text(
-        "⚡ <b>Has agotado tus 3 análisis gratuitos.</b>\n\n"
-        "El bot cruza el precio con el mercado real, investiga el "
-        "historial del modelo, detecta red flags y calcula la "
-        "etiqueta DGT. Todo en segundos.\n\n"
-        "Para seguir analizando:\n"
-        "• <b>4.90€</b> — 20 análisis (pago único)\n"
-        "• <b>9.90€/mes</b> — Ilimitados\n\n"
-        "Los ingresos financian el desarrollo del proyecto.",
-        parse_mode="HTML",
-        reply_markup=keyboard,
-    )
-    return
+### Eventos Stripe suscritos (configurar en Dashboard)
+- `checkout.session.completed`
+- `invoice.payment_succeeded`
+- `customer.subscription.deleted`
 
-# Aviso cuando queda 1 análisis free
-if plan == "free" and restantes == 1:
-    await update.message.reply_text(
-        "ℹ️ Este es tu último análisis gratuito. "
-        "Después puedes continuar por 4.90€ (20 análisis).",
-    )
+### Para probar sin dinero real
+```bash
+# Terminal 1: bot
+python main.py
 
-# ... resto del código existente de cmd_analizar sin tocar ...
+# Terminal 2: webhook
+uvicorn webhook:app --host 127.0.0.1 --port 8080
 
-# AL FINAL del análisis, cuando haya terminado con éxito:
-registrar_analisis(user.id)
+# Terminal 3: túnel Stripe CLI (imprime el whsec_xxx)
+stripe listen --forward-to localhost:8080/stripe/webhook
+
+# Simular pago sin tocar tarjeta:
+stripe trigger checkout.session.completed
 ```
+Tarjeta de test: `4242 4242 4242 4242`, cualquier fecha futura, cualquier CVV.
 
-### Handler de pago en `main.py`
-
-```python
-async def callback_pago(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    import stripe
-    stripe.api_key = STRIPE_API_KEY
-
-    es_pack  = query.data == "pagar_pack"
-    price_id = STRIPE_PRICE_PACK if es_pack else STRIPE_PRICE_PRO
-    mode     = "payment" if es_pack else "subscription"
-
-    try:
-        session = stripe.checkout.Session.create(
-            payment_method_types=["card"],
-            line_items=[{"price": price_id, "quantity": 1}],
-            mode=mode,
-            success_url="https://juanlopera.es?pago=ok",
-            cancel_url="https://juanlopera.es",
-            metadata={"telegram_user_id": str(query.from_user.id)},
-            locale="es",
-        )
-        await query.message.reply_text(
-            f"🔗 <b>Completa el pago aquí:</b>\n\n{session.url}\n\n"
-            "Cuando pagues el bot se activa automáticamente.",
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
-    except Exception as e:
-        logger.error(f"[PAGO] Error Stripe: {e}")
-        await query.message.reply_text(
-            "⚠️ Error generando el enlace. "
-            "Escríbeme a juanloperasanchez@gmail.com y lo resuelvo."
-        )
-
-# Registrar en main():
-app.add_handler(CallbackQueryHandler(
-    callback_pago, pattern=r"^pagar_(pack|pro)$"
-))
-```
-
-### Variables nuevas en `config.py`
-
-```python
-# ─── STRIPE ──────────────────────────────────────────────────────────────────
-STRIPE_API_KEY     = os.getenv("STRIPE_API_KEY", "")
-STRIPE_PRICE_PACK  = os.getenv("STRIPE_PRICE_PACK", "")
-STRIPE_PRICE_PRO   = os.getenv("STRIPE_PRICE_PRO", "")
-STRIPE_WEBHOOK_SEC = os.getenv("STRIPE_WEBHOOK_SEC", "")
-
-# ─── TIER LIMITS ─────────────────────────────────────────────────────────────
-FREE_ANALISIS_MAX = int(os.getenv("FREE_ANALISIS_MAX", "3"))
-PAID_ANALISIS_MAX = int(os.getenv("PAID_ANALISIS_MAX", "20"))
-```
-
-### `webhook.py` — nuevo archivo, servidor mínimo para Stripe
-
-```python
-"""
-webhook.py — Servidor FastAPI mínimo para webhooks de Stripe.
-NO tiene páginas de usuario. Solo recibe eventos de Stripe.
-
-Arrancar en producción:
-    uvicorn webhook:app --host 0.0.0.0 --port 8080
-
-En local con Stripe CLI:
-    stripe listen --forward-to localhost:8080/stripe/webhook
-"""
-from fastapi import FastAPI, Request, HTTPException
-import stripe, logging
-from config import STRIPE_API_KEY, STRIPE_WEBHOOK_SEC
-from database import activar_plan
-
-stripe.api_key = STRIPE_API_KEY
-app    = FastAPI()
-logger = logging.getLogger(__name__)
-
-@app.post("/stripe/webhook")
-async def stripe_webhook(request: Request):
-    payload = await request.body()
-    sig     = request.headers.get("stripe-signature", "")
-
-    try:
-        event = stripe.Webhook.construct_event(
-            payload, sig, STRIPE_WEBHOOK_SEC
-        )
-    except stripe.error.SignatureVerificationError:
-        raise HTTPException(status_code=400, detail="Firma inválida")
-    except Exception as e:
-        logger.error(f"[STRIPE] Error webhook: {e}")
-        raise HTTPException(status_code=400)
-
-    tipo = event["type"]
-    logger.info(f"[STRIPE] Evento: {tipo}")
-
-    # Pago único completado (pack 20 análisis)
-    if tipo == "checkout.session.completed":
-        session  = event["data"]["object"]
-        user_id  = int(session.get("metadata", {}).get("telegram_user_id", 0))
-        mode     = session.get("mode", "payment")
-        concepto = "pack_20" if mode == "payment" else "pro_mes"
-        if user_id:
-            activar_plan(user_id, concepto, session.get("id", ""))
-            logger.info(f"[STRIPE] user {user_id} → {concepto}")
-
-    # Renovación mensual de suscripción pro
-    elif tipo == "invoice.payment_succeeded":
-        invoice = event["data"]["object"]
-        sub_id  = invoice.get("subscription")
-        if sub_id:
-            try:
-                sub     = stripe.Subscription.retrieve(sub_id)
-                user_id = int(sub.metadata.get("telegram_user_id", 0))
-                if user_id:
-                    activar_plan(user_id, "pro_mes", invoice.get("id", ""))
-                    logger.info(f"[STRIPE] user {user_id} renovado pro")
-            except Exception as e:
-                logger.error(f"[STRIPE] Error renovación: {e}")
-
-    return {"ok": True}
-```
-
-### Orden de implementación en esta sesión
-
-1. `database.py`: tablas `usuarios` + `pagos` + 4 funciones.
-2. `config.py`: variables Stripe + TIER_LIMITS.
-3. `main.py`: check de límite en `cmd_analizar` + `callback_pago` + handler.
-4. `webhook.py`: archivo nuevo.
-5. Instalar dependencias: `pip install stripe fastapi uvicorn`.
-6. Probar flujo en local con `stripe listen --forward-to localhost:8080/stripe/webhook`.
-
-**NO implementar en esta sesión:**
-- Portal de cliente Stripe.
-- UI web de gestión de cuenta.
-- Códigos descuento.
-- /tasar, /ideal, /km_check (van en semanas siguientes).
+### Para añadir un comando futuro con acceso premium
+1. Añadir entrada en `COSTE_COMANDO` en `permisos.py`.
+2. Decorar el handler: `@requiere_acceso("/nuevo_comando")`.
+3. Si se quiere bloquear para free: añadir lógica en el decorator
+   (comprobando tier además de créditos). Hoy no es necesario.
 
 ---
 
@@ -361,7 +220,7 @@ precio vs mercado, red flags, etiqueta DGT, historial del modelo.
 
 Estoy en construcción pública. Cada semana una función nueva.
 
-Tienes 3 análisis gratuitos para empezar.
+Tienes 3 acciones gratuitas al día para empezar.
 
 /analizar <url> — Analiza cualquier anuncio de Wallapop o Coches.net
 /ayuda — Qué puedo hacer
@@ -401,7 +260,7 @@ URL → extractor regex (wallapop|coches.net)
         ├ html.escape() en todos los campos
         └ _enviar_largo() si >4000 chars
     → botón preguntas + checklist (1 llamada IA si user pulsa Sí)
-    → registrar_analisis(user_id)  ← NUEVO al final si éxito
+    → registrar_uso(user_id, "/analizar")  ← AHORA lo hace el decorator
 ```
 
 ---
@@ -426,8 +285,8 @@ ANALISIS_CACHE_TTL_S=1800
 HISTORICO_RETENCION_DIAS=180
 ENABLE_VISION=false
 ENABLE_COCHES_NET=true
-FREE_ANALISIS_MAX=3
-PAID_ANALISIS_MAX=20
+FREE_CREDITOS_DIA=3
+PAID_CREDITOS_PACK=30
 ```
 
 Arrancar en producción Linux:
@@ -437,15 +296,28 @@ nohup xvfb-run python worker.py > worker.log 2>&1 &
 nohup uvicorn webhook:app --host 0.0.0.0 --port 8080 > webhook.log 2>&1 &
 ```
 
+Webhook expuesto a Internet:
+- Puerto 8080 abierto en firewall Hetzner.
+- O nginx reverse proxy con HTTPS en `webhook.juanlopera.es`.
+- En Stripe Dashboard → Webhooks → añadir endpoint con esa URL.
+- Eventos a suscribir:
+  - `checkout.session.completed`
+  - `invoice.payment_succeeded`
+  - `customer.subscription.deleted`
+
 ---
 
 ## Limitaciones conocidas
 
 - Coches.net: scraping HTML/SPA frágil. Falla controlado si cambia el HTML.
 - Vision LLM: desactivado (`ENABLE_VISION=false`). Modelo decommissioned.
-- TIER_LIMITS: pendiente de implementar (tarea actual).
 - webhook.py: requiere puerto 8080 accesible externamente o nginx proxy.
-- Sin portal de cliente Stripe todavía (gestión de suscripciones manual).
+- Sin portal de cliente Stripe todavía (gestión de suscripciones manual
+  por email los primeros meses).
+- Anti-abuso multicuenta: usuarios creando Telegrams nuevos para
+  resetear los 3 free. Sin mitigación todavía. Aceptar pérdida.
+- Apple Tax: NO usar Telegram Payments + Stripe in-app para iOS.
+  Stripe Checkout en navegador SÍ es válido.
 
 ---
 
@@ -488,15 +360,27 @@ nohup uvicorn webhook:app --host 0.0.0.0 --port 8080 > webhook.log 2>&1 &
 - Caché 30 min por URL.
 - Score confianza 🟢/🟡/🔴.
 
-### 2026-04-28 — Sesión 5 (freemium — PENDIENTE)
-- [ ] Tablas `usuarios` + `pagos` en database.py
-- [ ] 4 funciones: get_o_crear_usuario, puede_analizar, registrar_analisis, activar_plan
-- [ ] Variables Stripe en config.py
-- [ ] Check de límite en cmd_analizar + registrar_analisis al final
-- [ ] callback_pago + handler registrado en main.py
-- [ ] webhook.py nuevo
+### 2026-05-04 — Sesión 5 (freemium — A IMPLEMENTAR)
+- Modelo revisado: 3 análisis cada 3h (ventana deslizante) en vez de
+  3 totales para siempre.
+- [ ] Tablas `usuarios` + `pagos` en database.py (con stripe_customer_id
+      y stripe_subscription_id).
+- [ ] 5 funciones: get_o_crear_usuario, puede_usar_comando,
+      registrar_uso, activar_plan, desactivar_pro, pago_ya_procesado.
+- [ ] `permisos.py` nuevo con PLAN_COMANDOS y decorator
+      `@requiere_acceso(comando)`.
+- [ ] Variables Stripe + FREE_VENTANA_HORAS en config.py.
+- [ ] Aplicar decorator a `cmd_analizar` y `cmd_ideal` en main.py.
+- [ ] `callback_pago` con metadata telegram_user_id + handler registrado.
+- [ ] `webhook.py` nuevo con:
+      - Idempotencia (event_id en tabla pagos).
+      - Notificación al user vía Telegram tras activar plan.
+      - Manejo de checkout.session.completed, invoice.payment_succeeded,
+        customer.subscription.deleted.
 - [ ] pip install stripe fastapi uvicorn
-- [ ] Test con Stripe CLI modo test
+- [ ] Crear productos en Stripe Dashboard (modo test).
+- [ ] Test con Stripe CLI modo test (5 escenarios).
+- [ ] Configurar webhook en Stripe Dashboard apuntando a producción.
 
 ---
 
@@ -508,3 +392,6 @@ nohup uvicorn webhook:app --host 0.0.0.0 --port 8080 > webhook.log 2>&1 &
 - Coste total a 5 años (TCO).
 - Monitor de precio del anuncio.
 - Verificación matrícula → DGT (fase 9+).
+- Telegram Stars como pago secundario (semana 9-10): añadir botón
+  "Pagar con Stars" al paywall, usar `sendInvoice(currency="XTR")`.
+  user_id viene nativo en `successful_payment`, sin webhook externo.

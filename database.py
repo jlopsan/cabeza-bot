@@ -3,7 +3,7 @@ import sqlite3
 import json
 import logging
 from datetime import datetime, timedelta
-from config import DB_PATH, ALLOWED_USER_IDS, FREE_ANALISIS_MAX, FREE_VENTANA_HORAS
+from config import DB_PATH, ALLOWED_USER_IDS, FREE_CREDITOS_DIA, PAID_CREDITOS_PACK
 
 logger = logging.getLogger(__name__)
 
@@ -83,16 +83,36 @@ def init_db():
                 updated_at  TEXT
             )
         """)
-        # Migración: contadores de freemium
+        # Migraciones: columnas freemium (las antiguas se conservan por compatibilidad)
         for col, ddl in [
-            ("first_name",      "TEXT    DEFAULT ''"),
-            ("analisis_usados", "INTEGER DEFAULT 0"),
-            ("ventana_inicio",  "TEXT    DEFAULT ''"),
+            ("first_name",             "TEXT    DEFAULT ''"),
+            ("analisis_usados",        "INTEGER DEFAULT 0"),   # legacy
+            ("ventana_inicio",         "TEXT    DEFAULT ''"),   # legacy
+            ("analisis_pack",          "INTEGER DEFAULT 0"),    # legacy
+            ("analisis_mes",           "INTEGER DEFAULT 0"),    # legacy
+            ("mes_actual",             "TEXT    DEFAULT ''"),   # legacy
+            ("stripe_customer_id",     "TEXT    DEFAULT ''"),
+            ("stripe_subscription_id", "TEXT    DEFAULT ''"),
+            # Plan A: créditos diarios unificados
+            ("creditos_disponibles",   "INTEGER DEFAULT 3"),
+            ("ultimo_reset_diario",    "TEXT    DEFAULT ''"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE usuarios ADD COLUMN {col} {ddl}")
             except sqlite3.OperationalError:
                 pass  # Ya existe
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pagos (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL,
+                stripe_id   TEXT UNIQUE,
+                concepto    TEXT,
+                importe     REAL,
+                estado      TEXT DEFAULT 'completado',
+                created_at  TEXT
+            )
+        """)
 
         # Ofertas ya publicadas en el canal (scanner)
         conn.execute("""
@@ -275,7 +295,15 @@ def obtener_tier(user_id: int) -> str:
     return u["tier"] if u else "free"
 
 
-# ─── FREEMIUM: límite de análisis por ventana ──────────────────────────────
+# ─── FREEMIUM: créditos diarios unificados ────────────────────────────────
+#
+# Modelo Plan A:
+#   free  → FREE_CREDITOS_DIA créditos/día, reset a medianoche UTC
+#   paid  → PAID_CREDITOS_PACK créditos sin caducidad (creditos_disponibles)
+#   pro   → ilimitado
+#
+# Cada comando tiene un coste en COSTE_COMANDO (permisos.py).
+# Hoy todo cuesta 1. Mañana se puede cambiar el mapa sin tocar la BD.
 
 def get_o_crear_usuario(user_id: int, username: str = "",
                         first_name: str = "") -> dict:
@@ -284,11 +312,10 @@ def get_o_crear_usuario(user_id: int, username: str = "",
     with get_conn() as conn:
         conn.execute(
             "INSERT OR IGNORE INTO usuarios "
-            "(user_id, username, first_name, tier, created_at, updated_at) "
-            "VALUES (?, ?, ?, 'free', ?, ?)",
-            (user_id, username, first_name, now, now),
+            "(user_id, username, first_name, tier, creditos_disponibles, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'free', ?, ?, ?)",
+            (user_id, username, first_name, FREE_CREDITOS_DIA, now, now),
         )
-        # Refrescar username/first_name si cambiaron (sin tocar contadores)
         conn.execute(
             "UPDATE usuarios SET username = ?, first_name = ?, updated_at = ? "
             "WHERE user_id = ?",
@@ -301,91 +328,188 @@ def get_o_crear_usuario(user_id: int, username: str = "",
     return dict(row)
 
 
-def _ventana_expirada(ventana_inicio: str) -> bool:
-    """True si la ventana está vacía o han pasado >= FREE_VENTANA_HORAS."""
-    if not ventana_inicio:
+def _reset_diario_necesario(ultimo_reset: str) -> bool:
+    """True si no hay reset hoy (UTC)."""
+    if not ultimo_reset:
         return True
     try:
-        inicio = datetime.fromisoformat(ventana_inicio)
+        return datetime.fromisoformat(ultimo_reset).date() < datetime.utcnow().date()
     except ValueError:
         return True
-    return datetime.utcnow() - inicio >= timedelta(hours=FREE_VENTANA_HORAS)
 
 
-def puede_analizar(user_id: int) -> tuple[bool, int]:
+def puede_usar(user_id: int, coste: int = 1) -> tuple[bool, int]:
     """
-    Devuelve (puede, restantes).
-    - Whitelist (ALLOWED_USER_IDS) → ilimitado.
-    - Si la ventana ha expirado → reset contador a 0.
+    Devuelve (puede, creditos_restantes).
+    - Whitelist/admin → ilimitado.
+    - pro  → siempre puede.
+    - free → reset diario automático; bloquea si creditos_disponibles < coste.
+    - paid → descuenta de creditos_disponibles (sin caducidad); si se agota → free.
     """
     if ALLOWED_USER_IDS and user_id in ALLOWED_USER_IDS:
         return True, 999
 
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT analisis_usados, ventana_inicio FROM usuarios WHERE user_id = ?",
+            "SELECT tier, creditos_disponibles, ultimo_reset_diario "
+            "FROM usuarios WHERE user_id = ?",
             (user_id,),
         ).fetchone()
         if not row:
-            return True, FREE_ANALISIS_MAX
+            return True, FREE_CREDITOS_DIA
 
-        usados = row["analisis_usados"] or 0
-        if _ventana_expirada(row["ventana_inicio"] or ""):
-            conn.execute(
-                "UPDATE usuarios SET analisis_usados = 0, ventana_inicio = '' "
-                "WHERE user_id = ?",
-                (user_id,),
-            )
-            conn.commit()
-            usados = 0
+        tier      = row["tier"] or "free"
+        creditos  = row["creditos_disponibles"] if row["creditos_disponibles"] is not None else FREE_CREDITOS_DIA
+        reset_str = row["ultimo_reset_diario"] or ""
 
-    restantes = max(FREE_ANALISIS_MAX - usados, 0)
-    return usados < FREE_ANALISIS_MAX, restantes
+        if tier == "pro":
+            return True, 999
+
+        if tier == "free":
+            if _reset_diario_necesario(reset_str):
+                creditos = FREE_CREDITOS_DIA
+                conn.execute(
+                    "UPDATE usuarios SET creditos_disponibles = ?, ultimo_reset_diario = ? "
+                    "WHERE user_id = ?",
+                    (creditos, datetime.utcnow().isoformat(), user_id),
+                )
+                conn.commit()
+
+        return creditos >= coste, max(creditos, 0)
 
 
-def registrar_analisis(user_id: int):
-    """Incrementa el contador. Whitelist no descuenta."""
+def registrar_uso(user_id: int, coste: int = 1):
+    """
+    Descuenta créditos según el tier. Whitelist no descuenta.
+    - pro:  no hace nada (ilimitado).
+    - free: descuenta de creditos_disponibles (ya reseteados si era necesario).
+    - paid: descuenta de creditos_disponibles; si llega a 0, vuelve a free con
+            reset diario para que no quede en -1.
+    """
     if ALLOWED_USER_IDS and user_id in ALLOWED_USER_IDS:
         return
 
     now = datetime.utcnow().isoformat()
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT analisis_usados, ventana_inicio FROM usuarios WHERE user_id = ?",
+            "SELECT tier, creditos_disponibles FROM usuarios WHERE user_id = ?",
             (user_id,),
         ).fetchone()
         if not row:
             return
 
-        ventana = row["ventana_inicio"] or ""
-        if _ventana_expirada(ventana):
-            ventana = now  # arranca nueva ventana
-            usados = 1
-        else:
-            usados = (row["analisis_usados"] or 0) + 1
+        tier     = row["tier"] or "free"
+        creditos = row["creditos_disponibles"] if row["creditos_disponibles"] is not None else 0
 
+        if tier == "pro":
+            return
+
+        nuevo = max(creditos - coste, 0)
+
+        if tier == "paid" and nuevo == 0:
+            conn.execute(
+                "UPDATE usuarios SET creditos_disponibles = 0, tier = 'free', "
+                "ultimo_reset_diario = '', updated_at = ? WHERE user_id = ?",
+                (now, user_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE usuarios SET creditos_disponibles = ?, updated_at = ? "
+                "WHERE user_id = ?",
+                (nuevo, now, user_id),
+            )
+        conn.commit()
+
+
+# Alias para compatibilidad con código existente que llama registrar_analisis
+def registrar_analisis(user_id: int):
+    registrar_uso(user_id, coste=1)
+
+
+# Alias para compatibilidad con código existente que llama puede_analizar
+def puede_analizar(user_id: int) -> tuple[bool, int]:
+    return puede_usar(user_id, coste=1)
+
+
+def activar_plan(user_id: int, concepto: str, stripe_id: str = "",
+                 stripe_customer_id: str = "", stripe_subscription_id: str = ""):
+    """
+    Activa el plan tras pago confirmado. Idempotente via stripe_id.
+    concepto='pack_30' → tier='paid', creditos_disponibles += 30 (acumula si ya era paid).
+    concepto='pro_mes' → tier='pro'.
+    """
+    if stripe_id and pago_ya_procesado(stripe_id):
+        return
+
+    now = datetime.utcnow().isoformat()
+
+    with get_conn() as conn:
+        if concepto == "pack_30":
+            row = conn.execute(
+                "SELECT tier, creditos_disponibles FROM usuarios WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+            actuales = (row["creditos_disponibles"] or 0) if row else 0
+            # Si ya era paid, acumula; si era free, empieza desde 0 + pack
+            nuevos = actuales + PAID_CREDITOS_PACK
+            conn.execute(
+                "UPDATE usuarios SET tier = 'paid', creditos_disponibles = ?, "
+                "stripe_customer_id = COALESCE(NULLIF(?, ''), stripe_customer_id), "
+                "updated_at = ? WHERE user_id = ?",
+                (nuevos, stripe_customer_id, now, user_id),
+            )
+        else:  # pro_mes
+            conn.execute(
+                "UPDATE usuarios SET tier = 'pro', "
+                "stripe_customer_id = COALESCE(NULLIF(?, ''), stripe_customer_id), "
+                "stripe_subscription_id = COALESCE(NULLIF(?, ''), stripe_subscription_id), "
+                "updated_at = ? WHERE user_id = ?",
+                (stripe_customer_id, stripe_subscription_id, now, user_id),
+            )
+
+        if stripe_id:
+            conn.execute(
+                "INSERT OR IGNORE INTO pagos (user_id, stripe_id, concepto, estado, created_at) "
+                "VALUES (?, ?, ?, 'completado', ?)",
+                (user_id, stripe_id, concepto, now),
+            )
+        conn.commit()
+
+
+def desactivar_pro(user_id: int):
+    """Llamado cuando Stripe cancela la suscripción. Vuelve a free con reset limpio."""
+    now = datetime.utcnow().isoformat()
+    with get_conn() as conn:
         conn.execute(
-            "UPDATE usuarios SET analisis_usados = ?, ventana_inicio = ?, updated_at = ? "
-            "WHERE user_id = ?",
-            (usados, ventana, now, user_id),
+            "UPDATE usuarios SET tier = 'free', creditos_disponibles = ?, "
+            "ultimo_reset_diario = '', updated_at = ? WHERE user_id = ?",
+            (FREE_CREDITOS_DIA, now, user_id),
         )
         conn.commit()
 
 
-def minutos_hasta_reset(user_id: int) -> int:
-    """Minutos restantes hasta que la ventana actual expire. 0 si ya expiró."""
+def pago_ya_procesado(stripe_id: str) -> bool:
+    """True si el stripe_id ya está en la tabla pagos (idempotencia)."""
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT ventana_inicio FROM usuarios WHERE user_id = ?", (user_id,)
+            "SELECT 1 FROM pagos WHERE stripe_id = ?", (stripe_id,)
         ).fetchone()
-    if not row or not row["ventana_inicio"]:
+    return row is not None
+
+
+def minutos_hasta_reset(user_id: int) -> int:
+    """Minutos restantes hasta la medianoche UTC (reset diario free). 0 si ya pasó."""
+    now = datetime.utcnow()
+    manana = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT tier, ultimo_reset_diario FROM usuarios WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    if not row or (row["tier"] or "free") != "free":
         return 0
-    try:
-        inicio = datetime.fromisoformat(row["ventana_inicio"])
-    except ValueError:
+    if _reset_diario_necesario(row["ultimo_reset_diario"] or ""):
         return 0
-    fin = inicio + timedelta(hours=FREE_VENTANA_HORAS)
-    delta = fin - datetime.utcnow()
+    delta = manana - now
     return max(int(delta.total_seconds() // 60), 0)
 
 

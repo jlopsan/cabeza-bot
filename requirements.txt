@@ -1,9 +1,12 @@
 python-telegram-bot
 playwright
 httpx
-apscheduler  
-openai        
-SQLAlchemy    
+apscheduler
+openai
+SQLAlchemy
 python-dotenv
 google
 tavily
+stripe
+fastapi
+uvicorn
