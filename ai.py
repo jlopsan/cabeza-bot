@@ -1356,7 +1356,6 @@ async def parsear_perfil_ideal(texto: str) -> dict:
         '"marcas_evitar":[],'
         '"huecos":["presupuesto_max","uso","plazas_min","tamaño","combustible","duracion_uso","marcas_evitar"]}\n\n'
         'Reglas de inferencia:\n'
-        '"grande"/"familiar"/"para la familia" → carrocerias=["suv","familiar","monovolumen"], plazas_min=5\n'
         '"rápido" → cv_min=130; "muy rápido"/"deportivo" → cv_min=200\n'
         '"ciudad"/"urbano" → uso=ciudad; "viajes"/"autopista"/"carretera" → uso=autopista\n'
         '"ZBE"/"pegatina"/"Madrid Central"/"ECO" → etiqueta_dgt_min=ECO, combustible=[hibrido,electrico]\n'
@@ -1372,9 +1371,9 @@ async def parsear_perfil_ideal(texto: str) -> dict:
         'Solo pon km_max si el usuario menciona km explícitos ("máximo 100k km").\n'
         '\nReglas tamaño (DECISIVO para qué modelos sugerir):\n'
         '"primer coche"/"recién carnet" → tamaño="urbano" si presup<7000, "compacto" si 7000≤presup<11000\n'
-        '"familia"/"niños"/"sillita"/"para la familia" → tamaño="familiar" o "monovolumen" si plazas>=7\n'
-        '"SUV pequeño"/"crossover" → tamaño="suv_compacto"\n'
-        '"SUV grande"/"todoterreno"/"4x4" → tamaño="suv_grande"\n'
+        '"familia"/"niños"/"sillita"/"para la familia"/"7 plazas" → tamaño="monovolumen"\n'
+        '"SUV"/"todoterreno"/"4x4"/"crossover" sin mención de 7 plazas → tamaño="suv_compacto" si presup<20000, "suv_grande" si presup>=20000\n'
+        '"SUV grande"/"SUV familiar"/"7 plazas SUV" → tamaño="suv_grande"\n'
         '"berlina"/"sedán"/"tipo Octavia/Golf" → tamaño="berlina"\n'
         '"ciudad"/"para aparcar"/"pequeño"/"urbano" → tamaño="urbano"\n'
         'Si NO hay pistas claras de tamaño, déjalo null (se preguntará).\n'
@@ -1671,3 +1670,247 @@ async def generar_veredicto_ideal(perfil: dict, top3: list, medianas: dict) -> s
             f"{a.km:,} km · <b>{a.precio:,.0f}€</b>"
         )
     return "\n".join(lineas)
+
+
+async def recomendar_configuraciones_ideal(perfil: dict, viables: list[dict]) -> str:
+    """
+    Dado un perfil y los modelos viables verificados en Wallapop,
+    devuelve HTML Telegram con 3 configuraciones específicas recomendadas.
+    viables: [{"marca", "modelo", "precio_min_sondeo"}, ...]
+    """
+    presup = perfil.get("presupuesto_max", 0)
+    uso = perfil.get("uso", "mixto")
+    plazas = perfil.get("plazas_min") or 5
+    combustible = perfil.get("combustible")
+
+    viables_txt = "\n".join(
+        f"- {v['marca'].title()} {v['modelo'].title()}: desde {v['precio_min_sondeo']:,.0f}€ en Wallapop"
+        for v in viables
+    )
+
+    system = (
+        "Eres experto en coches usados en España. "
+        "Te doy modelos con anuncios reales en Wallapop dentro del presupuesto. "
+        "Elige los 3 más recomendables. Para cada uno: motor específico "
+        "(cilindrada + CV), rango de años, rango de precio esperable, 1 frase del por qué. "
+        "Responde SOLO en HTML Telegram. Formato exacto (sin texto extra):\n\n"
+        "<b>🥇 [Marca Modelo] [motor] ([año_ini]-[año_fin])</b>\n"
+        "💶 ~[precio_min]-[precio_max]€ · [motivo en 1 frase]\n\n"
+        "<b>🥈 [Marca Modelo] [motor] ([año_ini]-[año_fin])</b>\n"
+        "💶 ~[precio_min]-[precio_max]€ · [motivo en 1 frase]\n\n"
+        "<b>🥉 [Marca Modelo] [motor] ([año_ini]-[año_fin])</b>\n"
+        "💶 ~[precio_min]-[precio_max]€ · [motivo en 1 frase]\n\n"
+        "Máximo 600 caracteres. Sin saludos. Sin intro. Solo las 3 fichas. "
+        "CRÍTICO: motores REALES del modelo en esos años "
+        "(ej: 'Fabia 1.2 TSI 90cv' no 'Fabia motor gasolina'). "
+        f"CRÍTICO: precios <= {presup:,}€ (presupuesto máximo del usuario)."
+    )
+    user_msg = (
+        f"Presupuesto máximo: {presup:,}€\n"
+        f"Uso: {uso}\n"
+        f"Plazas mínimas: {plazas}\n"
+        + (f"Combustible preferido: {', '.join(combustible) if isinstance(combustible, list) else combustible}\n" if combustible else "")
+        + f"\nModelos viables verificados en Wallapop:\n{viables_txt}"
+    )
+    resultado = await _llamar_ia(system, user_msg, max_tokens=600)
+    if resultado:
+        return resultado
+    # Fallback sin IA
+    lines = []
+    for i, v in enumerate(viables[:3]):
+        e = ["🥇", "🥈", "🥉"][i]
+        lines.append(
+            f"<b>{e} {_html.escape(v['marca'].title())} {_html.escape(v['modelo'].title())}</b>\n"
+            f"💶 desde {v['precio_min_sondeo']:,.0f}€"
+        )
+    return "\n\n".join(lines)
+
+
+async def recomendar_configs_json(perfil: dict, viables: list[dict]) -> list[dict]:
+    """
+    Elige los 3 mejores modelos de los viables y devuelve configs estructuradas.
+    Devuelve list[{marca, modelo, motor, año_ini, año_fin, comentario}] o [].
+    """
+    presup = perfil.get("presupuesto_max", 0)
+    uso = perfil.get("uso", "mixto")
+    combustible = perfil.get("combustible")
+
+    viables_txt = "\n".join(
+        f"- {v['marca']} {v['modelo']}: desde {v['precio_min_sondeo']:,.0f}€"
+        for v in viables
+    )
+
+    comb_list = combustible if isinstance(combustible, list) else ([combustible] if combustible else [])
+    comb_regla = ""
+    if comb_list:
+        comb_txt = "/".join(comb_list)
+        comb_regla = (
+            f" CRÍTICO: el motor DEBE ser {comb_txt}. "
+            f"Si el modelo no se vende con motor {comb_txt} en esos años, descártalo y elige otro de la lista."
+        )
+
+    system = (
+        "Eres experto en coches usados en España. "
+        "Devuelve un ARRAY JSON con EXACTAMENTE 3 objetos eligiendo los 3 mejores modelos de la lista. "
+        "NO devuelvas un solo objeto — siempre array de 3. "
+        "Responde SOLO con JSON puro, sin markdown ni backticks. Formato:\n"
+        '[\n'
+        '  {"marca":"seat","modelo":"ibiza","motor":"1.0 TSI 95cv",'
+        '"año_ini":2017,"año_fin":2020,'
+        '"comentario":"Compacto urbano muy equilibrado. El 1.0 TSI consume ~5,5L/100km y es fiable si lleva mantenimiento al día. Vigila el tacto del embrague (ojo a tirones) y revisa que la cadena de distribución no haga ruidos. Equipamiento básico decente y piezas baratas."},\n'
+        '  {"marca":"volkswagen","modelo":"polo","motor":"1.0 TSI 95cv",'
+        '"año_ini":2018,"año_fin":2021,'
+        '"comentario":"Mismo motor que el Ibiza pero con acabados superiores y mejor insonorización. Mantiene mejor el valor de reventa. Punto débil: la electrónica del cuadro digital en versiones altas puede dar problemas. Excelente opción si quieres calidad sin pagar premium."},\n'
+        '  {"marca":"toyota","modelo":"yaris","motor":"1.5 Hybrid 100cv",'
+        '"año_ini":2017,"año_fin":2020,'
+        '"comentario":"Híbrido autorrecargable con consumos reales de 4L/100km en ciudad. Mantenimiento muy barato (sin embrague, frenos duran el doble). Etiqueta ECO útil para ZBE. La batería híbrida tiene 10 años de garantía y los problemas reales son rarísimos."}\n'
+        ']\n'
+        "CRÍTICO: marca/modelo EXACTOS de la lista que te paso. "
+        "CRÍTICO: motor real con cilindrada y CV (ej '1.5 TSI 150cv', NO 'gasolina'). "
+        "Prefiere motores MUY COMUNES en el mercado de segunda mano (TSI, TDI, PureTech, "
+        "HDI, MPI, Hybrid, EcoBoost) sobre versiones raras o discontinuadas. "
+        "Solo recomienda motores poco comunes si son la única opción real para ese modelo "
+        "en ese rango de precio. "
+        f"CRÍTICO: rango año_ini-año_fin máximo 5 años, con UNIDADES REALES A LA VENTA por menos de {presup:,}€ en ese rango. "
+        f"Si para {presup:,}€ ese modelo solo está disponible en años antiguos, RECOMIENDA AÑOS ANTIGUOS (ej 2010-2014) con motor de la época. "
+        "NO recomiendes configs modernas (2018+) si el presupuesto solo da para versiones de hace 10+ años. "
+        "CRÍTICO: comentario de 40-60 palabras (3-4 frases). Incluye: "
+        "(1) por qué encaja con el USO/PRESUPUESTO del usuario, "
+        "(2) consumo real o dato técnico relevante, "
+        "(3) puntos débiles típicos del modelo (qué revisar al comprar), "
+        "(4) por qué es buena compra frente a alternativas. "
+        "Habla como mecánico experimentado, sin tecnicismos vacíos."
+        + comb_regla
+    )
+    combustible_txt = (
+        f"Combustible obligatorio: {', '.join(combustible) if isinstance(combustible, list) else combustible}\n"
+        if combustible else ""
+    )
+    user_msg = (
+        f"Presupuesto: {presup:,}€\nUso: {uso}\n{combustible_txt}"
+        f"\nModelos viables en Wallapop (elige 3):\n{viables_txt}\n"
+        f"\nIMPORTANTE: el 'desde X€' indica el precio mínimo encontrado. "
+        f"Si 'desde' es muy bajo (<{presup * 0.4:,.0f}€), significa que los anuncios "
+        f"a {presup:,}€ son de años más antiguos. Ajusta año_ini/año_fin a una época "
+        f"realista para ese presupuesto, no recomiendes versiones de hace 5 años "
+        f"si el dinero solo alcanza para versiones de hace 10-15 años."
+    )
+
+    resultado = await _llamar_ia(system, user_msg, max_tokens=1500)
+    if not resultado:
+        return []
+
+    # Limpiar fences markdown y trailing commas
+    txt = resultado.strip()
+    txt = re.sub(r'^```(?:json)?\s*', '', txt)
+    txt = re.sub(r'\s*```$', '', txt)
+    txt = re.sub(r',\s*([}\]])', r'\1', txt)
+
+    def _validar(item) -> dict | None:
+        if not isinstance(item, dict):
+            return None
+        if not item.get("marca") or not item.get("modelo"):
+            return None
+        if not item.get("motor") or not item.get("comentario"):
+            return None
+        return item
+
+    parsed: list[dict] = []
+    try:
+        data = json.loads(txt)
+        if isinstance(data, list):
+            parsed = data
+        elif isinstance(data, dict):
+            parsed = [data]
+    except json.JSONDecodeError:
+        # Buscar array greedy
+        m = re.search(r'\[\s*\{.*\}\s*\]', txt, re.DOTALL)
+        if m:
+            try:
+                parsed = json.loads(m.group())
+            except Exception:
+                pass
+        # Si no hay array, buscar objetos sueltos
+        if not parsed:
+            for m in re.finditer(r'\{[^{}]*\}', txt, re.DOTALL):
+                try:
+                    parsed.append(json.loads(m.group()))
+                except Exception:
+                    continue
+
+    validos = [v for v in (_validar(x) for x in parsed) if v]
+
+    if len(validos) < 3:
+        logger.warning(f"[IDEAL_AI] parse devolvió {len(validos)} items raw={resultado[:300]!r}")
+
+    # Si la IA devolvió menos de 3, completar con viables que no estén ya
+    if 0 < len(validos) < 3:
+        usados = {(v["marca"].lower(), v["modelo"].lower()) for v in validos}
+        for vi in viables:
+            key = (vi["marca"].lower(), vi["modelo"].lower())
+            if key in usados:
+                continue
+            validos.append({
+                "marca": vi["marca"],
+                "modelo": vi["modelo"],
+                "motor": "",
+                "comentario": "Modelo con anuncios disponibles en tu presupuesto.",
+            })
+            if len(validos) >= 3:
+                break
+
+    return validos[:3]
+
+
+async def recomendar_con_anuncios(perfil: dict, modelos: list[dict]) -> str:
+    """
+    Genera recomendaciones de configuración + evaluación del anuncio real encontrado.
+    modelos: [{"candidato": {marca, modelo}, "anuncio": Anuncio, "flags": list[str]}]
+    """
+    presup = perfil.get("presupuesto_max", 0)
+    uso = perfil.get("uso", "mixto")
+
+    modelos_txt = []
+    for i, m in enumerate(modelos, 1):
+        c = m["candidato"]
+        a = m["anuncio"]
+        flags_txt = "; ".join(m["flags"]) if m["flags"] else "ninguna"
+        desc = (a.descripcion or "")[:200]
+        modelos_txt.append(
+            f"#{i}: {c['marca'].title()} {c['modelo'].title()}\n"
+            f"  Anuncio: {a.año} · {a.km:,}km · {a.precio:,.0f}€ · {a.provincia or 'España'}\n"
+            f"  Motor anuncio: {a.motor or '?'}\n"
+            f"  Descripción: {desc}\n"
+            f"  Alertas: {flags_txt}"
+        )
+
+    system = (
+        "Eres experto en coches usados en España. "
+        "Para cada modelo hay un anuncio real de Wallapop. "
+        "Para cada uno indica:\n"
+        "1. Motor/versión específico más recomendable (cilindrada + CV)\n"
+        "2. Rango de años ideal para el presupuesto\n"
+        "3. Una frase evaluando el anuncio concreto (km, precio, motor si lo indica)\n\n"
+        "Formato HTML Telegram exacto (sin texto extra, sin intro):\n"
+        "<b>🥇 [Marca Modelo] [motor] ([año_ini]-[año_fin])</b>\n"
+        "[evaluación del anuncio en 1 frase]\n\n"
+        "<b>🥈 ...</b>\n...\n\n"
+        "<b>🥉 ...</b>\n...\n\n"
+        "Máx 600 chars. Sin saludos. Solo las 3 fichas.\n"
+        f"Presupuesto: {presup:,}€. Uso: {uso}."
+    )
+    user_msg = "\n\n".join(modelos_txt)
+
+    resultado = await _llamar_ia(system, user_msg, max_tokens=600)
+    if resultado:
+        return resultado
+    emojis = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, m in enumerate(modelos[:3]):
+        c = m["candidato"]
+        a = m["anuncio"]
+        lines.append(
+            f"<b>{emojis[i]} {_html.escape(c['marca'].title())} {_html.escape(c['modelo'].title())}</b>\n"
+            f"{a.año} · {a.km:,}km · {a.precio:,.0f}€"
+        )
+    return "\n\n".join(lines)

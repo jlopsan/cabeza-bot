@@ -22,13 +22,12 @@ from telegram.ext import (
 )
 
 from config import TELEGRAM_TOKEN, TOP_RESULTS, MIN_BENEFICIO, ALLOWED_USER_IDS, ADMIN_USER_IDS
-from config import IDEAL_TOP_N, IDEAL_KM_AÑO_MAX
 from ai import (
     parsear_filtros_nl, parsear_modelo_nl, enriquecer_coches,
     texto_analisis, validar_precio_mercado, filtrar_por_extras,
     generar_veredicto_analizar, preguntas_y_checklist, formatear_qa,
     cache_get, cache_set,
-    parsear_perfil_ideal, generar_veredicto_ideal,
+    parsear_perfil_ideal,
 )
 from database import (
     init_db, crear_mision, eliminar_mision,
@@ -1263,21 +1262,18 @@ async def _sondear_modelos_viables(
 
 async def _ideal_buscar(source_msg, ctx) -> int:
     """
-    Corazón del /ideal: sugiere modelos, scrapea, puntúa y muestra Top 3.
+    Corazón del /ideal: IA elige 3 configs, scraper busca anuncio de ejemplo por config.
     """
     from datetime import datetime
+    from statistics import median
+    from ai import recomendar_configs_json
+    from scraper import ScraperWallapop
     from red_flags import detectar_red_flags
-    from dgt import calcular_etiqueta_dgt
-    from config import PRECIO_MINIMO_VALIDO, ANTI_SCAM_FACTOR
-    from ai import validar_anuncios_modelo
 
-    perfil    = ctx.user_data.get("ideal_perfil", {})
-    user_id   = ctx.user_data.get("ideal_user_id")
-    es_admin  = ctx.user_data.get("ideal_es_admin", False)
-    año_actual = datetime.utcnow().year
+    perfil   = ctx.user_data.get("ideal_perfil", {})
+    user_id  = ctx.user_data.get("ideal_user_id")
+    es_admin = ctx.user_data.get("ideal_es_admin", False)
 
-    # Guardia: presupuesto y tamaño son OBLIGATORIOS para sugerir bien.
-    # Si falta alguno, volver al cuestionario.
     faltan = []
     if not perfil.get("presupuesto_max"):
         faltan.append("presupuesto_max")
@@ -1286,19 +1282,15 @@ async def _ideal_buscar(source_msg, ctx) -> int:
     if faltan:
         ctx.user_data["ideal_huecos"] = faltan
         ctx.user_data["hueco_actual"] = faltan[0]
+        await source_msg.reply_text("⚠️ Necesito un dato más para acertar:", parse_mode="HTML")
         await source_msg.reply_text(
-            "⚠️ Necesito un dato más para acertar:",
-            parse_mode="HTML",
-        )
-        await source_msg.reply_text(
-            _IDEAL_TEXTOS[faltan[0]],
-            parse_mode="HTML",
+            _IDEAL_TEXTOS[faltan[0]], parse_mode="HTML",
             reply_markup=_ideal_keyboard(faltan[0]),
         )
         return IDEAL_COLLECT
 
-    presup_max_p   = perfil["presupuesto_max"]
-    tamaño_p       = perfil["tamaño"]
+    presup_max_p    = perfil["presupuesto_max"]
+    tamaño_p        = perfil["tamaño"]
     marcas_evitar_p = [m.lower() for m in (perfil.get("marcas_evitar") or [])]
 
     msg = await source_msg.reply_text(
@@ -1307,13 +1299,11 @@ async def _ideal_buscar(source_msg, ctx) -> int:
         parse_mode="HTML",
     )
 
-    # 1. Sondeo barato: qué modelos del segmento tienen anuncios <= presupuesto
+    # 1. Sondeo: qué modelos del segmento tienen anuncios <= presupuesto
     viables = await _sondear_modelos_viables(tamaño_p, presup_max_p, marcas_evitar_p)
 
     if len(viables) < 3:
-        nombres = ", ".join(
-            f"{v['marca'].title()} {v['modelo'].title()}" for v in viables
-        )
+        nombres = ", ".join(f"{v['marca'].title()} {v['modelo'].title()}" for v in viables)
         sugerencia_presup = int(presup_max_p * 1.4 // 1000) * 1000
         await msg.edit_text(
             f"⚠️ <b>Pocos modelos viables en {presup_max_p:,}€.</b>\n\n"
@@ -1326,195 +1316,319 @@ async def _ideal_buscar(source_msg, ctx) -> int:
         )
         return ConversationHandler.END
 
-    # Tomar los 5 más asequibles para el scraping completo
-    candidatos = viables[:5]
-
     candidatos_txt = ", ".join(
-        f"{c['marca'].title()} {c['modelo'].title()}" for c in candidatos
+        f"{v['marca'].title()} {v['modelo'].title()}" for v in viables[:8]
     )
     await msg.edit_text(
-        f"✅ <b>{len(viables)} modelos viables.</b> Analizando los más asequibles:\n"
+        f"✅ <b>{len(viables)} modelos en presupuesto.</b>\n"
         f"{html.escape(candidatos_txt)}\n\n"
-        "⏳ Buscando anuncios concretos en Wallapop y Coches.net…",
+        "🤖 Eligiendo las mejores configuraciones…",
         parse_mode="HTML",
     )
 
-    # 2. Scraping paralelo
-    km_ref = (perfil.get("km_max") or 200_000) // 2
-    tareas = [
-        buscar_comparables_todas(
-            c["marca"], c["modelo"],
-            (c["año_min"] + c["año_max"]) // 2,
-            km_ref, n=20,
-        )
-        for c in candidatos
-    ]
-    resultados = await asyncio.gather(*tareas, return_exceptions=True)
+    # 2. IA elige 3 configs estructuradas de los viables
+    configs = await recomendar_configs_json(perfil, viables[:10])
+    if not configs:
+        logger.warning("[IDEAL] recomendar_configs_json vacío, usando fallback")
+        configs = [
+            {"marca": v["marca"], "modelo": v["modelo"], "motor": "",
+             "comentario": "Modelo con anuncios disponibles en tu presupuesto."}
+            for v in viables[:3]
+        ]
 
-    # 3. Por modelo: filtrar, calcular mediana, puntuar → elegir mejor anuncio
-    medianas: dict[str, float] = {}
-    presup_max    = perfil.get("presupuesto_max")
-    marcas_evitar = [m.lower() for m in (perfil.get("marcas_evitar") or [])]
-    _ORDEN_DGT    = {"0": 4, "ECO": 3, "C": 2, "B": 1, "sin etiqueta": 0}
-    etiqueta_req  = perfil.get("etiqueta_dgt_min")
+    await msg.edit_text(
+        "🔍 Buscando anuncios de ejemplo en Wallapop…",
+        parse_mode="HTML",
+    )
 
-    def _score_ad(a, med: float) -> float:
+    # 3. Por cada config, buscar un anuncio de ejemplo de calidad
+    km_max_ejemplo = min(180_000, presup_max_p * 15)
+    # Suelo de precio: 65% del presupuesto. El usuario quiere ejemplos en su rango,
+    # no chollos sospechosos. Para 20k → mínimo 13k.
+    precio_min_ej = max(2_000, presup_max_p * 0.65)
+    # Banda objetivo: 75-95% del presupuesto (donde están los buenos ejemplos)
+    precio_obj_min = presup_max_p * 0.75
+    precio_obj_max = presup_max_p * 0.95
+    año_actual = datetime.utcnow().year
+
+    # Filtro de combustible: si el usuario lo especificó, vetar el resto
+    comb_user = perfil.get("combustible")
+    if isinstance(comb_user, str):
+        comb_user = [comb_user]
+    comb_user_set = {c.lower() for c in (comb_user or [])}
+
+    _COMB_PATRONES = {
+        "diesel":    ["diesel", "diésel", "tdi", "hdi", "dci", "cdti", "tdci",
+                      "bluetec", "blue hdi", "bluehdi", "gasoil", "gasoleo", "gasóleo"],
+        "gasolina":  ["gasolin", "petrol", "tsi", "tfsi", "puretech", " vti",
+                      " thp", " mpi", " gdi", " fsi"],
+        "hibrido":   ["hibrid", "hybrid", "híbrid", " hev", "phev", "self charg"],
+        "electrico": ["electric", "eléctric", " ev ", " bev"],
+        "glp":       ["glp", "gnc", "autogas", " lpg"],
+    }
+
+    def _detectar_combustible(a) -> str:
+        txt = f" {(a.motor or '').lower()} {(getattr(a, 'titulo', '') or '').lower()} "
+        for comb in ("hibrido", "electrico", "diesel", "glp", "gasolina"):
+            if any(p in txt for p in _COMB_PATRONES[comb]):
+                return comb
+        return ""
+
+    def _score_ejemplo(a, cfg: dict, med: float) -> float:
         sc = 0.0
+        # Mediana del modelo: priorizar ofertas ligeramente por debajo (5-20%)
         if med > 0:
-            sc += max(0.0, (med - a.precio) / med * 50)
+            diff_pct = (med - a.precio) / med  # >0 → más barato que mediana
+            if 0.05 <= diff_pct <= 0.20:
+                sc += 50  # mejor zona: chollo razonable
+            elif -0.05 <= diff_pct < 0.05:
+                sc += 30  # en mediana
+            elif 0.20 < diff_pct <= 0.35:
+                sc += 15  # algo barato (sospechoso)
+            elif diff_pct > 0.35:
+                sc -= 30  # demasiado barato → red flag de scam
+            else:
+                sc -= 10  # más caro que mediana
+
+        # Banda de presupuesto (secundario)
+        if precio_obj_min <= a.precio <= precio_obj_max:
+            sc += 15
+
         años_uso = max(1, año_actual - a.año) if a.año > 1990 else 10
-        km_año   = a.km / años_uso
-        if km_año < IDEAL_KM_AÑO_MAX:
+        km_año = a.km / años_uso
+        if 7_000 <= km_año <= 25_000:
+            sc += 20
+        elif km_año <= 30_000:
             sc += 10
-        sc -= max(0.0, (a.km - 150_000) / 10_000) * 5
-        flags = detectar_red_flags(a, None)
-        sc -= len(flags) * 15
-        if etiqueta_req:
-            etiqueta = calcular_etiqueta_dgt(a.motor or "gasolina", a.año)
-            if _ORDEN_DGT.get(etiqueta, 0) < _ORDEN_DGT.get(etiqueta_req, 0):
-                sc -= 20
+        sc -= max(0.0, (a.km - 100_000) / 10_000) * 3
+
+        # Premiar año más reciente dentro del rango
+        if a.año >= cfg.get("año_ini", 2010):
+            sc += (a.año - cfg.get("año_ini", 2010)) * 2
+
+        # Red flags deterministas
+        try:
+            flags = detectar_red_flags(a, None)
+            sc -= len(flags) * 25
+        except Exception:
+            pass
+
         return sc
 
-    # (score_modelo, mejor_anuncio) — uno por modelo
-    mejor_por_modelo: list[tuple[float, object]] = []
+    def _to_int(v, default: int) -> int:
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return default
 
-    for candidato, resultado in zip(candidatos, resultados):
-        if isinstance(resultado, Exception) or not resultado:
-            continue
+    # Tokens técnicos comunes para detectar coincidencia de motor
+    _TECH_TOKENS = [
+        "tsi", "tfsi", "tdi", "hdi", "dci", "cdti", "tdci", "bluehdi", "blue hdi",
+        "puretech", "vti", "thp", "mpi", "gdi", "fsi", "ecoboost", "vvt-i", "vvti",
+        "vvt", "dualjet", "skyactiv", "dynamic force", "turbo", "ecotec",
+        "hybrid", "hibrid", "phev", "hev", "self charg", "mhev", "e-tech",
+        "crdi", "drive-e", "eat", "dsg",
+    ]
 
-        marca_c  = candidato["marca"]
-        modelo_c = candidato["modelo"]
+    def _tokens_motor_cfg(motor_cfg: str) -> tuple[str, list[str]]:
+        """Extrae cilindrada (ej '1.33') y tokens técnicos (ej ['vvt-i'])."""
+        m = (motor_cfg or "").lower().strip()
+        cil_match = _re.search(r'\b(\d\.\d{1,2})\b', m)
+        cilindrada = cil_match.group(1) if cil_match else ""
+        tech = [t for t in _TECH_TOKENS if t in m]
+        return cilindrada, tech
 
-        # Filtro absoluto: scam + año + marca evitar
-        validos = [
-            a for a in resultado
-            if a.precio >= PRECIO_MINIMO_VALIDO
-            and a.año >= candidato["año_min"] - 1
-            and a.año <= candidato["año_max"] + 1
-            and a.marca.lower() not in marcas_evitar
+    # Familias incompatibles: si la cfg está en una y el ad en otra, descartar.
+    # Nota: las familias del AD incluyen palabras genéricas (diesel, gasolina) porque
+    # Wallapop devuelve el motor como "Diesel 110.0" / "Gasolina 130.0".
+    _MOTOR_FAMILIAS = {
+        "diesel":   ["tdi", "hdi", "dci", "cdti", "tdci", "bluehdi", "blue hdi", "crdi",
+                     "diesel", "diésel", "gasoil", "gasoleo", "gasóleo"],
+        "gas":      ["tsi", "tfsi", "puretech", "vti", "thp", "mpi", "gdi", "fsi",
+                     "ecoboost", "vvt-i", "vvti", "vvt", "dualjet", "skyactiv",
+                     "gasolina", "petrol"],
+        "hibrido":  ["hybrid", "hibrid", "híbrid", "phev", "hev", "self charg", "mhev", "e-tech"],
+    }
+
+    def _familia(motor_str: str) -> str:
+        m = (motor_str or "").lower()
+        for fam, toks in _MOTOR_FAMILIAS.items():
+            if any(t in m for t in toks):
+                return fam
+        return ""
+
+    def _motor_match(a, cilindrada: str, tech: list[str]) -> bool:
+        """
+        Rechaza solo si el anuncio CONTRADICE la cfg.
+        - Cilindrada distinta detectada en el ad → rechazar.
+        - Familia tech incompatible (cfg=gas vs ad=diesel) → rechazar.
+        - Sin contradicción evidente → aceptar (Wallapop suele omitir esos datos).
+        """
+        if not cilindrada and not tech:
+            return True  # cfg sin motor concreto → no filtrar
+
+        txt = f" {(a.motor or '').lower()} {(getattr(a, 'titulo', '') or '').lower()} "
+
+        # 1) Cilindrada contradictoria: el ad menciona una distinta a la cfg
+        if cilindrada:
+            cils_ad = _re.findall(r'\b(\d\.\d{1,2})\b', txt)
+            if cils_ad and cilindrada not in cils_ad:
+                return False  # ad declara otra cilindrada distinta
+
+        # 2) Familia tech incompatible: cfg gasolina vs ad TDI, o cfg TSI vs ad híbrido
+        fam_cfg = _familia(" ".join(tech)) if tech else ""
+        fam_ad  = _familia(txt)
+        if fam_cfg and fam_ad and fam_cfg != fam_ad:
+            return False
+
+        return True
+
+    async def _buscar_ejemplo(cfg: dict):
+        kw = f"{cfg['marca'].title()} {cfg['modelo'].title()}"
+        try:
+            items = await ScraperWallapop().buscar_items(kw, año=0, km=0, n=25, order_by="newest")
+        except Exception as e:
+            logger.warning(f"[IDEAL] ejemplo {kw}: {e}")
+            return None
+        if not items:
+            logger.info(f"[IDEAL] ejemplo {kw}: 0 items de Wallapop")
+            return None
+
+        año_ini = _to_int(cfg.get("año_ini"), 2010)
+        año_fin = _to_int(cfg.get("año_fin"), año_actual)
+        # Año mínimo ABSOLUTO: nunca aceptar coches >5 años antes del rango.
+        # Si la IA dice 2018-2020 no podemos mostrar un 2002 como ejemplo de esa config.
+        año_min_abs = año_ini - 5
+        año_max_abs = año_fin + 3
+
+        # Motor: extraer cilindrada y tech tokens de la cfg para validar coincidencia
+        cilindrada, tech = _tokens_motor_cfg(cfg.get("motor", ""))
+
+        def _comb_ok(a) -> bool:
+            if not comb_user_set:
+                return True
+            det = _detectar_combustible(a)
+            return (not det) or det in comb_user_set
+
+        def _mot_ok(a) -> bool:
+            return _motor_match(a, cilindrada, tech)
+
+        # Nivel 1: rango año estricto + comb + motor + precio 65-100% + km
+        cands = [
+            a for a in items
+            if precio_min_ej <= a.precio <= presup_max_p
+            and 1_000 <= a.km <= km_max_ejemplo
+            and (año_ini - 1) <= a.año <= (año_fin + 2)
+            and _comb_ok(a) and _mot_ok(a)
         ]
-        if not validos:
-            continue
+        # Nivel 2: rango año absoluto (±5/±3) + comb + motor + precio 65-100%
+        if not cands:
+            cands = [
+                a for a in items
+                if precio_min_ej <= a.precio <= presup_max_p
+                and 1_000 <= a.km <= km_max_ejemplo
+                and año_min_abs <= a.año <= año_max_abs
+                and _comb_ok(a) and _mot_ok(a)
+            ]
+        # Nivel 3: bajar suelo de precio al 40% (mantiene año + comb + motor)
+        if not cands:
+            precio_floor = max(2_000, presup_max_p * 0.40)
+            cands = [
+                a for a in items
+                if precio_floor <= a.precio <= presup_max_p
+                and 1_000 <= a.km <= km_max_ejemplo
+                and año_min_abs <= a.año <= año_max_abs
+                and _comb_ok(a) and _mot_ok(a)
+            ]
+        if not cands:
+            logger.info(
+                f"[IDEAL] ejemplo {kw}: 0 candidatos con motor "
+                f"{cilindrada or '?'}/{tech or '?'} de {len(items)} items"
+            )
+            return None
 
-        # ── LAYER 0: verificar que el anuncio es el modelo buscado ───────────
-        # Primera palabra no-numérica del modelo para matching en título
-        _kw_raw = [w for w in modelo_c.lower().split()
-                   if not _re.match(r'^[\d.]+$', w) and len(w) >= 3]
-        modelo_kw = _kw_raw[0] if _kw_raw else modelo_c.lower()[:5]
+        # Mediana del modelo: usar items con precio razonable (>2k) para no contaminar
+        precios_validos = sorted(a.precio for a in items if a.precio >= 2_000)
+        med = median(precios_validos) if precios_validos else 0.0
 
-        def _es_modelo_correcto(a, _mc=marca_c, _mkw=modelo_kw) -> bool:
-            if a.fuente == "wallapop":
-                marca_ok = _mc.lower() in a.marca.lower() or a.marca.lower() in _mc.lower()
-                titulo_a = (getattr(a, "titulo", "") or "").lower()
-                modelo_ok = _mkw in a.modelo.lower() or _mkw in titulo_a
-                return marca_ok and modelo_ok
-            else:
-                titulo_a = (getattr(a, "titulo", "") or "").lower()
-                if not titulo_a:
-                    return True  # sin título → conservador
-                return _mkw in titulo_a or _mc.lower() in titulo_a
+        # Filtro anti-outliers: si hay >3 candidatos, descartar los <50% mediana o >150%
+        if med > 0 and len(cands) > 3:
+            filtrados = [a for a in cands if 0.50 * med <= a.precio <= 1.50 * med]
+            if filtrados:
+                cands = filtrados
 
-        validos_l0 = [a for a in validos if _es_modelo_correcto(a)]
-        n_drop_l0 = len(validos) - len(validos_l0)
-        if n_drop_l0 > 0:
-            logger.info(f"[IDEAL] L0: {marca_c} {modelo_c} → {n_drop_l0} descartados")
-        if not validos_l0:
-            continue
+        return max(cands, key=lambda a: _score_ejemplo(a, cfg, med))
 
-        # ── LAYER 1: validación IA batch con 8B-instant ──────────────────────
-        # Usar modelo_kw (base, sin variante) — Wallapop normaliza la búsqueda
-        # al modelo base ("octavia", no "octavia combi"), así que L1 solo debe
-        # validar marca+modelo base para capturar coches completamente distintos
-        # (Berlingo en búsqueda de Tucson). Las variantes (Combi/SW/Tourer) las
-        # gestiona el scoring, no L1.
-        if len(validos_l0) > 3:
-            try:
-                indices_ok = await validar_anuncios_modelo(marca_c, modelo_kw, validos_l0[:15])
-                candidatos_ia = [validos_l0[i] for i in indices_ok if i < len(validos_l0)]
-                if candidatos_ia:
-                    validos_l0 = candidatos_ia
-            except Exception as e:
-                logger.warning(f"[IDEAL] L1 falló {marca_c} {modelo_c}: {e}. Pass-through.")
-
-        # Mediana del modelo (sin scams, usando anuncios ya validados)
-        mediana_modelo = _stats_mod.median([a.precio for a in validos_l0])
-
-        # Anti-scam relativo + rango presupuesto
-        umbral_min = max(PRECIO_MINIMO_VALIDO, mediana_modelo * ANTI_SCAM_FACTOR)
-        presup_min = presup_max * 0.50 if presup_max else 0
-        if presup_max and mediana_modelo >= presup_max * 0.6:
-            presup_min = presup_max * 0.65
-
-        anuncios_modelo = [
-            a for a in validos_l0
-            if a.precio >= umbral_min
-            and (not presup_max or a.precio <= presup_max)
-            and a.precio >= presup_min
-        ]
-        if not anuncios_modelo:
-            continue
-
-        key = f"{marca_c} {modelo_c}"
-        medianas[key] = mediana_modelo
-
-        # Mejor anuncio de este modelo
-        mejor = max(anuncios_modelo, key=lambda a: _score_ad(a, mediana_modelo))
-        mejor_por_modelo.append((_score_ad(mejor, mediana_modelo), mejor))
-
-    if not mejor_por_modelo:
-        await msg.edit_text(
-            "😔 No encontré anuncios que encajen con tu perfil.\n"
-            "Prueba aumentar el presupuesto o los km máximos."
-        )
-        return ConversationHandler.END
-
-    # Ordenar modelos por score y tomar top N
-    mejor_por_modelo.sort(key=lambda x: x[0], reverse=True)
-    top = [ad for _, ad in mejor_por_modelo[:IDEAL_TOP_N]]
-
-    n_modelos = len(mejor_por_modelo)
-    await msg.edit_text(
-        f"✅ {n_modelos} modelos encontrados. Generando informe…",
-        parse_mode="HTML",
-    )
-
-    # 5. Veredicto IA
     try:
-        veredicto = await generar_veredicto_ideal(perfil, top, medianas)
+        resultados_ej = await asyncio.gather(
+            *(_buscar_ejemplo(c) for c in configs), return_exceptions=True
+        )
     except Exception as e:
-        logger.error(f"[IDEAL] Error veredicto: {e}")
-        veredicto = ""
+        logger.error(f"[IDEAL] gather ejemplos falló: {e}")
+        resultados_ej = [None] * len(configs)
+    ejemplos = []
+    for r in resultados_ej:
+        if isinstance(r, Exception):
+            logger.warning(f"[IDEAL] _buscar_ejemplo lanzó: {r}")
+            ejemplos.append(None)
+        else:
+            ejemplos.append(r)
 
-    # 6. Render
+    # 4. Render: cabecera IA + línea de ejemplo
     emojis = ["🥇", "🥈", "🥉"]
     lineas = []
-    for i, a in enumerate(top):
-        key = f"{a.marca.lower()} {a.modelo.lower()}"
-        med = next((v for k, v in medianas.items() if a.marca.lower() in k and a.modelo.lower() in k), 0)
-        diff_txt = ""
-        if med > 0:
-            diff_pct = round((med - a.precio) / med * 100)
-            diff_txt = f" <i>({'+' if diff_pct >= 0 else ''}{diff_pct}% vs mercado)</i>"
-        lineas.append(
-            f"{emojis[i]} <b>{html.escape(a.marca.title())} "
-            f"{html.escape(a.modelo.upper())}</b> {a.año}\n"
-            f"   📍 {html.escape(a.provincia or 'España')}  ·  "
-            f"{a.km:,} km  ·  <b>{a.precio:,.0f}€</b>{diff_txt}\n"
-            f"   <a href='{a.url}'>Ver anuncio</a>"
+    for i, (cfg, ej) in enumerate(zip(configs, ejemplos)):
+        marca_t  = cfg["marca"].title()
+        modelo_t = cfg["modelo"].title()
+        motor    = cfg.get("motor", "")
+        año_ini  = cfg.get("año_ini", "")
+        año_fin  = cfg.get("año_fin", "")
+        comentario = html.escape(cfg.get("comentario", ""))
+
+        cabecera = (
+            f"<b>{emojis[i]} {html.escape(marca_t)} {html.escape(modelo_t)}"
+            + (f" {html.escape(motor)}" if motor else "")
+            + (f" ({año_ini}-{año_fin})" if año_ini and año_fin else "")
+            + "</b>"
         )
+        bloque = cabecera
+        if not motor:
+            bloque += "\n🔧 <i>Motor sugerido: por confirmar</i>"
+        if comentario:
+            bloque += f"\n{comentario}"
+        if ej:
+            bloque += (
+                f"\n💡 <i>Ej:</i> 📍{html.escape(ej.provincia or 'España')} · "
+                f"{ej.km:,} km · <b>{ej.precio:,.0f}€</b> · "
+                f"<a href='{ej.url}'>Ver anuncio</a>"
+            )
+        else:
+            bloque += (
+                "\n💡 <i>Sin ejemplo exacto del motor en presupuesto. "
+                "Búscalo manualmente con /buscar.</i>"
+            )
+        lineas.append(bloque)
 
     resultado_txt = (
-        "🎯 <b>Tu coche ideal — Top 3</b>\n\n"
+        f"🎯 <b>3 configuraciones recomendadas</b>\n"
+        f"<i>Para {presup_max_p:,}€ · {tamaño_p.replace('_', ' ')}</i>\n\n"
         + "\n\n".join(lineas)
-        + ("\n\n" + veredicto if veredicto else "")
+        + "\n\n<i>Pulsa Analizar para un informe completo.</i>"
     )
 
-    ctx.user_data["ideal_urls"] = [a.url for a in top]
+    # Guardar URLs para botones Analizar #N
+    urls_botones: list[tuple[int, str]] = []
+    for idx, ej in enumerate(ejemplos):
+        if ej and ej.url:
+            urls_botones.append((idx + 1, ej.url))
+    ctx.user_data["ideal_urls"] = [u for _, u in urls_botones]
 
-    teclado = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"🔍 Analizar #{i + 1}", callback_data=f"ideal_analizar:{i}")
-        for i in range(len(top))
-    ]])
+    teclado = None
+    if urls_botones:
+        teclado = InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"🔍 Analizar #{n}", callback_data=f"ideal_analizar:{i}")
+            for i, (n, _) in enumerate(urls_botones)
+        ]])
 
     await _enviar_largo(
         msg, resultado_txt,
@@ -1525,6 +1639,45 @@ async def _ideal_buscar(source_msg, ctx) -> int:
         registrar_analisis(user_id)
 
     return ConversationHandler.END
+
+
+async def callback_ideal_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Callback: pulsar Analizar #N en el resultado de /ideal."""
+    query = update.callback_query
+    await query.answer()
+
+    partes = (query.data or "").split(":")
+    if len(partes) < 2:
+        return
+    try:
+        idx = int(partes[1])
+    except ValueError:
+        return
+    urls = ctx.user_data.get("ideal_urls", [])
+    if idx >= len(urls):
+        await query.message.reply_text("⚠️ No encontré la URL del anuncio.")
+        return
+
+    url  = urls[idx]
+    user = update.effective_user
+
+    get_o_crear_usuario(user.id, user.username or "", user.first_name or "")
+    es_admin = user.id in ADMIN_USER_IDS
+    puede, _ = puede_analizar(user.id)
+    if es_admin:
+        puede = True
+    if not puede:
+        mins = minutos_hasta_reset(user.id)
+        h, m = divmod(mins, 60)
+        cuando = f"{h}h {m}min" if h else f"{m} min"
+        await query.message.reply_text(
+            f"⛔ <b>Has agotado tus análisis gratuitos.</b>\n"
+            f"⏳ Reset en {cuando}.",
+            parse_mode="HTML",
+        )
+        return
+
+    await _core_analisis(url, query.message, ctx, es_admin, user.id)
 
 
 async def cmd_ideal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1593,42 +1746,6 @@ async def cmd_ideal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["ideal_huecos"] = list(perfil.get("huecos", _IDEAL_HUECOS_ORDEN))
 
     return await _ideal_avanzar(update.message, ctx)
-
-
-async def callback_ideal_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Callback para los botones 'Analizar #N' del resultado /ideal."""
-    query = update.callback_query
-    await query.answer()
-
-    partes = (query.data or "").split(":")
-    if len(partes) < 2:
-        return
-    idx = int(partes[1])
-    urls = ctx.user_data.get("ideal_urls", [])
-    if idx >= len(urls):
-        await query.edit_message_text("⚠️ No encontré la URL del anuncio.")
-        return
-
-    url  = urls[idx]
-    user = update.effective_user
-
-    get_o_crear_usuario(user.id, user.username or "", user.first_name or "")
-    es_admin = user.id in ADMIN_USER_IDS
-    puede, _ = puede_analizar(user.id)
-    if es_admin:
-        puede = True
-    if not puede:
-        mins = minutos_hasta_reset(user.id)
-        h, m = divmod(mins, 60)
-        cuando = f"{h}h {m}min" if h else f"{m} min"
-        await query.message.reply_text(
-            f"⛔ <b>Has agotado tus análisis gratuitos.</b>\n"
-            f"⏳ Reset en {cuando}.",
-            parse_mode="HTML",
-        )
-        return
-
-    await _core_analisis(url, query.message, ctx, es_admin, user.id)
 
 
 # ════════════════════════════════════════════════════════════════════════════

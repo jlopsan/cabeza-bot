@@ -1938,21 +1938,20 @@ async def buscar_comparables_wallapop(
 
 
 async def sondear_precio_modelo(
-    marca: str, modelo: str, n: int = 5,
+    marca: str, modelo: str, n: int = 20,
 ) -> list[float]:
     """
-    Devuelve los N precios más baratos del modelo en Wallapop, ordenados ASC.
-    Sondeo ligero para saber si un modelo entra en presupuesto antes de hacer
-    el scraping completo. Si falla o no hay resultados, devuelve [].
+    Devuelve los N precios del modelo en Wallapop, ordenados ASC.
+    n=20 para muestra fiable incluso si Wallapop no ordena por precio.
     """
     keywords = f"{marca.strip().title()} {modelo.strip().title()}"
     try:
         items = await ScraperWallapop().buscar_items(
             keywords, año=0, km=0, n=n,
-            order_by="price_low_to_high",
+            order_by="newest",
         )
         precios = sorted([a.precio for a in items if a.precio > 0])
-        logger.info(f"[SONDEO] {keywords}: {len(precios)} precios, min={precios[0] if precios else 0:.0f}€")
+        logger.info(f"[SONDEO] {keywords}: {len(precios)} precios, min={precios[0] if precios else 0:.0f}€, lista={precios[:5]}")
         return precios
     except Exception as e:
         logger.warning(f"[SONDEO] {keywords} falló: {e}")
