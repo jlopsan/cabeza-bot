@@ -53,7 +53,22 @@
       "Bash(python -c \"import os; from dotenv import load_dotenv; load_dotenv\\(\\); print\\('KEY:', 'SET' if os.getenv\\('SAMBANOVA_API_KEY'\\) else 'MISSING'\\); print\\('BASE:', os.getenv\\('SAMBANOVA_BASE_URL', 'default'\\)\\); print\\('MODEL:', os.getenv\\('AI_MODEL', 'default'\\)\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('main.py', encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('ai.py', encoding='utf-8'\\).read\\(\\)\\); print\\('SYNTAX OK'\\)\")",
       "Bash(python _test_ej.py)",
-      "Bash(python _test_motor.py)"
+      "Bash(python _test_motor.py)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('main.py', encoding='utf-8'\\).read\\(\\)\\); print\\('main.py OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('webhook.py', encoding='utf-8'\\).read\\(\\)\\); print\\('webhook.py OK'\\)\")",
+      "Bash(python -c \"import ast; [ast.parse\\(open\\(f, encoding='utf-8'\\).read\\(\\)\\) for f in ['main.py','webhook.py','permisos.py','database.py','config.py']]; print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; [ast.parse\\(open\\(f, encoding='utf-8'\\).read\\(\\)\\) for f in ['main.py','webhook.py','permisos.py','database.py','config.py']]; print\\('Sintaxis OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('permisos.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('webhook.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('ai.py', encoding='utf-8'\\).read\\(\\)\\); print\\('ai.py OK'\\)\")",
+      "Bash(python -c \"import ast; [ast.parse\\(open\\(f, encoding='utf-8'\\).read\\(\\)\\) for f in ['main.py','ai.py','webhook.py','permisos.py','database.py','config.py']]; print\\('Sintaxis OK todos los archivos'\\)\")",
+      "Bash(python -c \"import main, ai, webhook, permisos, database, config; print\\('Imports OK'\\)\")",
+      "Bash(python -c \"import ast; [ast.parse\\(open\\(f, encoding='utf-8'\\).read\\(\\)\\) for f in ['main.py','ai.py']]; print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('ai.py', encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; [ast.parse\\(open\\(f, encoding='utf-8'\\).read\\(\\)\\) for f in ['main.py','ai.py']]; print\\('Sintaxis OK'\\)\")",
+      "Bash(python -c \"import main, ai; print\\('Imports runtime OK'\\)\")",
+      "Bash(/c/Users/Juan/Documents/cabeza-bot/venv/Scripts/python -c \"import py_compile; [py_compile.compile\\(f, doraise=True\\) for f in \\('ideal_schema.py','ideal_pipeline.py','ai.py','database.py','main.py','permisos.py'\\)]; print\\('OK'\\)\")",
+      "Bash(/c/Users/Juan/Documents/cabeza-bot/venv/Scripts/python -c ' *)"
     ],
     "additionalDirectories": [
       "c:\\Users\\Juan\\.claude\\plans"

@@ -90,22 +90,41 @@ no vía web de usuario.
 
 ## SISTEMA FREEMIUM — Plan A (implementado, Semana 3) ✅
 
-### Modelo de negocio definitivo
+### Modelo de negocio HOY (2 features: /analizar + /ideal)
 
 ```
-Plan FREE:   3 acciones/día (reset medianoche UTC, combinadas entre todos los comandos)
-Plan PAID:   30 acciones por 4.90€  (pago único, sin caducidad, se acumulan)
-Plan PRO:    Ilimitado por 9.90€/mes (suscripción recurrente)
+Plan FREE:        3 acciones/día (reset medianoche UTC, combinadas entre todos los comandos)
+PACK CHICO:      30 acciones — 4.90€  (pago único, sin caducidad, se acumulan)
+PACK GRANDE:    100 acciones — 9.90€  (pago único, sin caducidad, se acumulan)
 ```
+
+**No hay PRO/suscripción todavía.** El código de `pro_mes` (database.py) y la env
+`STRIPE_PRICE_PRO` están dormidos a propósito para activarlos cuando toque sin
+reescribir webhook ni paywall.
 
 **Por qué estos números:**
 - 3 al día (no 3 cada 3h): el free anterior permitía 24/día en la práctica.
   "Al día" es más simple de comunicar y genera retención (el user vuelve mañana).
-- 30 en pack (no 20): cubre el ciclo completo de compra (20-40 anuncios en 2-4 semanas).
-  Sin caducidad: quien compra coche cada 3 años no quiere que le caduquen créditos.
+- 30 en pack chico: cubre el ciclo completo de compra (20-40 anuncios en 2-4 semanas).
+- 100 en pack grande: power user — el que va a comprar coche en serio o el que
+  cubre a familia/amigos. Margen para escalar a PRO cuando exista.
+- Sin caducidad: quien compra coche cada 3 años no quiere que le caduquen créditos.
 - `/ideal` gratis en free: es la killer feature. Se vira, sale en vídeos, crea efecto WOW.
-  Cuando haya señal de demanda premium, se sube a paid/pro sin tocar BD ni decorator.
-- Precios sub-5€ y sub-10€: psicología de precio, funcionan.
+  Cuando haya señal de demanda premium, se sube a paid sin tocar BD ni decorator.
+- Precios 4.90€ y 9.90€: psicología de precio, funcionan.
+
+### Plan a futuro (cómo evoluciona el modelo)
+
+```
+Hoy (2 features):           FREE + 2 PACKs
+Cuando haya 4-5 features:   FREE + 2 PACKs + PRO 9.90€/mes
+                            (los del PACK 100 son conversión natural a PRO al mismo precio)
+Cuando haya 6+ features:    Considerar tiers o features premium puntuales
+```
+
+Por qué se introduce PRO solo con 4-5 features: hoy un usuario gasta el pack 100
+en 2-3 meses → PRO mensual no aporta. Con más features, el uso recurrente justifica
+suscripción y el pack 100 actúa como antesala (mismo precio que PRO).
 
 ### Diseño técnico (implementado)
 
@@ -134,8 +153,8 @@ Hoy todo cuesta 1. Para añadir un comando nuevo: una línea en este dict
   Bloquea si `creditos_disponibles < coste`.
 - `paid`: descuenta de `creditos_disponibles` (sin caducidad).
   Cuando llega a 0 → vuelve a `free` con reset limpio.
-  Si recarga otro pack → se acumulan (actuales + 30).
-- `pro`: siempre pasa, no descuenta nada.
+  Si recarga otro pack → se acumulan (actuales + 30 ó actuales + 100).
+- `pro`: siempre pasa, no descuenta nada (dormido — para cuando se lance suscripción).
 
 **Funciones clave en `database.py`:**
 - `puede_usar(user_id, coste)` → `(bool, restantes)`
@@ -143,38 +162,43 @@ Hoy todo cuesta 1. Para añadir un comando nuevo: una línea en este dict
 - `registrar_analisis(user_id)` — alias de `registrar_uso(user_id, 1)` (compatibilidad)
 - `puede_analizar(user_id)` — alias de `puede_usar(user_id, 1)` (compatibilidad)
 - `activar_plan(user_id, concepto, stripe_id, ...)` — idempotente via stripe_id
-  - `concepto='pack_30'` → tier='paid', acumula créditos
-  - `concepto='pro_mes'` → tier='pro'
+  - `concepto='pack_30'`  → tier='paid', acumula 30 créditos
+  - `concepto='pack_100'` → tier='paid', acumula 100 créditos
+  - `concepto='pro_mes'`  → tier='pro' (dormido, listo para activar)
 - `desactivar_pro(user_id)` — webhook cancelación → free con 3 créditos
 - `pago_ya_procesado(stripe_id)` → bool (idempotencia Stripe)
 
 **Variables de entorno (`config.py`):**
 ```
-STRIPE_API_KEY=sk_test_...      (sk_live_... en producción)
-STRIPE_PRICE_PACK=price_...     (producto "Pack 30 acciones", pago único, 4.90€)
-STRIPE_PRICE_PRO=price_...      (producto "Pro mensual", recurrente, 9.90€/mes)
-STRIPE_WEBHOOK_SEC=whsec_...    (del stripe CLI o del dashboard)
-FREE_CREDITOS_DIA=3             (default 3, configurable por env)
-PAID_CREDITOS_PACK=30           (default 30, configurable por env)
+STRIPE_API_KEY=sk_test_...           (sk_live_... en producción)
+STRIPE_PRICE_PACK_30=price_...       (producto "Pack 30 acciones", pago único, 4.90€)
+STRIPE_PRICE_PACK_100=price_...      (producto "Pack 100 acciones", pago único, 9.90€)
+STRIPE_PRICE_PRO=price_...           (DORMIDO — futuro PRO mensual 9.90€)
+STRIPE_WEBHOOK_SEC=whsec_...         (del stripe CLI o del dashboard)
+FREE_CREDITOS_DIA=3                  (default 3, configurable por env)
+PAID_CREDITOS_PACK_30=30             (default 30, configurable por env)
+PAID_CREDITOS_PACK_100=100           (default 100, configurable por env)
 ```
 
 ### Cómo se ata el pago al usuario de Telegram
 
-1. User pulsa botón "Pagar" → `callback_pago` llama `stripe.checkout.Session.create`
-   con `metadata={"telegram_user_id": "123456"}`.
+1. User pulsa botón paywall (`pagar_pack_30` ó `pagar_pack_100`) → `callback_pago`
+   llama `stripe.checkout.Session.create` con
+   `metadata={"telegram_user_id": "123456", "concepto": "pack_30"}`.
 2. Stripe devuelve URL única → bot la manda al chat (expira en 30 min).
 3. User paga en el navegador con tarjeta (test: `4242 4242 4242 4242`).
 4. Stripe envía `checkout.session.completed` al webhook.
-5. `webhook.py` comprueba idempotencia, llama `activar_plan()`.
+5. `webhook.py` lee `metadata.concepto`, comprueba idempotencia, llama `activar_plan()`.
 6. Bot envía mensaje de confirmación al user vía `api.telegram.org/sendMessage`.
 
-Para PRO: metadata se propaga a la suscripción con `subscription_data.metadata`,
-así las renovaciones (`invoice.payment_succeeded`) también traen el user_id.
+Para futuro PRO: cuando se active, `subscription_data.metadata` propagará el
+`telegram_user_id` para que las renovaciones (`invoice.payment_succeeded`) también
+traigan el user_id.
 
 ### Eventos Stripe suscritos (configurar en Dashboard)
-- `checkout.session.completed`
-- `invoice.payment_succeeded`
-- `customer.subscription.deleted`
+- `checkout.session.completed`            (HOY: activa pack_30 o pack_100)
+- `invoice.payment_succeeded`              (FUTURO: renovación PRO)
+- `customer.subscription.deleted`          (FUTURO: cancelación PRO)
 
 ### Para probar sin dinero real
 ```bash
@@ -272,9 +296,10 @@ Variables en `.env`:
 TELEGRAM_TOKEN=...
 SAMBANOVA_API_KEY=...
 TAVILY_API_KEY=...
-STRIPE_API_KEY=sk_test_...     (sk_live_... en producción)
-STRIPE_PRICE_PACK=price_...
-STRIPE_PRICE_PRO=price_...
+STRIPE_API_KEY=sk_test_...        (sk_live_... en producción)
+STRIPE_PRICE_PACK_30=price_...    (Pack 30 — 4.90€)
+STRIPE_PRICE_PACK_100=price_...   (Pack 100 — 9.90€)
+STRIPE_PRICE_PRO=price_...        (DORMIDO — futuro PRO mensual)
 STRIPE_WEBHOOK_SEC=whsec_...
 ```
 
@@ -286,7 +311,8 @@ HISTORICO_RETENCION_DIAS=180
 ENABLE_VISION=false
 ENABLE_COCHES_NET=true
 FREE_CREDITOS_DIA=3
-PAID_CREDITOS_PACK=30
+PAID_CREDITOS_PACK_30=30
+PAID_CREDITOS_PACK_100=100
 ```
 
 Arrancar en producción Linux:

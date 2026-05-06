@@ -13,7 +13,10 @@ import stripe
 
 from fastapi import FastAPI, Request, HTTPException
 
-from config import STRIPE_API_KEY, STRIPE_WEBHOOK_SEC, TELEGRAM_TOKEN
+from config import (
+    STRIPE_API_KEY, STRIPE_WEBHOOK_SEC, TELEGRAM_TOKEN,
+    PAID_CREDITOS_PACK_30, PAID_CREDITOS_PACK_100, FREE_CREDITOS_DIA,
+)
 from database import activar_plan, desactivar_pro, pago_ya_procesado
 
 stripe.api_key = STRIPE_API_KEY
@@ -46,16 +49,20 @@ async def stripe_webhook(request: Request):
     # Pago único completado (pack) o inicio de suscripción
     if tipo == "checkout.session.completed":
         session  = event["data"]["object"]
-        user_id  = int(session.get("metadata", {}).get("telegram_user_id", 0))
-        mode     = session.get("mode", "payment")
-        concepto = "pack_20" if mode == "payment" else "pro_mes"
+        meta     = _field(session, "metadata")
+        user_id  = int(_field(meta, "telegram_user_id", 0) or 0)
+        # El concepto viaja en metadata desde callback_pago.
+        # Si falta, inferir por mode (suscripción → pro, pago → pack_30).
+        concepto = _field(meta, "concepto") or (
+            "pro_mes" if _field(session, "mode") == "subscription" else "pack_30"
+        )
         if user_id:
             activar_plan(
                 user_id                = user_id,
                 concepto               = concepto,
                 stripe_id              = event_id,
-                stripe_customer_id     = session.get("customer", "") or "",
-                stripe_subscription_id = session.get("subscription", "") or "",
+                stripe_customer_id     = _field(session, "customer", "") or "",
+                stripe_subscription_id = _field(session, "subscription", "") or "",
             )
             await _notificar_user(user_id, concepto)
             logger.info(f"[STRIPE] user {user_id} → {concepto}")
@@ -63,14 +70,14 @@ async def stripe_webhook(request: Request):
     # Renovación mensual de suscripción pro
     elif tipo == "invoice.payment_succeeded":
         invoice = event["data"]["object"]
-        # Skip de la primera factura (ya la maneja checkout.session.completed)
-        if invoice.get("billing_reason") == "subscription_create":
+        if _field(invoice, "billing_reason") == "subscription_create":
             return {"ok": True, "skip": "primera_factura"}
-        sub_id = invoice.get("subscription")
+        sub_id = _field(invoice, "subscription")
         if sub_id:
             try:
-                sub     = stripe.Subscription.retrieve(sub_id)
-                user_id = int(sub.metadata.get("telegram_user_id", 0))
+                sub      = stripe.Subscription.retrieve(sub_id)
+                sub_meta = _field(sub, "metadata")
+                user_id  = int(_field(sub_meta, "telegram_user_id", 0) or 0)
                 if user_id:
                     activar_plan(user_id, "pro_mes", event_id)
                     await _notificar_user(user_id, "pro_mes")
@@ -80,8 +87,9 @@ async def stripe_webhook(request: Request):
 
     # Cancelación de suscripción
     elif tipo == "customer.subscription.deleted":
-        sub     = event["data"]["object"]
-        user_id = int(sub.get("metadata", {}).get("telegram_user_id", 0))
+        sub      = event["data"]["object"]
+        sub_meta = _field(sub, "metadata")
+        user_id  = int(_field(sub_meta, "telegram_user_id", 0) or 0)
         if user_id:
             desactivar_pro(user_id)
             await _notificar_user(user_id, "cancelado")
@@ -90,20 +98,47 @@ async def stripe_webhook(request: Request):
     return {"ok": True}
 
 
+def _field(obj, key, default=None):
+    """
+    Lee una clave de un StripeObject o dict, devolviendo default si falta.
+    StripeObject no implementa .get() — sí soporta indexación con [] pero
+    lanza KeyError. Esta función abstrae las dos formas.
+    """
+    if obj is None:
+        return default
+    if isinstance(obj, dict):
+        v = obj.get(key, default)
+        return v if v is not None else default
+    try:
+        v = obj[key]
+        return v if v is not None else default
+    except (KeyError, AttributeError, TypeError):
+        return default
+
+
 async def _notificar_user(user_id: int, concepto: str):
     if not TELEGRAM_TOKEN:
         return
-    if concepto == "pack_20":
-        texto = "✅ <b>Pack activado.</b>\n\n20 análisis disponibles. ¡Vamos!"
+    if concepto == "pack_30":
+        texto = (
+            f"✅ <b>Pack activado.</b>\n\n"
+            f"{PAID_CREDITOS_PACK_30} acciones disponibles, sin caducidad. ¡Vamos!"
+        )
+    elif concepto == "pack_100":
+        texto = (
+            f"✅ <b>Pack activado.</b>\n\n"
+            f"{PAID_CREDITOS_PACK_100} acciones disponibles, sin caducidad. ¡Vamos!"
+        )
     elif concepto == "pro_mes":
         texto = (
             "🚀 <b>Plan PRO activado.</b>\n\n"
-            "Análisis ilimitados durante un mes. Se renueva automáticamente."
+            "Acciones ilimitadas durante un mes. Se renueva automáticamente."
         )
     elif concepto == "cancelado":
         texto = (
             "ℹ️ Tu suscripción PRO ha sido cancelada.\n"
-            "Has vuelto al plan gratuito (3 análisis cada 3h)."
+            f"Has vuelto al plan gratuito ({FREE_CREDITOS_DIA} acciones al día, "
+            "reset medianoche UTC)."
         )
     else:
         return

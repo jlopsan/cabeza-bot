@@ -210,6 +210,75 @@ async def investigar_coche(version_info: dict, marca: str, modelo: str, anno: in
 _IDEAL_TAVILY_CACHE: dict[str, tuple[float, str]] = {}
 
 
+# Stoplist usada al extraer (marca, modelo) de snippets Tavily.
+# Solo descarta tokens que NO pueden ser un modelo.
+_MODELO_STOP = {
+    "es", "son", "para", "como", "muy", "buen", "buena", "buenos", "buenas",
+    "el", "la", "los", "las", "un", "una", "unos", "unas",
+    "de", "del", "y", "o", "u", "que", "este", "esta", "estos", "estas",
+    "segundo", "segunda", "segundos", "segundas", "primero", "primera",
+    "mano", "usado", "usada", "usados", "usadas", "nuevo", "nueva",
+    "se", "te", "me", "le", "lo", "yo", "tu", "su", "tus", "sus",
+    "con", "sin", "por", "tras", "bajo", "sobre", "entre", "hasta", "desde",
+    "modelo", "modelos", "coche", "coches", "auto", "autos", "vehiculo", "vehículo",
+    "version", "versión", "versiones", "motor", "motores", "marca", "marcas",
+    "html", "http", "https", "www", "com", "review", "comparativa",
+    "mejor", "mejores", "peor", "peores", "más", "mas", "menos",
+    "tiene", "tienen", "ofrece", "ofrecen", "destaca", "destacan",
+    "según", "segun", "también", "tambien", "ademas", "además",
+}
+
+
+def _extraer_modelos_de_snippets(
+    texto: str, marcas: list[str], top_n: int = 8,
+) -> list[tuple[str, str]]:
+    """
+    Extrae pares (marca, modelo) de un texto plano de Tavily. Para cada marca
+    conocida, captura la palabra siguiente como modelo, filtrando ruido.
+    Devuelve los `top_n` pares más mencionados (frecuencia desc).
+    """
+    if not texto:
+        return []
+
+    from collections import Counter
+    contador: Counter[tuple[str, str]] = Counter()
+    txt_lower = texto.lower()
+    for marca in marcas:
+        patron = rf"\b{re.escape(marca)}\s+([a-zA-Z0-9áéíóúüñ\-]{{2,20}})"
+        for m in re.finditer(patron, txt_lower):
+            modelo = m.group(1).strip(".,;:-").lower()
+            if not modelo or modelo in _MODELO_STOP:
+                continue
+            if modelo.isdigit():
+                continue
+            if modelo in marcas:
+                continue
+            contador[(marca, modelo)] += 1
+    # Solo los TOP N por frecuencia (los citados ≥2 veces tienden a ser señal,
+    # los citados 1 vez suelen ser ruido).
+    return [par for par, _ in contador.most_common(top_n)]
+
+
+async def obtener_contexto_perfil(perfil: dict) -> tuple[str, list[tuple[str, str]]]:
+    """
+    Llama Tavily una vez con el perfil y devuelve (snippets_texto, modelos_extra).
+    Reusa la caché 24h de _tavily_modelos_para_perfil. Si Tavily desactivado,
+    devuelve ("", []).
+    """
+    snippets = await _tavily_modelos_para_perfil(perfil)
+    if not snippets:
+        return "", []
+    try:
+        from config import MARCAS_MOBILE_ID
+        marcas = list(MARCAS_MOBILE_ID.keys())
+        modelos = _extraer_modelos_de_snippets(snippets, marcas)
+        logger.info(f"[IDEAL_CTX] Tavily extrajo {len(modelos)} pares (marca,modelo)")
+        return snippets, modelos
+    except Exception as e:
+        logger.warning(f"[IDEAL_CTX] Error extrayendo modelos: {e}")
+        return snippets, []
+
+
 async def _tavily_modelos_para_perfil(perfil: dict) -> str:
     """
     Busca en Tavily 2 queries con el perfil del usuario para obtener
@@ -1607,10 +1676,17 @@ async def validar_candidatos_perfil(
         return {"ok": True, "problema": "", "modelos_a_evitar": []}
 
 
-async def generar_veredicto_ideal(perfil: dict, top3: list, medianas: dict) -> str:
+async def generar_veredicto_ideal(
+    perfil: dict,
+    top3: list,
+    medianas: dict,
+    investigacion: dict | None = None,
+) -> str:
     """
     Genera HTML Telegram con el resumen del Top 3 del /ideal.
     top3: list[Anuncio]; medianas: {"marca modelo": float}
+    investigacion: dict opcional {"marca modelo": {"foros":..., "fiabilidad":..., ...}}
+                   con resultados de investigar_coche por modelo.
     """
     if not top3:
         return "😔 No encontré anuncios que encajen con tu perfil."
@@ -1658,6 +1734,28 @@ async def generar_veredicto_ideal(perfil: dict, top3: list, medianas: dict) -> s
         "Sin saludos. Sin repetir datos. Solo conocimiento del dominio."
     )
     user_msg = f"PERFIL COMPRADOR:\n{perfil_txt}\n\nTOP 3 ENCONTRADOS:\n" + "\n".join(anuncios_txt)
+
+    # Adjuntar investigación real (foros + fiabilidad + artículos) por modelo
+    # para que la IA cite datos concretos en vez de inventar.
+    if investigacion:
+        bloques_inv = []
+        for clave, datos in investigacion.items():
+            if not isinstance(datos, dict):
+                continue
+            partes = []
+            for k in ("foros", "fiabilidad", "articulos", "alternativas"):
+                v = datos.get(k) or ""
+                if v:
+                    partes.append(f"  [{k}] {v[:600]}")
+            if partes:
+                bloques_inv.append(f"\n{clave.upper()}:\n" + "\n".join(partes))
+        if bloques_inv:
+            user_msg += (
+                "\n\nINVESTIGACIÓN REAL POR MODELO (foros, fiabilidad, comparativas — "
+                "úsalo para puntos fuertes, débiles y qué revisar; NO inventes datos):\n"
+                + "\n".join(bloques_inv)[:5000]
+            )
+
     resultado = await _llamar_ia(system, user_msg, max_tokens=750)
     if resultado:
         return resultado
@@ -1726,19 +1824,332 @@ async def recomendar_configuraciones_ideal(perfil: dict, viables: list[dict]) ->
     return "\n\n".join(lines)
 
 
-async def recomendar_configs_json(perfil: dict, viables: list[dict]) -> list[dict]:
+# Definición concreta del segmento — lo que el usuario eligió.
+# Sin esto la IA cuela modelos de otros segmentos (Civic en urbano, A3 en compacto).
+_SEGMENTO_DESC: dict[str, str] = {
+    "urbano": (
+        "SEGMENTO A — coche pequeño de ciudad <4m, motores 1.0-1.2L, "
+        "5 plazas justas. Ej válido: Picanto, i10, Aygo, C1, 108, Twingo, "
+        "Up, Citigo, Mii, Sandero, Panda. "
+        "PROHIBIDO sugerir: Honda Civic, Audi A3, BMW Serie 1, Mercedes Clase A, "
+        "Toyota Corolla, Renault Mégane, VW Golf, ningún SUV ni berlina."
+    ),
+    "compacto": (
+        "SEGMENTO B — coche compacto 4-4.2m, motores 1.0-1.4L. "
+        "Ej válido: Ibiza, Polo, Fabia, i20, Yaris, Mazda 2, Fiesta, Clio, 208, Corsa. "
+        "PROHIBIDO: berlinas (Civic, Mégane, Golf), SUVs, premium A3/Serie 1."
+    ),
+    "berlina": (
+        "SEGMENTO C — berlina/compacta familiar 4.3-4.6m, motores 1.4-2.0L. "
+        "Ej válido: Octavia, Leon, Golf, i30, Ceed, Corolla, Mazda 3, Focus, 308. "
+        "PROHIBIDO: utilitarios (Yaris, Polo), SUV grandes."
+    ),
+    "suv_compacto": (
+        "SEGMENTO C-SUV — SUV compacto 4.3-4.5m. "
+        "Ej válido: Tucson, Sportage, Qashqai, Ateca, Karoq, CX-5, RAV4, etc. "
+        "PROHIBIDO: utilitarios, berlinas, monovolúmenes."
+    ),
+    "suv_grande": (
+        "SEGMENTO D-SUV — SUV grande 4.6m+, 5 plazas amplias. "
+        "PROHIBIDO: SUV compactos pequeños (Captur, Juke), urbanos."
+    ),
+    "familiar": (
+        "FAMILIAR/RANCHERA — variante SW de berlina compacta. "
+        "Ej válido: Octavia Combi, Golf Variant, 308 SW, Mégane SW, Focus SW. "
+        "PROHIBIDO: utilitarios, SUV, berlinas no SW."
+    ),
+    "monovolumen": (
+        "MONOVOLUMEN 7 plazas. "
+        "Ej válido: Touran, Sharan, S-Max, Picasso, Citroen Grand C4, Kia Carens, Mazda 5. "
+        "PROHIBIDO: SUV, utilitarios, berlinas no MPV."
+    ),
+}
+
+
+def _formato_investigacion_compacta(investigacion: dict, max_chars_por_modelo: int = 1200) -> str:
     """
-    Elige los 3 mejores modelos de los viables y devuelve configs estructuradas.
-    Devuelve list[{marca, modelo, motor, año_ini, año_fin, comentario}] o [].
+    Convierte el dict de investigar_coche por modelo en texto compacto para
+    el prompt del seleccionador. Trunca por modelo para que el prompt total
+    no se infle.
+    """
+    if not investigacion:
+        return ""
+    bloques = []
+    for clave, datos in investigacion.items():
+        if not isinstance(datos, dict):
+            continue
+        partes = []
+        for k in ("foros", "fiabilidad", "articulos", "alternativas"):
+            v = datos.get(k) or ""
+            if v:
+                partes.append(f"  [{k}] {v[:max_chars_por_modelo // 4]}")
+        if partes:
+            bloques.append(f"\n— {clave.upper()} —\n" + "\n".join(partes))
+    return "\n".join(bloques)
+
+
+async def brainstorm_candidatos_ideal(perfil: dict, n: int = 8) -> list[dict]:
+    """
+    PASO 1 del nuevo flujo /ideal:
+    IA propone N modelos candidatos que encajan con el perfil, SIN verificar Wallapop.
+    Solo conocimiento de mercado.
+    Output: list[{marca, modelo, motor, año_ini, año_fin, razon}] × N o [].
+    """
+    presup        = perfil.get("presupuesto_max", 0)
+    uso           = perfil.get("uso", "mixto")
+    combustible   = perfil.get("combustible")
+    tamaño        = perfil.get("tamaño", "")
+    plazas_min    = perfil.get("plazas_min") or 0
+    etiqueta_min  = perfil.get("etiqueta_dgt_min") or ""
+    marcas_evitar = perfil.get("marcas_evitar") or []
+
+    segmento_bloque = _SEGMENTO_DESC.get(tamaño, "") if tamaño else ""
+    comb_list = combustible if isinstance(combustible, list) else ([combustible] if combustible else [])
+    comb_txt = "/".join(comb_list) if comb_list else ""
+
+    system = (
+        f"Eres experto en coches usados en España. Sugiere EXACTAMENTE {n} modelos "
+        "REALES que encajen con el perfil que te paso. SIN verificar Wallapop, "
+        "solo con tu conocimiento del mercado.\n"
+        "Por cada candidato: marca y modelo exactos, motor PRINCIPAL típico de ese "
+        "modelo en esos años, rango de años (máximo 4 años) donde el modelo+motor "
+        f"está realmente disponible por ≤{presup:,}€ en mercado español hoy, y una "
+        "razón breve (1 frase) de por qué encaja con el perfil.\n"
+        f"REGLA INVIOLABLE: solo modelos del SEGMENTO que el usuario eligió. {segmento_bloque}\n"
+        f"REGLA INVIOLABLE de PRESUPUESTO: el modelo+motor+año debe poder comprarse "
+        f"realmente por ≤{presup:,}€ en España. Antes de fijar año, piénsalo: '¿una "
+        f"unidad de este modelo+motor de este año cuesta ≤{presup:,}€?'. Si no, baja "
+        "años o cambia de modelo. Ejemplos PROHIBIDOS por presupuesto:\n"
+        f"  - Honda Civic 1.5 Hybrid 2017+ con presup<15k → cuesta 17-22k.\n"
+        f"  - Audi A3 e-tron con presup<14k → cuesta 14-19k.\n"
+        f"  - Toyota Yaris Hybrid <2017 con presup<7k → cuesta 8-11k.\n"
+        f"  - Cualquier modelo premium (Audi/BMW/Mercedes/Lexus) con presup<12k.\n"
+        "REGLA: motor REAL que ese modelo TUVO en esos años. Prohibido inventar "
+        "(ej 'Peugeot 108 Hybrid' no existe — el 108 solo tuvo 1.0 VTi gasolina).\n"
+        "REGLA: variar — máximo 2 modelos de la misma marca; modelos DIFERENTES.\n"
+        + (f"REGLA: combustible debe ser {comb_txt}.\n" if comb_txt else "")
+        + (f"REGLA: ≥{plazas_min} plazas reales.\n" if plazas_min else "")
+        + (f"REGLA: etiqueta DGT mínima {etiqueta_min} (B/C/ECO/0).\n" if etiqueta_min else "")
+        + (f"REGLA: NO marcas {marcas_evitar}.\n" if marcas_evitar else "")
+        + "Responde SOLO con JSON puro (array de objetos), sin markdown ni backticks. Formato:\n"
+        '[{"marca":"toyota","modelo":"yaris","motor":"1.5 Hybrid 100cv","año_ini":2017,"año_fin":2020,'
+        '"razon":"Híbrido autorrecargable, etiqueta ECO, fiabilidad probada en taxis"}]'
+    )
+    user_msg = (
+        f"PERFIL:\n"
+        f"- Presupuesto máximo: {presup:,}€\n"
+        f"- Tamaño/segmento: {tamaño or '?'}\n"
+        f"- Uso: {uso}\n"
+        + (f"- Combustible: {comb_txt}\n" if comb_txt else "")
+        + (f"- Plazas mínimas: {plazas_min}\n" if plazas_min else "")
+        + (f"- Etiqueta DGT mínima: {etiqueta_min}\n" if etiqueta_min else "")
+        + (f"- Marcas a evitar: {', '.join(marcas_evitar)}\n" if marcas_evitar else "")
+        + f"\nSugiere {n} candidatos."
+    )
+
+    resultado = await _llamar_ia(system, user_msg, max_tokens=1200)
+    if not resultado:
+        return []
+
+    txt = resultado.strip()
+    txt = re.sub(r'^```(?:json)?\s*', '', txt)
+    txt = re.sub(r'\s*```$', '', txt)
+    txt = re.sub(r',\s*([}\]])', r'\1', txt)
+
+    candidatos: list[dict] = []
+    try:
+        data = json.loads(txt)
+        if isinstance(data, list):
+            candidatos = data
+        elif isinstance(data, dict):
+            candidatos = [data]
+    except json.JSONDecodeError:
+        m = re.search(r'\[\s*\{.*\}\s*\]', txt, re.DOTALL)
+        if m:
+            try:
+                candidatos = json.loads(m.group())
+            except Exception:
+                pass
+
+    # Validación mínima
+    validos: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for c in candidatos:
+        if not isinstance(c, dict):
+            continue
+        marca  = (c.get("marca") or "").strip().lower()
+        modelo = (c.get("modelo") or "").strip().lower()
+        motor  = (c.get("motor") or "").strip()
+        if not marca or not modelo or not motor:
+            continue
+        if (marca, modelo) in seen:
+            continue
+        seen.add((marca, modelo))
+        validos.append({
+            "marca":   marca,
+            "modelo":  modelo,
+            "motor":   motor,
+            "año_ini": c.get("año_ini") or 2014,
+            "año_fin": c.get("año_fin") or 2020,
+            "razon":   (c.get("razon") or "").strip(),
+        })
+
+    logger.info(f"[IDEAL_BRAINSTORM] IA propuso {len(validos)} candidatos")
+    return validos[:n]
+
+
+async def seleccionar_top3_con_investigacion(
+    perfil: dict,
+    candidatos: list[dict],
+    investigacion: dict,
+) -> list[dict]:
+    """
+    PASO 3 del nuevo flujo /ideal:
+    Dada la lista de candidatos del brainstorm + la investigación Tavily real
+    de cada uno (foros, fiabilidad, comparativas), elige los 3 mejores con
+    comentario detallado de 60-90 palabras citando datos reales.
+    Output: list[{marca, modelo, motor, año_ini, año_fin, comentario}] de longitud ≤3.
+    """
+    if not candidatos:
+        return []
+
+    presup        = perfil.get("presupuesto_max", 0)
+    uso           = perfil.get("uso", "mixto")
+    tamaño        = perfil.get("tamaño", "")
+    combustible   = perfil.get("combustible")
+    segmento_bloque = _SEGMENTO_DESC.get(tamaño, "") if tamaño else ""
+
+    cand_txt = "\n".join(
+        f"- {c['marca']} {c['modelo']} {c['motor']} ({c['año_ini']}-{c['año_fin']})"
+        + (f" — {c['razon']}" if c.get('razon') else "")
+        for c in candidatos
+    )
+    invest_txt = _formato_investigacion_compacta(investigacion, max_chars_por_modelo=1200)
+
+    comb_list = combustible if isinstance(combustible, list) else ([combustible] if combustible else [])
+    comb_regla = ""
+    if comb_list:
+        comb_regla = f" CRÍTICO: motor {'/'.join(comb_list)}."
+
+    system = (
+        "Eres experto en coches usados en España. Te paso una lista de candidatos "
+        "que ya encajan con el perfil del usuario, junto con investigación REAL "
+        "(foros, fiabilidad, comparativas) sobre cada uno.\n"
+        "TAREA: elige los 3 mejores y devuelve un ARRAY JSON con EXACTAMENTE 3 objetos. "
+        "Si hay menos de 3 candidatos sólidos, devuelve los que haya.\n"
+        "RESPONDE SOLO CON JSON PURO, sin markdown ni backticks. Formato:\n"
+        '[{"marca":"toyota","modelo":"yaris","motor":"1.5 Hybrid 100cv",'
+        '"año_ini":2017,"año_fin":2020,'
+        '"comentario":"Híbrido autorrecargable, consumos reales 4L/100km en ciudad. '
+        'Etiqueta ECO útil para ZBE. La generación 2017-2020 corrige los problemas de '
+        'la batería híbrida que tenían los 2014-2016. Vigila el desgaste irregular de '
+        'frenos (regenerativos casi no se usan, óxido) y el sistema de inyección directa '
+        'que gripa si no se hacen revisiones cada 15k km. Frente al Picanto es más caro '
+        'pero compensa en consumo y mantenimiento a largo plazo."}]\n'
+        f"REGLA: marca/modelo/motor EXACTAMENTE de la lista de candidatos. NO mezcles.\n"
+        f"REGLA: solo segmento del usuario. {segmento_bloque}\n"
+        f"REGLA: el comentario debe CITAR datos concretos de la investigación que "
+        "te paso (problemas típicos de foros, fiabilidad TÜV/ADAC, etc). Si la "
+        "investigación dice X, tu comentario debe usar X. Prohibido inventar datos.\n"
+        "ESTRUCTURA OBLIGATORIA del comentario (60-90 palabras, 4-5 frases):\n"
+        "(1) Por qué ESE motor concreto encaja (consumo real medido + perfil de "
+        "fiabilidad).\n"
+        "(2) Por qué ese rango de años: qué problema típico tienen las versiones pre-X "
+        "o post-Y, o qué facelift/mejora se introdujo.\n"
+        "(3) DOS puntos a revisar específicos del modelo (CON datos de la investigación: "
+        "'cadena distribución del 1.4 TSI EA111 según foros', 'inyectores Bosch del TDI 2.0 "
+        "CR pasados los 150k según ADAC'...).\n"
+        "(4) Comparación 1 frase con el modelo más cercano de los otros 2 elegidos.\n"
+        "PROHIBIDO frases vacías: 'buena fiabilidad', 'gran equilibrio', 'alternativa "
+        "interesante', 'buen mantenimiento'."
+        + comb_regla
+    )
+
+    user_msg = (
+        f"PERFIL:\n"
+        f"- Presupuesto: {presup:,}€\n"
+        f"- Tamaño: {tamaño}\n"
+        f"- Uso: {uso}\n\n"
+        f"CANDIDATOS A ELEGIR:\n{cand_txt}\n"
+    )
+    if invest_txt:
+        user_msg += f"\n\nINVESTIGACIÓN REAL POR MODELO:\n{invest_txt}"
+
+    resultado = await _llamar_ia(system, user_msg, max_tokens=2200)
+    if not resultado:
+        return []
+
+    txt = resultado.strip()
+    txt = re.sub(r'^```(?:json)?\s*', '', txt)
+    txt = re.sub(r'\s*```$', '', txt)
+    txt = re.sub(r',\s*([}\]])', r'\1', txt)
+
+    parsed: list[dict] = []
+    try:
+        data = json.loads(txt)
+        if isinstance(data, list):
+            parsed = data
+        elif isinstance(data, dict):
+            parsed = [data]
+    except json.JSONDecodeError:
+        m = re.search(r'\[\s*\{.*\}\s*\]', txt, re.DOTALL)
+        if m:
+            try:
+                parsed = json.loads(m.group())
+            except Exception:
+                pass
+
+    # Filtrar configs cuyo (marca, modelo) no está en candidatos
+    cand_keys = {(c["marca"].lower(), c["modelo"].lower()) for c in candidatos}
+    validos: list[dict] = []
+    for x in parsed:
+        if not isinstance(x, dict):
+            continue
+        if not x.get("marca") or not x.get("modelo") or not x.get("motor") or not x.get("comentario"):
+            continue
+        if (x["marca"].lower(), x["modelo"].lower()) not in cand_keys:
+            logger.info(f"[IDEAL_TOP3] descartada {x['marca']} {x['modelo']} (fuera de candidatos)")
+            continue
+        validos.append(x)
+
+    logger.info(f"[IDEAL_TOP3] IA eligió {len(validos)} top configs")
+    return validos[:3]
+
+
+async def recomendar_configs_json(
+    perfil: dict,
+    viables: list[dict],
+    tavily_snippets: str = "",
+) -> list[dict]:
+    """
+    [LEGACY] Elige los 3 mejores modelos de los viables Wallapop.
+    Mantenida por compatibilidad. El nuevo flujo usa
+    `brainstorm_candidatos_ideal` + `seleccionar_top3_con_investigacion`.
     """
     presup = perfil.get("presupuesto_max", 0)
     uso = perfil.get("uso", "mixto")
     combustible = perfil.get("combustible")
+    tamaño = perfil.get("tamaño", "")
 
+    segmento_bloque = _SEGMENTO_DESC.get(tamaño, "") if tamaño else ""
+
+    # Marcar cada viable como seed (tabla deterministasegmento) o extra (foros).
+    # En la práctica todas las viables se han pasado el sondeo Wallapop, pero
+    # el origen ayuda a la IA a preferir las que sabemos que son del segmento.
     viables_txt = "\n".join(
         f"- {v['marca']} {v['modelo']}: desde {v['precio_min_sondeo']:,.0f}€"
         for v in viables
     )
+
+    # Truncar snippets para no inflar el prompt — los primeros 2500 chars cubren ~25 hits.
+    foros_bloque = ""
+    if tavily_snippets:
+        foros_bloque = (
+            "\n\nLO QUE DICEN FOROS Y COMPARATIVAS sobre este segmento "
+            "(usa estos datos para justificar tus comentarios — NO inventes datos "
+            "que contradigan estos snippets):\n"
+            + tavily_snippets[:2500]
+        )
 
     comb_list = combustible if isinstance(combustible, list) else ([combustible] if combustible else [])
     comb_regla = ""
@@ -1765,21 +2176,51 @@ async def recomendar_configs_json(perfil: dict, viables: list[dict]) -> list[dic
         '"año_ini":2017,"año_fin":2020,'
         '"comentario":"Híbrido autorrecargable con consumos reales de 4L/100km en ciudad. Mantenimiento muy barato (sin embrague, frenos duran el doble). Etiqueta ECO útil para ZBE. La batería híbrida tiene 10 años de garantía y los problemas reales son rarísimos."}\n'
         ']\n'
-        "CRÍTICO: marca/modelo EXACTOS de la lista que te paso. "
-        "CRÍTICO: motor real con cilindrada y CV (ej '1.5 TSI 150cv', NO 'gasolina'). "
-        "Prefiere motores MUY COMUNES en el mercado de segunda mano (TSI, TDI, PureTech, "
-        "HDI, MPI, Hybrid, EcoBoost) sobre versiones raras o discontinuadas. "
-        "Solo recomienda motores poco comunes si son la única opción real para ese modelo "
-        "en ese rango de precio. "
+        "🚨 REGLA INVIOLABLE: marca/modelo deben ser EXACTAMENTE de la lista de "
+        "modelos viables que te paso. La lista es autoritativa porque ya hemos "
+        "verificado que esos modelos tienen anuncios reales en el presupuesto. "
+        "PROHIBIDO inventar marcas/modelos o copiarlos de los snippets de foros. "
+        "Si los foros mencionan modelos que NO están en la lista viables, ignóralos.\n"
+        f"🚨 REGLA INVIOLABLE de SEGMENTO: el usuario quiere {tamaño or 'su segmento'}. "
+        f"{segmento_bloque}\n"
+        "Si la lista de viables incluye modelos del SEGMENTO INCORRECTO (porque el sondeo "
+        "los detectó por anuncios baratos de despiece), DESCÁRTALOS. Solo elige modelos "
+        "que pertenecen al segmento que el usuario pidió. Es preferible repetir un viable "
+        "del segmento correcto antes que sugerir un modelo de otro segmento.\n"
+        f"🚨 REGLA INVIOLABLE de PRESUPUESTO: con {presup:,}€ debe poder comprarse una "
+        "unidad REAL de ese modelo+motor+año en el mercado actual español. "
+        "Si la combinación que ibas a sugerir cuesta el doble del presupuesto en el mundo "
+        f"real (ej: Honda Civic 1.5 Hybrid 2018 cuesta ~18-22k, NO {presup:,}€), "
+        "NO LA SUGIERAS. Antes de fijar año, piensa: '¿una unidad de este modelo+motor "
+        f"de este año cuesta ≤{presup:,}€?'. Si no, baja años hasta donde encaje. "
+        "Si NINGÚN año encaja para ese motor con este presupuesto, cambia de modelo.\n"
+        "🚨 REGLA INVIOLABLE motor: solo motores REALES que ese modelo de verdad "
+        "tuvo a la venta. Antes de poner un motor, comprueba mentalmente si ese "
+        "modelo+motor existió. Ejemplos prohibidos por inventados: 'Peugeot 108 Hybrid' "
+        "(el 108 solo tuvo 1.0 VTi gasolina), 'Honda Civic 1.5 Hybrid' en años 2015-2017 "
+        "(esa motorización híbrida es del Civic e:HEV de 2022+). "
+        "Prefiere motores MUY COMUNES y bien establecidos: TSI, TDI, PureTech, HDI/BlueHDI, "
+        "MPI, Hybrid (solo Toyota/Lexus/Honda recientes/Hyundai-Kia), EcoBoost, dCi. "
+        "Si dudas si un motor existió, pon el motor más vendido/genérico de ese modelo "
+        "en esos años. "
         f"CRÍTICO: rango año_ini-año_fin máximo 5 años, con UNIDADES REALES A LA VENTA por menos de {presup:,}€ en ese rango. "
         f"Si para {presup:,}€ ese modelo solo está disponible en años antiguos, RECOMIENDA AÑOS ANTIGUOS (ej 2010-2014) con motor de la época. "
         "NO recomiendes configs modernas (2018+) si el presupuesto solo da para versiones de hace 10+ años. "
-        "CRÍTICO: comentario de 40-60 palabras (3-4 frases). Incluye: "
-        "(1) por qué encaja con el USO/PRESUPUESTO del usuario, "
-        "(2) consumo real o dato técnico relevante, "
-        "(3) puntos débiles típicos del modelo (qué revisar al comprar), "
-        "(4) por qué es buena compra frente a alternativas. "
-        "Habla como mecánico experimentado, sin tecnicismos vacíos."
+        "CRÍTICO: comentario de 60-90 palabras (4-5 frases). Estructura obligatoria, "
+        "una frase por cada punto:\n"
+        "(1) Por qué ESE motor concreto encaja con el uso/presupuesto del usuario "
+        "(fiabilidad histórica conocida + consumo real medio en L/100km).\n"
+        "(2) Por qué ese rango de años: qué problema típico tienen las versiones pre-X "
+        "o post-Y, o qué facelift/mejora se introdujo en X.\n"
+        "(3) DOS puntos a revisar específicos del modelo (NO genéricos como 'historial' "
+        "o 'estado': sé concreto — 'cadena distribución del 1.4 TSI EA111', "
+        "'inyectores Bosch del TDI 2.0 CR pasados los 150k', "
+        "'electrovalvula EGR del HDI'...).\n"
+        "(4) Comparación 1 frase con el modelo más cercano de los otros 2 elegidos "
+        "(qué te da este que el otro no).\n"
+        "Habla como mecánico experimentado de toda la vida, sin tecnicismos vacíos. "
+        "PROHIBIDO: 'buena fiabilidad', 'buen mantenimiento', 'gran equilibrio', "
+        "'alternativa interesante' y otras frases genéricas vacías."
         + comb_regla
     )
     combustible_txt = (
@@ -1794,9 +2235,11 @@ async def recomendar_configs_json(perfil: dict, viables: list[dict]) -> list[dic
         f"a {presup:,}€ son de años más antiguos. Ajusta año_ini/año_fin a una época "
         f"realista para ese presupuesto, no recomiendes versiones de hace 5 años "
         f"si el dinero solo alcanza para versiones de hace 10-15 años."
+        + foros_bloque
     )
 
-    resultado = await _llamar_ia(system, user_msg, max_tokens=1500)
+    # 60-90 palabras × 3 configs ≈ 270 palabras ≈ 1800 tokens out + estructura JSON.
+    resultado = await _llamar_ia(system, user_msg, max_tokens=2200)
     if not resultado:
         return []
 
@@ -1839,6 +2282,21 @@ async def recomendar_configs_json(perfil: dict, viables: list[dict]) -> list[dic
                     continue
 
     validos = [v for v in (_validar(x) for x in parsed) if v]
+
+    # POST-VALIDACIÓN: descartar configs cuyo (marca, modelo) no aparece en viables.
+    # La IA a veces saca modelos de los snippets de foros aunque la regla diga que no.
+    if viables:
+        viables_keys = {(v["marca"].lower(), v["modelo"].lower()) for v in viables}
+        antes = len(validos)
+        validos = [
+            v for v in validos
+            if (v["marca"].lower(), v["modelo"].lower()) in viables_keys
+        ]
+        if antes != len(validos):
+            logger.info(
+                f"[IDEAL_AI] descartadas {antes - len(validos)} configs por no estar "
+                f"en viables (alucinación IA)"
+            )
 
     if len(validos) < 3:
         logger.warning(f"[IDEAL_AI] parse devolvió {len(validos)} items raw={resultado[:300]!r}")
@@ -1914,3 +2372,440 @@ async def recomendar_con_anuncios(perfil: dict, modelos: list[dict]) -> str:
             f"{a.año} · {a.km:,}km · {a.precio:,.0f}€"
         )
     return "\n\n".join(lines)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# /ideal v2 — pipeline en 6 fases
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Fase 1: parsear_query_a_slots
+# Fase 2: generar_candidatos_modelos
+# Fase 3: enriquecer_candidato (Tavily 7d cache + IA por candidato)
+# Fase 5: generar_veredicto_ideal_v2 (HTML final)
+#
+# Caché Tavily v2 separada de la legacy:
+#   key = (marca, modelo, version_motor)
+#   TTL = 7 días
+
+_IDEAL_V2_TAVILY_TTL_S = 7 * 24 * 3600
+_IDEAL_V2_TAVILY_CACHE: dict[str, tuple[float, list[str]]] = {}
+
+DOMINIOS_FOROS_ES_V2 = [
+    "forocoches.com", "foros.coches.net", "alvolante.it",
+    "reddit.com", "ocu.org", "autobild.es",
+    "motorpasion.com", "km77.com", "autocasion.com",
+]
+
+
+def _slot_safe(d: dict, key: str, default=None):
+    v = d.get(key) if d else None
+    return v if v is not None else default
+
+
+# ── FASE 1: parseo NL → slots ──────────────────────────────────────────────
+
+async def parsear_query_a_slots(texto: str, slots_previos: dict | None = None) -> dict:
+    """
+    Extrae slots de la query del usuario. Devuelve dict con campos detectados
+    con confianza alta. NO inventa números.
+    """
+    texto = (texto or "").strip()
+    if not texto:
+        return {}
+
+    prev_json = json.dumps(slots_previos or {}, ensure_ascii=False, default=str)
+
+    system = (
+        "Eres un parser. Extrae requisitos del usuario para recomendarle un "
+        "coche usado en España segunda mano. Devuelve SOLO JSON puro sin "
+        "backticks. Solo rellena campos con CONFIANZA ALTA. No inventes números.\n\n"
+        "Reglas de inferencia:\n"
+        "- 'familia', 'niños', 'mujer e hijo' → pasajeros_habituales=4\n"
+        "- 'pareja', 'mi novia y yo' → pasajeros_habituales=2\n"
+        "- 'Madrid centro', 'vivo en Barcelona', 'centro ciudad' → zbe_relevante=true\n"
+        "- 'no quiero problemas', 'tranquilidad', 'que no falle' → aversion_taller=true\n"
+        "- 'voy a trabajar todos los días', 'comercial' → km_anuales >=20000\n"
+        "- 'fines de semana solo' → km_anuales=5000\n"
+        "- 'perro grande', 'maletas grandes', 'mucho espacio' → carga_habitual='mucha' o 'perro_grande'\n"
+        "- ciudad sin más → uso_principal='ciudad'\n"
+        "- 'autovía', 'viajo' → uso_principal='autovia'\n\n"
+        "Schema (todos opcionales, omite los que no estén claros):\n"
+        '{'
+        '"presupuesto_max": int|null, '
+        '"presupuesto_min": int|null, '
+        '"uso_principal": "ciudad"|"mixto"|"autovia"|"montaña"|"offroad"|null, '
+        '"pasajeros_habituales": int|null, '
+        '"km_anuales": int|null, '
+        '"zbe_relevante": bool|null, '
+        '"aversion_taller": bool|null, '
+        '"combustible_preferencia": "gasolina"|"diesel"|"hibrido"|"phev"|"electrico"|"indistinto", '
+        '"cambio": "manual"|"automatico"|"indistinto", '
+        '"tamaño_preferencia": "urbano"|"compacto"|"familiar"|"suv"|"monovolumen"|"indistinto", '
+        '"carga_habitual": "poca"|"normal"|"mucha"|"perro_grande", '
+        '"experiencia_previa": [str], '
+        '"rechazos_explicitos": [str], '
+        '"prioridad": "fiabilidad"|"comodidad"|"deportividad"|"eficiencia"|"espacio"'
+        '}'
+    )
+
+    user_msg = (
+        f"Query del usuario:\n{texto}\n\n"
+        f"Slots previos:\n{prev_json}\n\n"
+        "Devuelve SOLO JSON con los campos detectados. Nada más."
+    )
+
+    raw = await _llamar_ia(system, user_msg, max_tokens=400)
+    if not raw:
+        return {}
+    try:
+        data = json.loads(_limpiar_json(raw))
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.warning(f"[IDEAL_V2] parsear_query_a_slots parse error: {e} raw={raw!r}")
+        return {}
+
+
+# ── FASE 2: brainstorm de candidatos ───────────────────────────────────────
+
+async def generar_candidatos_modelos(slots: dict, segunda_ronda: bool = False,
+                                     rechazados: list[str] | None = None) -> list[dict]:
+    """
+    Genera 10 candidatos REALES y comprables con marca + modelo + version_motor.
+    Devuelve lista de dicts. Filtro determinista en pipeline.
+    """
+    presup_max  = _slot_safe(slots, "presupuesto_max", 0)
+    presup_min  = _slot_safe(slots, "presupuesto_min", int(presup_max * 0.5) if presup_max else 0)
+    uso         = _slot_safe(slots, "uso_principal", "mixto")
+    pasajeros   = _slot_safe(slots, "pasajeros_habituales", 4)
+    km_anuales  = _slot_safe(slots, "km_anuales", 12000)
+    zbe         = _slot_safe(slots, "zbe_relevante", False)
+    comb_pref   = _slot_safe(slots, "combustible_preferencia", "indistinto")
+    cambio      = _slot_safe(slots, "cambio", "indistinto")
+    prioridad   = _slot_safe(slots, "prioridad", "fiabilidad")
+    aversion    = _slot_safe(slots, "aversion_taller", False)
+    experiencia = _slot_safe(slots, "experiencia_previa", []) or []
+    rechazos    = list(_slot_safe(slots, "rechazos_explicitos", []) or [])
+    if rechazados:
+        rechazos = list(set(rechazos + rechazados))
+
+    instrucciones_extra = ""
+    if segunda_ronda:
+        instrucciones_extra = (
+            "\nSEGUNDA RONDA: el usuario rechazó la primera. Genera marcas/enfoques "
+            "DISTINTOS. Cambia tipo de motor o segmento. Evita repetir las marcas "
+            f"de los rechazados: {', '.join(rechazos) if rechazos else '(ninguna)'}.\n"
+        )
+
+    system = (
+        "Eres un mecánico veterano español con 30 años de taller. Conoces el "
+        "mercado de segunda mano español. Sabes qué motores fallan, qué generaciones "
+        "evitar, qué versión es la buena.\n\n"
+        "Genera candidatos REALES comprables HOY en España. Devuelve SOLO un JSON "
+        "ARRAY sin backticks ni texto extra.\n\n"
+        "REGLAS DURAS:\n"
+        "1. Cada candidato DEBE tener marca, modelo, GENERACIÓN y VERSIÓN MOTOR "
+        "concreta con CV (ej: 'VW Golf VII 1.0 TSI 110 CV', no 'VW Golf').\n"
+        "2. Máximo 2 candidatos por marca.\n"
+        "3. Diversifica enfoques: incluye al menos 1 híbrido si presupuesto>=10k, "
+        "1 gasolina pequeño, 1 diesel SOLO si km_anuales>15000, 1 outsider "
+        "(Skoda, Hyundai, Kia, Mazda, Suzuki).\n"
+        "4. Si zbe_relevante=true → prohibido B o sin etiqueta. Solo C, ECO o 0.\n"
+        "5. Si aversion_taller=true → prioriza Toyota, Lexus, Mazda, Honda, Suzuki, "
+        "Kia/Hyundai modernos.\n"
+        "6. Si km_anuales<12000 → NUNCA diesel.\n"
+        "7. Años recomendados encajan con presupuesto realista.\n"
+        "8. Evita versiones con problemas conocidos graves: 1.2 PureTech pre-2020, "
+        "1.4 TSI EA111 pre-2014, BMW N47, 1.6 HDI cadena pre-2014. Si recomiendas "
+        "una de esas familias, asegúrate que la generación está fuera del problema.\n"
+        + instrucciones_extra +
+        "\nFORMATO de cada elemento:\n"
+        '{'
+        '"marca": str, '
+        '"modelo": str, '
+        '"version_motor": str, '
+        '"años_recomendados": [int_desde, int_hasta], '
+        '"razon_principal": str, '
+        '"puntos_debiles": [str, str], '
+        '"encaje_con_caso_uso": int (0-10), '
+        '"etiqueta_dgt_estimada": "0"|"ECO"|"C"|"B"|"sin", '
+        '"presupuesto_realista_min": int, '
+        '"presupuesto_realista_max": int'
+        '}\n'
+        "Devuelve 10 candidatos. JSON ARRAY. Nada más."
+    )
+
+    user_msg = (
+        f"PRESUPUESTO: {presup_min}-{presup_max}€\n"
+        f"USO: {uso}\n"
+        f"PASAJEROS: {pasajeros}\n"
+        f"KM/AÑO: {km_anuales}\n"
+        f"ZBE: {zbe}\n"
+        f"COMBUSTIBLE: {comb_pref}\n"
+        f"CAMBIO: {cambio}\n"
+        f"PRIORIDAD: {prioridad}\n"
+        f"AVERSIÓN AL TALLER: {aversion}\n"
+        f"EXPERIENCIA PREVIA: {', '.join(experiencia) if experiencia else 'ninguna'}\n"
+        f"RECHAZOS: {', '.join(rechazos) if rechazos else 'ninguno'}\n"
+    )
+
+    raw = await _llamar_ia(system, user_msg, max_tokens=2000)
+    if not raw:
+        return []
+
+    try:
+        # Aceptar tanto array directo como objeto con "candidatos"
+        s = raw.strip()
+        s = re.sub(r"^```[a-z]*\s*", "", s)
+        s = re.sub(r"\s*```$", "", s).strip()
+        m_arr = re.search(r"\[\s*\{.*\}\s*\]", s, re.DOTALL)
+        if m_arr:
+            data = json.loads(m_arr.group(0))
+        else:
+            data = json.loads(s)
+            if isinstance(data, dict) and "candidatos" in data:
+                data = data["candidatos"]
+        if not isinstance(data, list):
+            return []
+        salida: list[dict] = []
+        for c in data:
+            if not isinstance(c, dict):
+                continue
+            if not c.get("marca") or not c.get("modelo") or not c.get("version_motor"):
+                continue
+            años = c.get("años_recomendados") or []
+            if not (isinstance(años, list) and len(años) == 2):
+                años = [2015, 2022]
+            try:
+                desde, hasta = int(años[0]), int(años[1])
+            except Exception:
+                desde, hasta = 2015, 2022
+            salida.append({
+                "marca": str(c["marca"]).strip().lower(),
+                "modelo": str(c["modelo"]).strip().lower(),
+                "version_motor": str(c["version_motor"]).strip(),
+                "años_recomendados": [desde, hasta],
+                "razon_principal": str(c.get("razon_principal", ""))[:300],
+                "puntos_debiles": [str(p)[:200] for p in (c.get("puntos_debiles") or [])][:4],
+                "encaje_con_caso_uso": int(c.get("encaje_con_caso_uso") or 5),
+                "etiqueta_dgt_estimada": str(c.get("etiqueta_dgt_estimada") or "C").upper(),
+                "presupuesto_realista_min": int(c.get("presupuesto_realista_min") or 0),
+                "presupuesto_realista_max": int(c.get("presupuesto_realista_max") or 0),
+            })
+        logger.info(f"[IDEAL_V2] generar_candidatos_modelos: {len(salida)} candidatos")
+        return salida
+    except Exception as e:
+        logger.warning(f"[IDEAL_V2] generar_candidatos_modelos parse error: {e} raw={raw[:200]!r}")
+        return []
+
+
+# ── FASE 3: enriquecimiento Tavily + IA ────────────────────────────────────
+
+async def _tavily_buscar_candidato(client, queries: list[str]) -> list[str]:
+    """3 queries paralelas Tavily restringidas a foros ES. Devuelve lista de snippets."""
+    tareas = [
+        _tavily_search(client, q, DOMINIOS_FOROS_ES_V2, 4) for q in queries
+    ]
+    results = await asyncio.gather(*tareas, return_exceptions=True)
+    out: list[str] = []
+    for r in results:
+        if isinstance(r, str) and r:
+            out.append(r)
+    return out
+
+
+async def _tavily_para_candidato(candidato: dict) -> str:
+    """Trae snippets Tavily para un candidato. Cachea 7 días."""
+    api_key = os.getenv("TAVILY_API_KEY", "")
+    if not api_key:
+        return ""
+
+    marca = candidato["marca"]
+    modelo = candidato["modelo"]
+    version = candidato["version_motor"]
+    cache_key = f"{marca}|{modelo}|{version}".lower()
+
+    ahora = time.time()
+    if cache_key in _IDEAL_V2_TAVILY_CACHE:
+        ts, snippets = _IDEAL_V2_TAVILY_CACHE[cache_key]
+        if ahora - ts < _IDEAL_V2_TAVILY_TTL_S:
+            return "\n".join(snippets)
+
+    try:
+        from tavily import AsyncTavilyClient
+        client = AsyncTavilyClient(api_key=api_key)
+        queries = [
+            f"{marca} {modelo} {version} fiabilidad problemas comunes",
+            f"{marca} {modelo} {version} foro opiniones propietarios",
+            f"{marca} {modelo} averías frecuentes coste mantenimiento",
+        ]
+        snippets = await _tavily_buscar_candidato(client, queries)
+        _IDEAL_V2_TAVILY_CACHE[cache_key] = (ahora, snippets)
+        return "\n".join(snippets)
+    except Exception as e:
+        logger.warning(f"[IDEAL_V2] Tavily candidato {marca} {modelo}: {e}")
+        return ""
+
+
+async def enriquecer_candidato(candidato: dict) -> dict:
+    """
+    Trae snippets Tavily + síntesis IA. Devuelve dict con fiabilidad_score,
+    averías típicas, puntos fuertes, verdict y comentario_experto.
+    """
+    snippets = await _tavily_para_candidato(candidato)
+
+    años = candidato.get("años_recomendados") or [2015, 2022]
+    try:
+        año_ini, año_fin = int(años[0]), int(años[1])
+    except Exception:
+        año_ini, año_fin = 2015, 2022
+
+    system = (
+        "Eres un mecánico que lleva años leyendo foros y atendiendo clientes en taller. "
+        "Resume la realidad de ESTE motor concreto basándote en lo que dicen los "
+        "propietarios reales. NO inventes — si los snippets no mencionan datos concretos, "
+        "baja fiabilidad_score. Devuelve SOLO JSON puro sin backticks.\n\n"
+        "Reglas:\n"
+        "- gravedad 'alta' = motor o caja, >2000€ reparación.\n"
+        "- comentario_experto en 2 frases en VOZ DE MECÁNICO que LO HA VISTO en taller.\n"
+        "- Si hay alternativas mejores claramente mencionadas, pásalas en 'alternativas_mencionadas'.\n\n"
+        "Schema:\n"
+        '{'
+        '"fiabilidad_score": int (0-10), '
+        '"averías_típicas": [{"componente": str, "km_típico": int, "coste_aprox_eur": int, "gravedad": "leve"|"media"|"alta"}], '
+        '"puntos_fuertes_reales": [str, str, str], '
+        '"verdict_propietarios": "muy_recomendado"|"recomendado_con_caveats"|"evitar", '
+        '"alternativas_mencionadas": [str], '
+        '"comentario_experto": str'
+        '}'
+    )
+
+    user_msg = (
+        f"CANDIDATO:\n"
+        f"{candidato['marca'].title()} {candidato['modelo'].title()} "
+        f"{candidato['version_motor']} ({año_ini}-{año_fin})\n\n"
+        f"SNIPPETS DE FOROS Y OPINIONES:\n"
+        f"{(snippets or '(sin datos de foros disponibles)')[:4500]}"
+    )
+
+    raw = await _llamar_ia(system, user_msg, max_tokens=900)
+    if not raw:
+        return _enriquecimiento_vacio()
+
+    try:
+        data = json.loads(_limpiar_json(raw))
+        if not isinstance(data, dict):
+            return _enriquecimiento_vacio()
+        return {
+            "fiabilidad_score": int(data.get("fiabilidad_score") or 5),
+            "averías_típicas": [
+                {
+                    "componente": str(a.get("componente", ""))[:80],
+                    "km_típico": int(a.get("km_típico") or 0),
+                    "coste_aprox_eur": int(a.get("coste_aprox_eur") or 0),
+                    "gravedad": str(a.get("gravedad") or "media").lower(),
+                }
+                for a in (data.get("averías_típicas") or [])[:4]
+                if isinstance(a, dict)
+            ],
+            "puntos_fuertes_reales": [str(p)[:120] for p in (data.get("puntos_fuertes_reales") or [])][:3],
+            "verdict_propietarios": str(data.get("verdict_propietarios") or "recomendado_con_caveats"),
+            "alternativas_mencionadas": [str(a)[:60] for a in (data.get("alternativas_mencionadas") or [])][:5],
+            "comentario_experto": str(data.get("comentario_experto") or "")[:400],
+        }
+    except Exception as e:
+        logger.warning(f"[IDEAL_V2] enriquecer_candidato parse error: {e} raw={raw[:200]!r}")
+        return _enriquecimiento_vacio()
+
+
+def _enriquecimiento_vacio() -> dict:
+    return {
+        "fiabilidad_score": 5,
+        "averías_típicas": [],
+        "puntos_fuertes_reales": [],
+        "verdict_propietarios": "recomendado_con_caveats",
+        "alternativas_mencionadas": [],
+        "comentario_experto": "",
+    }
+
+
+# ── FASE 5: veredicto experto v2 ───────────────────────────────────────────
+
+async def generar_veredicto_ideal_v2(top3: list[dict], slots: dict) -> str:
+    """
+    Genera HTML Telegram final del top 3 con voz de Juan Lopera.
+    top3: lista de dicts con {candidato, enriquecimiento, anuncios:[{año,km,precio,provincia,url}]}
+    """
+    if not top3:
+        return ""
+
+    payload = []
+    for item in top3[:3]:
+        c = item.get("candidato", {})
+        e = item.get("enriquecimiento", {})
+        anuncios = item.get("anuncios", []) or []
+        anuncios_min = [
+            {
+                "año": a.get("año"), "km": a.get("km"),
+                "precio": a.get("precio"),
+                "provincia": a.get("provincia") or "España",
+                "url": a.get("url") or "",
+            }
+            for a in anuncios[:2]
+        ]
+        payload.append({
+            "candidato": {
+                "marca": c.get("marca"), "modelo": c.get("modelo"),
+                "version_motor": c.get("version_motor"),
+                "años_recomendados": c.get("años_recomendados"),
+                "razon_principal": c.get("razon_principal"),
+                "puntos_debiles": c.get("puntos_debiles"),
+            },
+            "enriquecimiento": e,
+            "anuncios": anuncios_min,
+        })
+
+    system = (
+        "Eres Juan Lopera. Ingeniero. Construyes en público un bot que analiza "
+        "coches usados en España. Hablas claro, con datos concretos, sin "
+        "condescender. Cuando algo huele raro lo dices. Cuando funciona, lo "
+        "defiendes con datos de propietarios reales.\n\n"
+        "Devuelve la respuesta en HTML para Telegram. Estructura EXACTA:\n\n"
+        "🎯 <b>Tu coche ideal según tu perfil</b>\n\n"
+        "Una intro de 1-2 frases conectando los slots con el resultado.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🥇 <b>OPCIÓN 1 — [Marca Modelo Version_motor]</b>\n"
+        "<i>Años recomendados: X-Y</i>\n\n"
+        "<b>Por qué encaja contigo</b>\n"
+        "[2-3 frases con números concretos y los slots del usuario.]\n\n"
+        "<b>Lo que dicen los que lo tienen</b>\n"
+        "• [dato concreto con número]\n"
+        "• [dato concreto con número]\n"
+        "• [dato concreto con número]\n\n"
+        "<b>Cuidado con</b>\n"
+        "[1-2 averías típicas con km y coste. Si no hay graves, di 'sin averías graves reportadas'.]\n\n"
+        "<b>Anuncios que encajan ahora</b>\n"
+        "• [año] · [km]k km · [precio]€ · [ciudad] → <a href=\"[url]\">ver</a>\n"
+        "• [año] · [km]k km · [precio]€ · [ciudad] → <a href=\"[url]\">ver</a>\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🥈 <b>OPCIÓN 2 — ...</b>\n[mismo formato]\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🥉 <b>OPCIÓN 3 — ...</b>\n[mismo formato]\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "<i>Soy Juan Lopera. Cada semana una función nueva del bot.</i>\n\n"
+        "REGLAS:\n"
+        "- Cero genérico. Cada frase suena a alguien que vio el motor en taller.\n"
+        "- Usa números: km, €, años, CV, L/100.\n"
+        "- Voz directa. Frases cortas.\n"
+        "- 0 emojis dentro del texto narrativo. Solo en encabezados.\n"
+        "- Si una opción tiene <2 anuncios, di 'Solo hemos encontrado 1 ejemplar' o 'Sin stock comprable hoy'.\n"
+        "- Devuelve SOLO el HTML. Nada de backticks, ni preámbulos."
+    )
+
+    user_msg = (
+        f"PERFIL DEL USUARIO:\n{json.dumps(slots, ensure_ascii=False)}\n\n"
+        f"TOP 3 (con enriquecimiento y anuncios reales):\n"
+        f"{json.dumps(payload, ensure_ascii=False)}"
+    )
+
+    raw = await _llamar_ia(system, user_msg, max_tokens=2200)
+    return (raw or "").strip()

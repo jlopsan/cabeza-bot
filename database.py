@@ -3,7 +3,7 @@ import sqlite3
 import json
 import logging
 from datetime import datetime, timedelta
-from config import DB_PATH, ALLOWED_USER_IDS, FREE_CREDITOS_DIA, PAID_CREDITOS_PACK
+from config import DB_PATH, ALLOWED_USER_IDS, FREE_CREDITOS_DIA, PAID_CREDITOS_PACK_30, PAID_CREDITOS_PACK_100
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +153,21 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_evt_user ON eventos_comando(user_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_evt_cmd  ON eventos_comando(comando)")
+
+        # Métricas /ideal v2: una fila por flujo terminado
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS eventos_ideal (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id         INTEGER NOT NULL,
+                timestamp       TEXT    NOT NULL,
+                slots_json      TEXT,
+                candidatos_json TEXT,
+                top3_json       TEXT,
+                accion_user     TEXT,
+                duracion_s      INTEGER
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_eideal_user ON eventos_ideal(user_id)")
         conn.commit()
 
 
@@ -299,8 +314,8 @@ def obtener_tier(user_id: int) -> str:
 #
 # Modelo Plan A:
 #   free  → FREE_CREDITOS_DIA créditos/día, reset a medianoche UTC
-#   paid  → PAID_CREDITOS_PACK créditos sin caducidad (creditos_disponibles)
-#   pro   → ilimitado
+#   paid  → créditos del pack comprado, sin caducidad (creditos_disponibles)
+#   pro   → ilimitado (dormido — para cuando se lance suscripción)
 #
 # Cada comando tiene un coste en COSTE_COMANDO (permisos.py).
 # Hoy todo cuesta 1. Mañana se puede cambiar el mapa sin tocar la BD.
@@ -431,12 +446,19 @@ def puede_analizar(user_id: int) -> tuple[bool, int]:
     return puede_usar(user_id, coste=1)
 
 
+_CREDITOS_POR_PACK = {
+    "pack_30":  PAID_CREDITOS_PACK_30,
+    "pack_100": PAID_CREDITOS_PACK_100,
+}
+
+
 def activar_plan(user_id: int, concepto: str, stripe_id: str = "",
                  stripe_customer_id: str = "", stripe_subscription_id: str = ""):
     """
     Activa el plan tras pago confirmado. Idempotente via stripe_id.
-    concepto='pack_30' → tier='paid', creditos_disponibles += 30 (acumula si ya era paid).
-    concepto='pro_mes' → tier='pro'.
+    concepto='pack_30'  → tier='paid', creditos_disponibles += 30  (acumula si ya era paid).
+    concepto='pack_100' → tier='paid', creditos_disponibles += 100 (acumula si ya era paid).
+    concepto='pro_mes'  → tier='pro' (dormido — para cuando se lance suscripción).
     """
     if stripe_id and pago_ya_procesado(stripe_id):
         return
@@ -444,21 +466,21 @@ def activar_plan(user_id: int, concepto: str, stripe_id: str = "",
     now = datetime.utcnow().isoformat()
 
     with get_conn() as conn:
-        if concepto == "pack_30":
+        if concepto in _CREDITOS_POR_PACK:
             row = conn.execute(
                 "SELECT tier, creditos_disponibles FROM usuarios WHERE user_id = ?",
                 (user_id,),
             ).fetchone()
             actuales = (row["creditos_disponibles"] or 0) if row else 0
             # Si ya era paid, acumula; si era free, empieza desde 0 + pack
-            nuevos = actuales + PAID_CREDITOS_PACK
+            nuevos = actuales + _CREDITOS_POR_PACK[concepto]
             conn.execute(
                 "UPDATE usuarios SET tier = 'paid', creditos_disponibles = ?, "
                 "stripe_customer_id = COALESCE(NULLIF(?, ''), stripe_customer_id), "
                 "updated_at = ? WHERE user_id = ?",
                 (nuevos, stripe_customer_id, now, user_id),
             )
-        else:  # pro_mes
+        elif concepto == "pro_mes":
             conn.execute(
                 "UPDATE usuarios SET tier = 'pro', "
                 "stripe_customer_id = COALESCE(NULLIF(?, ''), stripe_customer_id), "
@@ -466,6 +488,9 @@ def activar_plan(user_id: int, concepto: str, stripe_id: str = "",
                 "updated_at = ? WHERE user_id = ?",
                 (stripe_customer_id, stripe_subscription_id, now, user_id),
             )
+        else:
+            logger.warning(f"[PAGO] Concepto desconocido: {concepto}")
+            return
 
         if stripe_id:
             conn.execute(
@@ -583,6 +608,30 @@ def resumen_stats() -> dict:
         "top_usuarios": [dict(r) for r in top_users],
         "ultimos_dias": [dict(r) for r in ult_dias],
     }
+
+
+def registrar_evento_ideal(user_id: int, slots: dict, candidatos: list,
+                           top3: list, accion: str, duracion_s: int = 0):
+    """Persiste un evento del flujo /ideal v2 para análisis posterior."""
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO eventos_ideal "
+                "(user_id, timestamp, slots_json, candidatos_json, top3_json, accion_user, duracion_s) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    user_id,
+                    datetime.utcnow().isoformat(),
+                    json.dumps(slots, ensure_ascii=False, default=str)[:8000],
+                    json.dumps(candidatos, ensure_ascii=False, default=str)[:12000],
+                    json.dumps(top3, ensure_ascii=False, default=str)[:12000],
+                    accion,
+                    duracion_s,
+                ),
+            )
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"[IDEAL_EVT] Error registrando: {e}")
 
 
 def stats_comandos_usuario(user_id: int) -> list[dict]:

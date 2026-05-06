@@ -121,18 +121,21 @@ IEDMT_TRAMOS = [
 MIN_BENEFICIO = 3_000
 
 # ─── STRIPE ──────────────────────────────────────────────────────────────────
-STRIPE_API_KEY     = os.getenv("STRIPE_API_KEY", "")
-STRIPE_PRICE_PACK  = os.getenv("STRIPE_PRICE_PACK", "")   # price_xxx pago único
-STRIPE_PRICE_PRO   = os.getenv("STRIPE_PRICE_PRO", "")    # price_xxx suscripción
-STRIPE_WEBHOOK_SEC = os.getenv("STRIPE_WEBHOOK_SEC", "")  # whsec_xxx
+STRIPE_API_KEY        = os.getenv("STRIPE_API_KEY", "")
+STRIPE_PRICE_PACK_30  = os.getenv("STRIPE_PRICE_PACK_30", "")  # price_xxx pago único 4.90€
+STRIPE_PRICE_PACK_100 = os.getenv("STRIPE_PRICE_PACK_100", "") # price_xxx pago único 9.90€
+STRIPE_PRICE_PRO      = os.getenv("STRIPE_PRICE_PRO", "")      # dormido — futuro: PRO mensual
+STRIPE_WEBHOOK_SEC    = os.getenv("STRIPE_WEBHOOK_SEC", "")    # whsec_xxx
 
 # ─── FREEMIUM ────────────────────────────────────────────────────────────────
-FREE_CREDITOS_DIA   = int(os.getenv("FREE_CREDITOS_DIA", "3"))    # créditos/día en plan free
-PAID_CREDITOS_PACK  = int(os.getenv("PAID_CREDITOS_PACK", "30"))  # créditos por pack 4.90€
+FREE_CREDITOS_DIA       = int(os.getenv("FREE_CREDITOS_DIA", "3"))         # créditos/día en plan free
+PAID_CREDITOS_PACK_30   = int(os.getenv("PAID_CREDITOS_PACK_30", "30"))    # pack 4.90€
+PAID_CREDITOS_PACK_100  = int(os.getenv("PAID_CREDITOS_PACK_100", "100"))  # pack 9.90€
 
-# Aliases legacy para compatibilidad con cmd_plan y mensajes existentes
+# Aliases legacy
 FREE_ANALISIS_MAX  = FREE_CREDITOS_DIA
 FREE_VENTANA_HORAS = 0   # ya no se usa ventana, reseteo diario
+PAID_CREDITOS_PACK = PAID_CREDITOS_PACK_30   # alias mientras se migra el resto del código
 
 # ─── /ideal ──────────────────────────────────────────────────────────────────
 IDEAL_TOP_N          = int(os.getenv("IDEAL_TOP_N", "3"))

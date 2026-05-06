@@ -11,7 +11,7 @@ from functools import wraps
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from config import FREE_CREDITOS_DIA, PAID_CREDITOS_PACK, ADMIN_USER_IDS
+from config import FREE_CREDITOS_DIA, PAID_CREDITOS_PACK_30, PAID_CREDITOS_PACK_100, ADMIN_USER_IDS
 from database import get_o_crear_usuario, puede_usar, registrar_uso, minutos_hasta_reset
 
 # Coste en créditos de cada comando.
@@ -60,11 +60,16 @@ def requiere_acceso(comando: str, registrar: bool = True):
                 return
 
             if info["plan"] == "free" and restantes == coste:
+                keyboard = InlineKeyboardMarkup([[
+                    InlineKeyboardButton(f"💳 {PAID_CREDITOS_PACK_30} acciones — 4.90€",  callback_data="pagar_pack_30"),
+                    InlineKeyboardButton(f"💎 {PAID_CREDITOS_PACK_100} acciones — 9.90€", callback_data="pagar_pack_100"),
+                ]])
                 await update.effective_message.reply_text(
                     f"ℹ️ Esta es tu última acción gratuita de hoy. "
-                    f"Mañana tienes {FREE_CREDITOS_DIA} nuevas. "
-                    f"O continúa ahora por 4.90€ ({PAID_CREDITOS_PACK} acciones sin caducidad).",
+                    f"Mañana tienes {FREE_CREDITOS_DIA} nuevas.\n\n"
+                    f"O continúa ahora con un pack sin caducidad:",
                     parse_mode="HTML",
+                    reply_markup=keyboard,
                 )
 
             try:
@@ -109,15 +114,15 @@ async def _enviar_paywall(update: Update, info: dict, comando: str):
             "El bot cruza el precio con el mercado real, investiga el "
             "historial del modelo, detecta red flags y calcula la "
             "etiqueta DGT. Todo en segundos.\n\n"
-            "Para seguir analizando ahora:\n"
-            f"• <b>4.90€</b> — {PAID_CREDITOS_PACK} acciones sin caducidad\n"
-            "• <b>9.90€/mes</b> — Ilimitado\n\n"
+            "Para seguir analizando ahora — packs sin caducidad:\n"
+            f"• <b>4.90€</b> — {PAID_CREDITOS_PACK_30} acciones\n"
+            f"• <b>9.90€</b> — {PAID_CREDITOS_PACK_100} acciones\n\n"
             "Los ingresos financian el proyecto."
         )
     elif plan == "paid":
         texto = (
-            f"📦 <b>Has consumido las {PAID_CREDITOS_PACK} acciones del pack.</b>\n\n"
-            "Recarga otro pack o pásate a PRO ilimitado:"
+            "📦 <b>Has consumido todas las acciones del pack.</b>\n\n"
+            "Recarga otro pack:"
         )
     else:
         texto = (
@@ -126,8 +131,8 @@ async def _enviar_paywall(update: Update, info: dict, comando: str):
         )
 
     keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"💳 {PAID_CREDITOS_PACK} acciones — 4.90€", callback_data="pagar_pack"),
-        InlineKeyboardButton("🚀 Ilimitado — 9.90€/mes", callback_data="pagar_pro"),
+        InlineKeyboardButton(f"💳 {PAID_CREDITOS_PACK_30} acciones — 4.90€",  callback_data="pagar_pack_30"),
+        InlineKeyboardButton(f"💎 {PAID_CREDITOS_PACK_100} acciones — 9.90€", callback_data="pagar_pack_100"),
     ]])
     await update.effective_message.reply_text(
         texto, parse_mode="HTML", reply_markup=keyboard
