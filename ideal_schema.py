@@ -20,9 +20,9 @@ class SlotsIdeal:
     aversion_taller: Optional[bool] = None
 
     # ── SECUNDARIOS ─────────────────────────────────────────────────────────
-    combustible_preferencia: str = "indistinto"    # gasolina|diesel|hibrido|phev|electrico|indistinto
-    cambio: str = "indistinto"                     # manual|automatico|indistinto
-    tamaño_preferencia: str = "indistinto"         # urbano|compacto|familiar|suv|monovolumen|indistinto
+    combustible_preferencia: Optional[str] = None  # gasolina|diesel|hibrido|phev|electrico|indistinto
+    cambio: Optional[str] = None                   # manual|automatico|indistinto
+    tamaño_preferencia: Optional[str] = None       # urbano|compacto|familiar|suv|monovolumen|indistinto
     carga_habitual: str = "normal"                 # poca|normal|mucha|perro_grande
     antiguedad_max_años: Optional[int] = None
     km_max_aceptable: Optional[int] = None
@@ -30,12 +30,13 @@ class SlotsIdeal:
     # ── CONTEXTO ────────────────────────────────────────────────────────────
     experiencia_previa: list[str] = field(default_factory=list)
     rechazos_explicitos: list[str] = field(default_factory=list)
-    prioridad: str = "fiabilidad"                  # fiabilidad|comodidad|deportividad|eficiencia|espacio
+    prioridad: Optional[str] = None                # fiabilidad|comodidad|deportividad|eficiencia|espacio
 
     # ── SLOTS CRÍTICOS ──────────────────────────────────────────────────────
     SLOTS_CRITICOS = (
         "presupuesto_max", "uso_principal", "pasajeros_habituales",
         "km_anuales", "zbe_relevante", "aversion_taller",
+        "combustible_preferencia", "tamaño_preferencia", "cambio", "prioridad",
     )
 
     def slots_criticos_faltantes(self) -> list[str]:
@@ -100,22 +101,30 @@ class SlotsIdeal:
 
 
 PLANTILLAS_PREGUNTAS: dict[str, str] = {
-    "presupuesto_max":      "💰 ¿Qué presupuesto máximo manejas? <i>(en euros)</i>",
-    "uso_principal":        "🛣️ ¿Para qué lo usarás más? <i>Ciudad, autovía, mixto, montaña, offroad.</i>",
-    "pasajeros_habituales": "👥 ¿Cuántos sois habitualmente? <i>(número)</i>",
-    "km_anuales":           "📏 ¿Cuántos km haces al año?",
-    "zbe_relevante":        "🚦 ¿Vives en ciudad con ZBE (Madrid Central, Barcelona…)? <i>Sí/No.</i>",
-    "aversion_taller":      "🔧 ¿Prefieres pagar más por algo que no dé un solo problema? <i>Sí/No.</i>",
+    "presupuesto_max":         "💰 ¿Qué presupuesto máximo manejas? <i>(en euros)</i>",
+    "uso_principal":           "🛣️ ¿Para qué lo usarás más? <i>Ciudad, autovía, mixto, montaña, offroad.</i>",
+    "pasajeros_habituales":    "👥 ¿Cuántos sois habitualmente? <i>(número)</i>",
+    "km_anuales":              "📏 ¿Cuántos km haces al año?",
+    "zbe_relevante":           "🚦 ¿Vives en ciudad con ZBE (Madrid Central, Barcelona…)? <i>Sí/No.</i>",
+    "aversion_taller":         "🔧 ¿Prefieres pagar más por algo que no dé un solo problema? <i>Sí/No.</i>",
+    "combustible_preferencia": "⛽ ¿Tienes preferencia de combustible? <i>Gasolina, diésel, híbrido, PHEV, eléctrico — o da igual.</i>",
+    "tamaño_preferencia":      "🚗 ¿Qué tipo de coche buscas? <i>Urbano, compacto, familiar/combi, SUV, monovolumen — o da igual.</i>",
+    "cambio":                  "⚙️ ¿Manual o automático? <i>O da igual.</i>",
+    "prioridad":               "🎯 ¿Qué priorizas más? <i>Fiabilidad, eficiencia (consumo), espacio, comodidad o deportividad.</i>",
 }
 
 # Defaults razonables si el user no sabe / no responde tras 2 intentos.
 # Presupuesto NO tiene default — sin él no se puede recomendar.
 DEFAULTS_SLOTS: dict[str, object] = {
-    "uso_principal":        "mixto",
-    "pasajeros_habituales": 4,
-    "km_anuales":           12000,
-    "zbe_relevante":        False,
-    "aversion_taller":      True,
+    "uso_principal":           "mixto",
+    "pasajeros_habituales":    4,
+    "km_anuales":              12000,
+    "zbe_relevante":           False,
+    "aversion_taller":         True,
+    "combustible_preferencia": "indistinto",
+    "tamaño_preferencia":      "indistinto",
+    "cambio":                  "indistinto",
+    "prioridad":               "fiabilidad",
 }
 
 _SKIP_PATTERNS = (
@@ -199,6 +208,62 @@ def parsear_respuesta_corta(slot: str, texto: str):
             return True
         if t in ("no", "n"):
             return False
+        return None
+
+    if slot == "combustible_preferencia":
+        if any(x in t for x in ("gasolina", "nafta", "gasolín", "gasolin")):
+            return "gasolina"
+        if any(x in t for x in ("diesel", "diésel", "gasoil", "gasóil", "tdi", "hdi", " dci")):
+            return "diesel"
+        if any(x in t for x in ("phev", "enchufable", "plug", "hibrido enchufable", "híbrido enchufable")):
+            return "phev"
+        if any(x in t for x in ("híbrido", "hibrido", "hybrid", "hev")):
+            return "hibrido"
+        if any(x in t for x in ("eléctrico", "electrico", " ev ", "bev", "100% eléctrico")):
+            return "electrico"
+        if any(x in t for x in ("indistinto", "da igual", "cualquier", "me da", "lo que sea", "no importa", "sin preferencia")):
+            return "indistinto"
+        return None
+
+    if slot == "tamaño_preferencia":
+        if any(x in t for x in ("suv", "todocamino", "todo camino", "campo", "4x4", "crossover")):
+            return "suv"
+        if any(x in t for x in ("monovolumen", "furgoneta", "minivan", "van", "7 plazas", "7 asientos")):
+            return "monovolumen"
+        if any(x in t for x in ("familiar", "combi", "break", "touring", "sw")):
+            return "familiar"
+        if any(x in t for x in ("compacto", "berlina", "sedán", "sedan", "hatchback", "5 puertas", "5p")):
+            return "compacto"
+        if any(x in t for x in ("urbano", "pequeño", "micro", "city", "utilitario")):
+            return "urbano"
+        if any(x in t for x in ("indistinto", "da igual", "cualquier", "me da", "lo que sea", "no importa")):
+            return "indistinto"
+        return None
+
+    if slot == "cambio":
+        if any(x in t for x in ("manual", "palanca", "embrague")):
+            return "manual"
+        if any(x in t for x in ("automático", "automatico", "auto ", "dsg", "caja auto", "sin embrague", "cvt", "pdk")):
+            return "automatico"
+        if any(x in t for x in ("indistinto", "da igual", "cualquier", "me da", "lo que sea")):
+            return "indistinto"
+        if t in ("a", "auto"):
+            return "automatico"
+        if t in ("m"):
+            return "manual"
+        return None
+
+    if slot == "prioridad":
+        if any(x in t for x in ("fiabilidad", "fiable", "no falle", "no de problemas", "sin averías", "sin averias", "seguro", "confiable")):
+            return "fiabilidad"
+        if any(x in t for x in ("eficien", "consumo", "ahorro", "gastar poco", "económico", "economico", "bajo consumo")):
+            return "eficiencia"
+        if any(x in t for x in ("espacio", "grande", "amplio", "amplia", "maletero", "cabida")):
+            return "espacio"
+        if any(x in t for x in ("comod", "confort", "suave", "silencioso", "descanso", "viaje largo")):
+            return "comodidad"
+        if any(x in t for x in ("deport", "sport", "rápido", "rapido", "potente", "potencia", "agil", "ágil", "divertido")):
+            return "deportividad"
         return None
 
     if slot == "uso_principal":

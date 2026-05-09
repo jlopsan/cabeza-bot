@@ -27,7 +27,7 @@ from ideal_schema import (
     SlotsIdeal, DEFAULTS_SLOTS, es_skip, parsear_respuesta_corta,
 )
 from red_flags import detectar_red_flags
-from scraper import buscar_comparables_todas
+from scraper import buscar_comparables_wallapop
 
 logger = logging.getLogger(__name__)
 
@@ -252,46 +252,134 @@ async def fase_enriquecimiento(sesion: dict, top_n: int = 8) -> list[dict]:
 
 # ── FASE 4: validación en mercado ──────────────────────────────────────────
 
-_TECH_TOKENS_MOTOR = [
-    "tsi", "tfsi", "tdi", "hdi", "dci", "cdti", "tdci", "bluehdi", "blue hdi",
-    "puretech", "vti", "thp", "mpi", "gdi", "fsi", "ecoboost", "vvt-i", "vvti",
-    "vvt", "dualjet", "skyactiv", "turbo", "ecotec",
-    "hybrid", "hibrid", "phev", "hev", "self charg", "mhev", "e-tech",
-    "crdi", "drive-e",
-]
+def _modelo_coincide(anun_marca: str, anun_modelo: str, cand_marca: str, cand_modelo: str) -> bool:
+    """
+    True si el anuncio pertenece al mismo marca+modelo que el candidato.
+    Evita que una búsqueda de 'Mazda 2' muestre 'Mazda 3' o 'CX-5'.
+    """
+    a_mar = (anun_marca or "").lower().strip()
+    c_mar = (cand_marca or "").lower().strip()
+    a_mod = (anun_modelo or "").lower().strip()
+    c_mod = (cand_modelo or "").lower().strip()
+
+    # Marca: si ambas conocidas deben coincidir
+    if a_mar and c_mar and a_mar != c_mar:
+        return False
+
+    # Modelo: si ambas conocidas
+    if not a_mod or not c_mod:
+        return True  # Sin datos → benefit of doubt
+
+    if a_mod == c_mod:
+        return True
+
+    # Modelos cortos (≤3 chars: "2", "3", "a3"): solo acepta exacto
+    # para evitar que "2" aparezca en "cx-2", "2016", etc.
+    if len(c_mod) <= 3 and len(a_mod) <= 3:
+        return False
+
+    # Modelos largos: acepta si uno contiene al otro
+    # ("golf" in "golf vii", "3" in "serie 3", "octavia" in "octavia rs")
+    return c_mod in a_mod or a_mod in c_mod
 
 
-def _keywords_motor(version_motor: str) -> list[str]:
-    """Extrae cilindrada (1.0, 2.0) y tokens técnicos del motor para matching."""
-    m = (version_motor or "").lower()
-    keys: list[str] = []
-    cil = _re.findall(r"\b(\d\.\d{1,2})\b", m)
-    keys.extend(cil)
-    for tok in _TECH_TOKENS_MOTOR:
-        if tok in m:
-            keys.append(tok)
-    return keys
+def _familia_combustible(texto: str) -> str:
+    """Extrae familia de combustible de cualquier texto. Devuelve '' si no detecta."""
+    t = (texto or "").lower()
+    if any(x in t for x in ("tdi", "hdi", "dci", "cdti", "tdci", "bluehdi", "crdi",
+                             "diesel", "diésel", "gasoil")):
+        return "diesel"
+    if any(x in t for x in ("hybrid", "hibrid", "phev", "hev", "mhev", "e-tech",
+                             "self-charg", "self charg")):
+        return "hibrido"
+    if any(x in t for x in ("electr", "bev", " ev ")):
+        return "electrico"
+    if any(x in t for x in ("tsi", "tfsi", "puretech", "ecoboost", "vvt", "gdi",
+                             "fsi", "skyactiv", "turbo", "gasolina", "nafta",
+                             "vti", "thp", "mpi", "ecotec", "dualjet")):
+        return "gasolina"
+    return ""
 
 
-def _anuncio_encaja(anuncio, candidato: dict, slots: SlotsIdeal) -> bool:
-    """Filtros duros sobre un anuncio para validar que es comprable."""
+def _año_rango_por_presupuesto(presup_max: int) -> tuple[int, int]:
+    """Dos años ancla para dos búsquedas paralelas. Cubre ~6 años de mercado."""
+    if presup_max <= 5000:  return 2011, 2014
+    if presup_max <= 7000:  return 2013, 2016
+    if presup_max <= 9000:  return 2014, 2017
+    if presup_max <= 12000: return 2016, 2019
+    if presup_max <= 16000: return 2018, 2021
+    if presup_max <= 22000: return 2020, 2022
+    return 2021, 2023
+
+
+def _km_max_por_presupuesto(presup_max: int) -> int:
+    """Km máximo coherente con el presupuesto para pasar al scraper."""
+    if presup_max <= 6000:  return 220000
+    if presup_max <= 9000:  return 190000
+    if presup_max <= 13000: return 160000
+    if presup_max <= 18000: return 130000
+    return 100000
+
+
+def _merge_dedup(res_a, res_b) -> list:
+    """Merge de dos resultados de búsqueda, deduplicando por item_id."""
+    vistos: set = set()
+    out: list = []
+    for res in (res_a, res_b):
+        if not isinstance(res, list):
+            continue
+        for a in res:
+            if a.item_id not in vistos:
+                vistos.add(a.item_id)
+                out.append(a)
+    return out
+
+
+def _anuncio_encaja(anuncio, candidato: dict, slots: SlotsIdeal,
+                    año_min: int = 0, año_max: int = 0,
+                    check_motor: bool = True) -> bool:
+    """
+    Filtros duros sobre un anuncio.
+    Motor: rechaza solo por CONTRADICCIÓN de familia combustible o cilindrada.
+    Wallapop.motor = "Gasolina 95cv" (familia, no código). Coches.net.motor = "".
+    """
     if anuncio.precio <= 0 or anuncio.km <= 0 or anuncio.año <= 1990:
         return False
 
-    keywords = _keywords_motor(candidato.get("version_motor", ""))
-    if keywords:
-        haystack = f"{(anuncio.titulo or '').lower()} {(anuncio.descripcion or '').lower()} {(getattr(anuncio, 'motor', '') or '').lower()}"
-        # Solo filtra si el haystack tiene contenido suficiente (título largo o descripción)
-        # Resultados de búsqueda suelen tener título corto sin código motor → pasar
-        if len(haystack.strip()) > 60 and not any(k in haystack for k in keywords):
-            return False
-
-    # Km vs edad
-    edad = max(1, datetime.utcnow().year - anuncio.año)
-    km_max_razonable = edad * 22000
-    if anuncio.km > km_max_razonable * 1.5:
+    # ── Filtro de marca+modelo — el anuncio debe ser del coche buscado ───────
+    if not _modelo_coincide(anuncio.marca, anuncio.modelo,
+                             candidato.get("marca", ""), candidato.get("modelo", "")):
         return False
 
+    # ── Filtro de motor — contradicción probada ──────────────────────────────
+    if check_motor:
+        version_motor = candidato.get("version_motor", "")
+        fam_cand = _familia_combustible(version_motor)
+        haystack_motor = (getattr(anuncio, "motor", "") or "") + " " + (anuncio.titulo or "")
+        fam_anun = _familia_combustible(haystack_motor)
+
+        # Contradicción de familia combustible
+        if fam_cand and fam_anun and fam_cand != fam_anun:
+            return False
+
+        # Cilindrada contradictoria: anuncio menciona una distinta a la candidata
+        cil_cand = _re.findall(r"\b(\d\.\d)\b", version_motor.lower())
+        if cil_cand:
+            cil_anun = _re.findall(r"\b(\d\.\d)\b", haystack_motor.lower())
+            if cil_anun and cil_cand[0] not in cil_anun:
+                return False
+
+    # ── Filtro de año ────────────────────────────────────────────────────────
+    if año_min and año_max:
+        if not (año_min - 1 <= anuncio.año <= año_max + 1):
+            return False
+
+    # ── Km vs edad ───────────────────────────────────────────────────────────
+    edad = max(1, datetime.utcnow().year - anuncio.año)
+    if anuncio.km > edad * 22000 * 1.5:
+        return False
+
+    # ── Precio dentro del presupuesto ────────────────────────────────────────
     presup_max = slots.presupuesto_max or 0
     presup_min = slots.presupuesto_min or int(presup_max * 0.5)
     if not (presup_min <= anuncio.precio <= presup_max * 1.05):
@@ -299,8 +387,7 @@ def _anuncio_encaja(anuncio, candidato: dict, slots: SlotsIdeal) -> bool:
 
     try:
         flags = detectar_red_flags(anuncio, None)
-        graves = [f for f in flags if "estafa" in f.lower() or "scam" in f.lower()]
-        if graves:
+        if any("estafa" in f.lower() or "scam" in f.lower() for f in flags):
             return False
     except Exception:
         pass
@@ -308,43 +395,53 @@ def _anuncio_encaja(anuncio, candidato: dict, slots: SlotsIdeal) -> bool:
     return True
 
 
-def _año_busqueda_por_presupuesto(presup_max: int) -> int:
-    """Año de búsqueda derivado del presupuesto real, no de estimados IA."""
-    if presup_max <= 5000:  return 2012
-    if presup_max <= 7000:  return 2014
-    if presup_max <= 9000:  return 2016
-    if presup_max <= 12000: return 2018
-    if presup_max <= 16000: return 2019
-    if presup_max <= 22000: return 2021
-    return 2022
-
-
 async def _buscar_anuncios_candidato(candidato: dict, slots: SlotsIdeal) -> list:
-    """Busca anuncios reales en el rango de precio del usuario, sin estimar."""
+    """
+    Dos búsquedas paralelas con cobertura de ~6 años + fallbacks en cascada.
+    Nunca devuelve vacío si el mercado tiene algo comprable.
+    """
     presup_max = slots.presupuesto_max or 0
-    año_busqueda = _año_busqueda_por_presupuesto(presup_max)
-    km_estimado = max(1, datetime.utcnow().year - año_busqueda) * 16000
+    presup_min = slots.presupuesto_min or int(presup_max * 0.5)
+    año_bajo, año_alto = _año_rango_por_presupuesto(presup_max)
+    km_max = _km_max_por_presupuesto(presup_max)
+    marca, modelo = candidato["marca"], candidato["modelo"]
 
-    try:
-        anuncios = await buscar_comparables_todas(
-            marca=candidato["marca"],
-            modelo=candidato["modelo"],
-            año=año_busqueda,
-            km=km_estimado,
-            n=25,
-        )
-    except Exception as e:
-        logger.warning(f"[IDEAL_V2] buscar {candidato['marca']} {candidato['modelo']}: {e}")
-        return []
+    # Construir filtros para coches.net (búsqueda IA con motor concreto)
+    version_motor = candidato.get("version_motor", "")
+    fam_comb = _familia_combustible(version_motor)
+    filtros_busqueda: dict | None = (
+        {"combustible": fam_comb, "version_motor": version_motor}
+        if version_motor else None
+    )
 
-    if not anuncios:
-        return []
+    # Dos búsquedas paralelas cubriendo ~6 años de mercado (solo Wallapop — coches.net devuelve marcas incorrectas)
+    res_b, res_a = await asyncio.gather(
+        buscar_comparables_wallapop(marca, modelo, año_bajo, km_max, n=20),
+        buscar_comparables_wallapop(marca, modelo, año_alto, km_max, n=20),
+        return_exceptions=True,
+    )
+    anuncios = _merge_dedup(res_b, res_a)
 
-    encajan = [a for a in anuncios if _anuncio_encaja(a, candidato, slots)]
+    # ── Intento 1: todos los filtros (motor familia + año + precio + km) ─────
+    encajan = [a for a in anuncios
+               if _anuncio_encaja(a, candidato, slots, año_bajo, año_alto, check_motor=True)]
+
+    # ── Fallback 1: sin filtro motor (coches.net motor="", wallapop motor=tipo) ─
+    if not encajan:
+        encajan = [a for a in anuncios
+                   if _anuncio_encaja(a, candidato, slots, año_bajo, año_alto, check_motor=False)]
+
+    # ── Fallback 2: solo precio dentro de presupuesto, año mínimo razonable ──
+    if not encajan:
+        encajan = [a for a in anuncios
+                   if a.precio > 0 and a.precio <= presup_max * 1.05
+                   and a.precio >= presup_min * 0.7
+                   and a.km > 0 and a.año > 2005]
+
     encajan.sort(key=lambda a: a.precio)
-    logger.info(f"[IDEAL_V2] {candidato['marca']} {candidato['modelo']}: "
-                f"{len(anuncios)} raw → {len(encajan)} dentro de presupuesto "
-                f"(año búsqueda={año_busqueda}, max={presup_max}€)")
+    logger.info(f"[IDEAL_V2] {marca} {modelo}: {len(anuncios)} raw → "
+                f"{len(encajan)} encajan "
+                f"(años {año_bajo}-{año_alto}, presup {presup_min}-{presup_max}€)")
     return encajan[:4]
 
 

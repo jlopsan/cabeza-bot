@@ -1232,6 +1232,10 @@ class ScraperWallapop:
 # COCHES.NET  (Query texto español → su buscador IA filtra)
 # ════════════════════════════════════════════════════════════════════════════
 
+# Máximo 2 browsers Playwright simultáneos para coches.net (10 en paralelo revienta RAM)
+_COCHES_NET_SEM = asyncio.Semaphore(2)
+
+
 class ScraperCochesNet:
     nombre = "coches.net"
     SEARCH_URL = "https://www.coches.net/segunda-mano/"
@@ -1260,21 +1264,161 @@ class ScraperCochesNet:
         return "coches.net" in (url or "").lower()
 
     # ── API pública unificada (capa fuente-agnóstica) ────────────────────────
+    def _query_busqueda(self, marca: str, modelo: str, filtros: dict) -> str:
+        """Query para el buscador IA: 'KIA Rio 1.2 CVVT' o 'KIA Rio gasolina'."""
+        version_motor = str(filtros.get("version_motor", "")).strip()
+        combustible = str(filtros.get("combustible", "")).strip().lower()
+        partes = [marca, modelo]
+        if version_motor:
+            engine = re.sub(
+                r"\s*\d+\s*(cv|kw|ps|hp)\b.*$", "", version_motor, flags=re.IGNORECASE
+            ).strip()
+            if engine:
+                partes.append(engine)
+        elif combustible and combustible not in ("indistinto", ""):
+            partes.append(combustible)
+        return " ".join(partes)
+
+    async def _buscar_httpx(
+        self, marca: str, modelo: str, año: int, km: int, n: int,
+        filtros: dict | None = None,
+    ) -> list:
+        """Scraping con httpx puro — coches.net usa SSR, el HTML llega completo."""
+        import urllib.parse
+        filtros = filtros or {}
+        query = self._query_busqueda(marca, modelo, filtros)
+
+        params: dict[str, str] = {
+            "MakeModelGeneralSearch": query,
+            "OrderTypeId": "Price",
+            "OrderAsc": "True",
+        }
+        if año:
+            params["MinYear"] = str(año - AÑO_TOLERANCIA)
+            params["MaxYear"] = str(año + AÑO_TOLERANCIA)
+        if km:
+            params["MaxKms"] = str(km + KM_TOLERANCIA)
+
+        url = self.SEARCH_URL + "?" + urllib.parse.urlencode(params)
+        hdrs = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "es-ES,es;q=0.9",
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;"
+                "q=0.9,image/avif,image/webp,*/*;q=0.8"
+            ),
+            "Accept-Encoding": "gzip, deflate, br",
+            "Referer": "https://www.coches.net/",
+        }
+
+        logger.info(f"[coches.net httpx] GET '{query}' año±{AÑO_TOLERANCIA} km≤{km}")
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True, timeout=20, headers=hdrs,
+            ) as client:
+                resp = await client.get(url)
+
+            if resp.status_code != 200:
+                logger.warning(f"[coches.net httpx] Status {resp.status_code}")
+                return []
+            if len(resp.text) < 10_000:
+                logger.warning(
+                    f"[coches.net httpx] Respuesta corta ({len(resp.text)} B) — posible bloqueo"
+                )
+                return []
+
+            anuncios = self._parsear_cards_html(resp.text, marca, modelo, n)
+            logger.info(f"[coches.net httpx] {len(anuncios)} anuncios")
+            return anuncios
+        except Exception as e:
+            logger.error(f"[coches.net httpx] Error: {e}")
+            return []
+
+    def _parsear_cards_html(self, html: str, marca: str, modelo: str, n: int) -> list:
+        """Parsea el HTML de listado coches.net (SSR). Título incluye motor exacto."""
+        import html as _html
+        from models import Anuncio
+        from datetime import datetime
+
+        anuncios: list = []
+        # Segmentar por card usando data-ad-id
+        posiciones = [(m.start(), m.group(1)) for m in re.finditer(r'data-ad-id="(\d+)"', html)]
+
+        for idx, (pos, ad_id) in enumerate(posiciones[:n]):
+            fin = posiciones[idx + 1][0] if idx + 1 < len(posiciones) else len(html)
+            chunk = html[pos:fin]
+            try:
+                # Título + href (el título incluye motor: "KIA Rio 1.2 CVVT Concept")
+                m = re.search(
+                    r'class="mt-CardAd-infoHeaderTitleLink"[^>]*href="([^"]+)"[^>]*>'
+                    r"([^<]+)</a>",
+                    chunk,
+                )
+                if not m:
+                    continue
+                href = m.group(1)
+                titulo = _html.unescape(m.group(2).strip())
+
+                # Precio
+                mp = re.search(r'data-testid="card-adPrice-price">([^<]+)</p>', chunk)
+                if not mp:
+                    continue
+                precio = float(re.sub(r"[^\d]", "", _html.unescape(mp.group(1))) or "0")
+                if precio <= 0:
+                    continue
+
+                # Atributos: año, km, combustible
+                año_val = km_val = 0
+                motor_texto = ""
+                for item in re.findall(r'class="mt-CardAd-attrItem">([^<]+)</li>', chunk):
+                    item = _html.unescape(item).strip()
+                    if re.match(r"^\d{4}$", item):
+                        año_val = int(item)
+                    elif "km" in item.lower():
+                        km_val = int(re.sub(r"[^\d]", "", item) or "0")
+                    elif any(c in item.lower() for c in
+                             ("gasol", "diesel", "híbrido", "electr", "gasoil")):
+                        motor_texto = item
+
+                full_url = (
+                    f"https://www.coches.net{href}" if href.startswith("/") else href
+                )
+                anuncios.append(Anuncio(
+                    item_id=ad_id,
+                    titulo=titulo,
+                    precio=precio,
+                    año=año_val,
+                    km=km_val,
+                    marca=marca,
+                    modelo=modelo,
+                    motor=motor_texto,
+                    url=full_url,
+                    fuente="coches.net",
+                    fecha_scraping=datetime.utcnow(),
+                ))
+            except Exception as e:
+                logger.debug(f"[coches.net httpx] card {ad_id} skip: {e}")
+
+        return anuncios
+
     async def buscar_comparables(
         self, marca: str, modelo: str, año: int, km: int, n: int = 20,
+        filtros: dict | None = None,
     ) -> list:
-        for backend in (self._buscar_playwright,):
+        # httpx bloqueado por Cloudflare — ir directo a Playwright con semáforo
+        async with _COCHES_NET_SEM:
             try:
-                items = await backend(marca, modelo, año, km, n)
-                if len(items) >= 3:
-                    logger.info(f"[coches.net] {backend.__name__} OK: {len(items)} items")
-                    return items
-                logger.warning(
-                    f"[coches.net] {backend.__name__} devolvió {len(items)} (<3)"
-                )
+                items = await self._buscar_playwright(marca, modelo, año, km, n, filtros or {})
+                if items:
+                    logger.info(f"[coches.net] Playwright OK: {len(items)} items")
+                return items
             except Exception as e:
-                logger.warning(f"[coches.net] {backend.__name__} falló: {e}")
-        return []
+                logger.warning(f"[coches.net] Playwright falló: {e}")
+                return []
 
     async def obtener_anuncio(self, url: str):
         """Extrae datos de un anuncio individual de coches.net por URL."""
@@ -1291,20 +1435,24 @@ class ScraperCochesNet:
         )
         proxy_cfg = {"server": random.choice(PROXIES)} if PROXIES else None
         async with async_playwright() as p:
-            # Headless es detectado por coches.net (devuelve 8 KB sin precio).
-            # Usamos headless=False; en producción Linux usa xvfb-run.
+            # headless=False evita el anti-bot de coches.net en producción (xvfb-run).
+            # Si no hay display, intentamos headless=True como fallback (puede ser detectado,
+            # pero al menos extraemos JSON-LD que está en el HTML inicial).
+            browser = None
             try:
                 browser = await p.chromium.launch(headless=False)
             except Exception as _e:
                 _emsg = str(_e).lower()
                 if any(x in _emsg for x in ("missing x", "display", "x11", "cannot open")):
-                    logger.error(
-                        "[coches.net] Sin display disponible — "
-                        "usa xvfb-run o pon ENABLE_COCHES_NET=false"
-                    )
+                    logger.warning("[coches.net] Sin display — intentando headless=True")
+                    try:
+                        browser = await p.chromium.launch(headless=True)
+                    except Exception as _e2:
+                        logger.error(f"[coches.net] headless=True también falló: {_e2}")
+                        return None
                 else:
                     logger.error(f"[coches.net] Error lanzando browser: {_e}")
-                return None
+                    return None
             context = await _nuevo_contexto_stealth(browser, user_agent, proxy_cfg, locale="es-ES")
             await context.add_init_script(
                 "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
@@ -1348,39 +1496,63 @@ class ScraperCochesNet:
                 except Exception:
                     pass
 
-                # Sanity check: si el HTML es muy pequeño la SPA no renderizó.
-                if len(html) < 50_000:
-                    logger.error(
-                        f"[coches.net] HTML solo {len(html)} bytes — coches.net "
-                        "bloqueó el render. No puedo extraer este anuncio."
-                    )
-                    return None
-
-                # Precio: SOLO dentro del header de detalle. Coger el PRIMER
-                # candidato real (el grande mostrado al usuario), filtrando
-                # cuotas mensuales y precios de banners/related.
-                precio = 0.0
-                for psel in ["[class*='mt-DetailHead-priceMain']",
-                             "[class*='priceMain']",
-                             "[class*='DetailPrice'] strong",
-                             "[class*='DetailHead'] strong",
-                             "[class*='DetailHead'] [class*='price']"]:
+                # --- JSON-LD (server-side, más estable que selectores CSS) ---
+                import json as _json
+                ld_precio = 0.0
+                ld_titulo = ""
+                for raw_ld in re.findall(
+                    r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+                    html, re.DOTALL | re.IGNORECASE
+                ):
                     try:
-                        loc = page.locator(psel)
-                        n = min(await loc.count(), 5)
-                        for i in range(n):
-                            t = (await loc.nth(i).inner_text()).strip()
-                            low = t.lower()
-                            if "/mes" in low or "mes" in low.split() or "cuota" in low:
-                                continue
-                            v = _parse_numero(t)
-                            if v >= 1000:
-                                precio = v
+                        d = _json.loads(raw_ld)
+                        items = d if isinstance(d, list) else [d]
+                        for item in items:
+                            offers = item.get('offers', {})
+                            if isinstance(offers, list):
+                                offers = offers[0] if offers else {}
+                            p = float(str(offers.get('price', 0) or 0))
+                            if p >= 1000:
+                                ld_precio = p
+                                ld_titulo = item.get('name', '') or ld_titulo
                                 break
-                        if precio > 0:
+                        if ld_precio > 0:
                             break
                     except Exception:
                         continue
+
+                # Sanity check: página muy pequeña Y sin JSON-LD = bloqueado.
+                if len(html) < 15_000 and ld_precio <= 0:
+                    logger.error(
+                        f"[coches.net] HTML solo {len(html)} bytes y sin JSON-LD — "
+                        "bloqueado por anti-bot."
+                    )
+                    return None
+
+                # Precio: usa JSON-LD si disponible, luego CSS selectors.
+                precio = ld_precio
+                if precio <= 0:
+                    for psel in ["[class*='mt-DetailHead-priceMain']",
+                                 "[class*='priceMain']",
+                                 "[class*='DetailPrice'] strong",
+                                 "[class*='DetailHead'] strong",
+                                 "[class*='DetailHead'] [class*='price']"]:
+                        try:
+                            loc = page.locator(psel)
+                            n = min(await loc.count(), 5)
+                            for i in range(n):
+                                t = (await loc.nth(i).inner_text()).strip()
+                                low = t.lower()
+                                if "/mes" in low or "mes" in low.split() or "cuota" in low:
+                                    continue
+                                v = _parse_numero(t)
+                                if v >= 1000:
+                                    precio = v
+                                    break
+                            if precio > 0:
+                                break
+                        except Exception:
+                            continue
 
                 # Fallback regex SOLO dentro del bloque de detalle (jamás en aside ni footer)
                 if precio <= 0:
@@ -1403,17 +1575,19 @@ class ScraperCochesNet:
                             precio = v
                             break
 
-                # Título
-                titulo = ""
-                for tsel in ["h1", "[class*='DetailHead-titleMain']", "[class*='title']"]:
-                    try:
-                        el = page.locator(tsel).first
-                        if await el.count() > 0:
-                            titulo = (await el.inner_text()).strip()
-                            if titulo:
-                                break
-                    except Exception:
-                        continue
+                # Título: JSON-LD primero, luego selectores CSS
+                titulo = ld_titulo
+                if not titulo:
+                    for tsel in ["h1", "[class*='DetailHead-titleMain']",
+                                 "[class*='titleMain']", "[class*='title']"]:
+                        try:
+                            el = page.locator(tsel).first
+                            if await el.count() > 0:
+                                titulo = (await el.inner_text()).strip()
+                                if titulo:
+                                    break
+                        except Exception:
+                            continue
 
                 # Descripción
                 descripcion = ""
@@ -1542,14 +1716,10 @@ class ScraperCochesNet:
     # ── Backend Playwright ────────────────────────────────────────────────────
     async def _buscar_playwright(
         self, marca: str, modelo: str, año: int, km: int, n: int,
+        filtros: dict | None = None,
     ) -> list:
-        query_es = _construir_query_es(marca, modelo, {})
-        url = f"{self.SEARCH_URL}?MakeModelGeneralSearch={query_es}"
-        url += "&OrderTypeId=Price&OrderAsc=True"
-        if año:
-            url += f"&MinYear={año - AÑO_TOLERANCIA}&MaxYear={año + AÑO_TOLERANCIA}"
-        if km:
-            url += f"&MaxKms={km + KM_TOLERANCIA}"
+        filtros = filtros or {}
+        query = self._query_busqueda(marca, modelo, filtros)
 
         user_agent = random.choice(USER_AGENTS)
         proxy_cfg = {"server": random.choice(PROXIES)} if PROXIES else None
@@ -1563,9 +1733,9 @@ class ScraperCochesNet:
             )
             page = await context.new_page()
             try:
-                logger.info(f"[coches.net] URL items: {url}")
-                await page.goto(url, timeout=30_000, wait_until="domcontentloaded")
-                await asyncio.sleep(random.uniform(2.0, 3.5))
+                logger.info(f"[coches.net] Buscando con IA: '{query}'")
+                await page.goto(self.SEARCH_URL, timeout=30_000, wait_until="domcontentloaded")
+                await asyncio.sleep(random.uniform(1.5, 2.5))
 
                 for sel in ["button#didomi-notice-agree-button",
                              "button:has-text('Aceptar')",
@@ -1578,6 +1748,33 @@ class ScraperCochesNet:
                             break
                     except Exception:
                         continue
+
+                # Escribir en el buscador IA y enviar
+                used_search_box = False
+                try:
+                    search_input = page.locator("input#search-ai-input-id")
+                    await search_input.wait_for(state="visible", timeout=5_000)
+                    await search_input.click()
+                    await asyncio.sleep(0.3)
+                    await search_input.fill(query)
+                    await asyncio.sleep(0.4)
+                    await search_input.press("Enter")
+                    await asyncio.sleep(random.uniform(3.5, 5.0))
+                    used_search_box = True
+                    logger.info(f"[coches.net] Query IA enviada: '{query}'")
+                except Exception as e:
+                    # Fallback: URL con params si el input no carga
+                    logger.warning(f"[coches.net] Search box no disponible ({e}), fallback URL")
+                    fallback_url = (
+                        f"{self.SEARCH_URL}?MakeModelGeneralSearch={query}"
+                        f"&OrderTypeId=Price&OrderAsc=True"
+                    )
+                    if año:
+                        fallback_url += f"&MinYear={año - AÑO_TOLERANCIA}&MaxYear={año + AÑO_TOLERANCIA}"
+                    if km:
+                        fallback_url += f"&MaxKms={km + KM_TOLERANCIA}"
+                    await page.goto(fallback_url, timeout=30_000, wait_until="domcontentloaded")
+                    await asyncio.sleep(random.uniform(2.0, 3.5))
 
                 # Localizar tarjetas con cascada de selectores
                 cards = None
@@ -2005,6 +2202,7 @@ async def obtener_anuncio_por_url(url: str):
 
 async def buscar_comparables_todas(
     marca: str, modelo: str, año: int, km: int, n: int = 20,
+    filtros: dict | None = None,
 ) -> list:
     """
     Lanza en paralelo las búsquedas de comparables en todas las fuentes ES
@@ -2015,7 +2213,7 @@ async def buscar_comparables_todas(
         tareas.append(buscar_comparables_wallapop(marca, modelo, año, km, n=n))
         fuentes.append("wallapop")
     if ENABLE_COCHES_NET:
-        tareas.append(ScraperCochesNet().buscar_comparables(marca, modelo, año, km, n=n))
+        tareas.append(ScraperCochesNet().buscar_comparables(marca, modelo, año, km, n=n, filtros=filtros))
         fuentes.append("coches.net")
     if not tareas:
         return []

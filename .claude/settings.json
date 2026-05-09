@@ -68,7 +68,10 @@
       "Bash(python -c \"import ast; [ast.parse\\(open\\(f, encoding='utf-8'\\).read\\(\\)\\) for f in ['main.py','ai.py']]; print\\('Sintaxis OK'\\)\")",
       "Bash(python -c \"import main, ai; print\\('Imports runtime OK'\\)\")",
       "Bash(/c/Users/Juan/Documents/cabeza-bot/venv/Scripts/python -c \"import py_compile; [py_compile.compile\\(f, doraise=True\\) for f in \\('ideal_schema.py','ideal_pipeline.py','ai.py','database.py','main.py','permisos.py'\\)]; print\\('OK'\\)\")",
-      "Bash(/c/Users/Juan/Documents/cabeza-bot/venv/Scripts/python -c ' *)"
+      "Bash(/c/Users/Juan/Documents/cabeza-bot/venv/Scripts/python -c ' *)",
+      "Bash(python -m py_compile scraper.py)",
+      "WebFetch(domain:apify.com)",
+      "WebFetch(domain:www.coches.net)"
     ],
     "additionalDirectories": [
       "c:\\Users\\Juan\\.claude\\plans"

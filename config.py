@@ -61,8 +61,9 @@ DB_PATH = os.getenv("DB_PATH", "cabeza_bot.db")
 
 # ─── IA (SambaNova - Llama 4 Maverick) ──────────────────────────────────────
 SAMBANOVA_API_KEY  = os.getenv("SAMBANOVA_API_KEY", "")
-SAMBANOVA_BASE_URL = os.getenv("SAMBANOVA_BASE_URL", "https://api.sambanova.ai/v1")
-AI_MODEL           = os.getenv("AI_MODEL", "Llama-4-Maverick-17B-128E-Instruct")
+SAMBANOVA_BASE_URL  = os.getenv("SAMBANOVA_BASE_URL", "https://api.sambanova.ai/v1")
+AI_MODEL            = os.getenv("AI_MODEL", "Llama-4-Maverick-17B-128E-Instruct")
+AI_MODEL_FALLBACK   = os.getenv("AI_MODEL_FALLBACK", "Meta-Llama-3.3-70B-Instruct")
 
 # ─── TAVILY (investigación experta del coche) ───────────────────────────────
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY", "")
@@ -78,7 +79,7 @@ VISION_MAX_FOTOS = int(os.getenv("VISION_MAX_FOTOS", "4"))
 VISION_TIMEOUT_S = int(os.getenv("VISION_TIMEOUT_S", "8"))
 
 # ─── ROBUSTEZ ───────────────────────────────────────────────────────────────
-AI_TIMEOUT_S          = int(os.getenv("AI_TIMEOUT_S", "30"))
+AI_TIMEOUT_S          = int(os.getenv("AI_TIMEOUT_S", "90"))
 ANALISIS_CACHE_TTL_S  = int(os.getenv("ANALISIS_CACHE_TTL_S", "1800"))   # 30 min
 HISTORICO_RETENCION_DIAS = int(os.getenv("HISTORICO_RETENCION_DIAS", "180"))
 

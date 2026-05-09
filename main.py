@@ -46,6 +46,7 @@ from database import (
     guardar_historico_batch,
     get_o_crear_usuario, puede_analizar, registrar_analisis, minutos_hasta_reset,
     registrar_evento, resumen_stats,
+    puede_usar, registrar_uso,
 )
 from config import FREE_ANALISIS_MAX, FREE_VENTANA_HORAS, FREE_CREDITOS_DIA, PAID_CREDITOS_PACK_30, PAID_CREDITOS_PACK_100
 from scraper import (
@@ -678,11 +679,17 @@ async def _core_analisis(url: str, source_msg, ctx, es_admin: bool, user_id: int
             anuncio = None
 
         if not anuncio or anuncio.precio <= 0:
-            await msg.edit_text(
-                "😔 No pude extraer los datos del anuncio.\n"
-                "• Comprueba que la URL sea de Wallapop o Coches.net y el anuncio siga activo.\n"
-                "• A veces Wallapop bloquea temporalmente. Prueba en 1 min."
-            )
+            if "coches.net" in url.lower():
+                detalle = (
+                    "• Coches.net a veces bloquea scrapers. Prueba en 1 min.\n"
+                    "• Asegúrate de que el anuncio sigue activo."
+                )
+            else:
+                detalle = (
+                    "• Wallapop a veces bloquea temporalmente. Prueba en 1 min.\n"
+                    "• Comprueba que la URL sea válida y el anuncio siga activo."
+                )
+            await msg.edit_text(f"😔 No pude extraer los datos del anuncio.\n{detalle}")
             return
 
         marca  = anuncio.marca  or "desconocida"
@@ -1863,7 +1870,7 @@ async def _ideal_v2_procesar_texto(update, ctx, texto: str, sesion: dict) -> int
     # Slots completos → pipeline
     await msg_parse.edit_text(
         "🔧 <b>Buscándote el mejor coche…</b>\n"
-        "<i>Voy a fondo. Tarda 30 segundos.</i>",
+        "<i>Voy a fondo. Tarda unos minutos.</i>",
         parse_mode="HTML",
     )
 
@@ -2074,14 +2081,17 @@ async def callback_ideal_v2_mas(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if alternativas:
         partes.append("\n<i>Mencionadas en foros: " + html.escape(", ".join(alternativas[:5])) + "</i>")
 
-    await _enviar_largo(
-        query.message, "\n".join(partes),
-        parse_mode="HTML", disable_web_page_preview=True,
-    )
+    texto = "\n".join(partes)
+    LIMITE = 4000
+    if len(texto) <= LIMITE:
+        await query.message.reply_text(texto, parse_mode="HTML", disable_web_page_preview=True)
+    else:
+        await query.message.reply_text(texto[:LIMITE], parse_mode="HTML", disable_web_page_preview=True)
+        await query.message.reply_text(texto[LIMITE:], parse_mode="HTML", disable_web_page_preview=True)
 
 
 async def callback_ideal_v2_ninguno(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """User rechaza todo → segunda ronda con marcas distintas."""
+    """User rechaza todo → segunda ronda con marcas distintas. Cuesta 1 crédito."""
     query = update.callback_query
     await query.answer()
     user = update.effective_user
@@ -2090,6 +2100,15 @@ async def callback_ideal_v2_ninguno(update: Update, ctx: ContextTypes.DEFAULT_TY
     if not sesion:
         await query.edit_message_text("⏰ La sesión caducó. Vuelve a lanzar /ideal.")
         return
+
+    # Cobrar un crédito por la segunda ronda
+    from permisos import _construir_info, _enviar_paywall
+    puede, restantes = puede_usar(user.id, 1)
+    if not puede:
+        info = _construir_info(user.id, puede, restantes)
+        await _enviar_paywall(update, info, "/ideal")
+        return
+    registrar_uso(user.id, 1)
 
     msg = await query.message.reply_text(
         "🔄 <b>Buscando otra ronda con enfoques distintos…</b>",

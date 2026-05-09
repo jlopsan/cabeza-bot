@@ -11,9 +11,9 @@ from config import (
     TAVILY_DOMINIOS_FIABILIDAD,
     TAVILY_DOMINIOS_ARTICULOS,
     ENABLE_VISION, VISION_MODEL, VISION_MAX_FOTOS, VISION_TIMEOUT_S,
-    AI_TIMEOUT_S, ANALISIS_CACHE_TTL_S,
+    ANALISIS_CACHE_TTL_S,
     IDEAL_CANDIDATOS_MAX,
-    SAMBANOVA_API_KEY, SAMBANOVA_BASE_URL, AI_MODEL,
+    SAMBANOVA_API_KEY, SAMBANOVA_BASE_URL, AI_MODEL, AI_MODEL_FALLBACK,
 )
 
 logger = logging.getLogger(__name__)
@@ -349,28 +349,45 @@ async def _llamar_ia(
     max_tokens: int = 3000,
     model: str = AI_MODEL,
 ) -> str:
-    try:
-        resp = await asyncio.wait_for(
-            _client().chat.completions.create(
-                model=model,
-                max_tokens=max_tokens,
-                temperature=0.1,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user",   "content": user},
-                ],
-            ),
-            timeout=AI_TIMEOUT_S,
-        )
-        text = resp.choices[0].message.content.strip()
-        print(f"[AI RAW] model={model} {repr(text)}")
-        return text
-    except asyncio.TimeoutError:
-        logger.error(f"[AI] Timeout ({AI_TIMEOUT_S}s) model={model}")
-        return ""
-    except Exception as e:
-        logger.error(f"[AI] Error SambaNova model={model}: {e}")
-        return ""
+    # Siempre intentar fallback si es distinto al primary
+    modelos = [model]
+    if AI_MODEL_FALLBACK and AI_MODEL_FALLBACK != model:
+        modelos.append(AI_MODEL_FALLBACK)
+
+    timeouts = [30, 60]  # primary: 30s (falla rápido); fallback: 60s
+
+    for i, m in enumerate(modelos):
+        t = timeouts[i] if i < len(timeouts) else 60
+        es_ultimo = (i == len(modelos) - 1)
+        try:
+            resp = await asyncio.wait_for(
+                _client().chat.completions.create(
+                    model=m,
+                    max_tokens=max_tokens,
+                    temperature=0.1,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user",   "content": user},
+                    ],
+                ),
+                timeout=t,
+            )
+            text = resp.choices[0].message.content.strip()
+            if i > 0:
+                logger.warning(f"[AI] Respondió fallback {m}")
+            return text
+        except asyncio.TimeoutError:
+            if es_ultimo:
+                logger.error(f"[AI] Timeout ({t}s) model={m} — sin más fallbacks")
+            else:
+                logger.warning(f"[AI] Timeout ({t}s) model={m} — probando {modelos[i+1]}")
+        except Exception as e:
+            if es_ultimo:
+                logger.error(f"[AI] Error model={m}: {e} — sin más fallbacks")
+            else:
+                logger.warning(f"[AI] Error model={m}: {e} — probando {modelos[i+1]}")
+
+    return ""
 
 def _limpiar_json(t: str) -> str:
     t = re.sub(r"^```[a-z]*\s*", "", t.strip())
@@ -2791,7 +2808,6 @@ async def generar_veredicto_ideal_v2(top3: list[dict], slots: dict) -> str:
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "🥉 <b>OPCIÓN 3 — ...</b>\n[mismo formato]\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        "<i>Soy Juan Lopera. Cada semana una función nueva del bot.</i>\n\n"
         "REGLAS:\n"
         "- Cero genérico. Cada frase suena a alguien que vio el motor en taller.\n"
         "- Usa números: km, €, años, CV, L/100.\n"
