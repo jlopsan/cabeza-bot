@@ -123,11 +123,13 @@ async def _notificar_user(user_id: int, concepto: str):
         texto = (
             f"✅ <b>Pack activado.</b>\n\n"
             f"{PAID_CREDITOS_PACK_30} acciones disponibles, sin caducidad. ¡Vamos!"
+            f"Usa /plan para ver tu número de usos restante."
         )
     elif concepto == "pack_100":
         texto = (
             f"✅ <b>Pack activado.</b>\n\n"
-            f"{PAID_CREDITOS_PACK_100} acciones disponibles, sin caducidad. ¡Vamos!"
+            f"{PAID_CREDITOS_PACK_100} acciones disponibles, sin caducidad. ¡Vamos!\n\n"
+            f"Usa /plan para ver tu número de usos restante."
         )
     elif concepto == "pro_mes":
         texto = (
