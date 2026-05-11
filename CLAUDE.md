@@ -65,7 +65,7 @@ no vía web de usuario.
 ### Semana 0 — Identidad, landing, vídeo manifiesto ✅ HECHO
 ### Semana 1 — `/analizar <url>` ✅ HECHO (v4 en producción)
 ### Semana 2 — `/ideal` Recomendador ✅ HECHO
-### Semana 3 — Sistema freemium con Stripe (TAREA ACTUAL)
+### Semana 3 — Sistema freemium con Stripe ✅ HECHO
 ### Semana 4 — `/comparar` Comparador
 ### Semana 5 — `/tasar` Tasar coche con precio real de mercado
 ### Semana 6 — `/alertas` Alertas de chollos

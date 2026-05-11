@@ -9,8 +9,11 @@ logger = logging.getLogger(__name__)
 
 
 def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
@@ -460,19 +463,30 @@ def activar_plan(user_id: int, concepto: str, stripe_id: str = "",
     concepto='pack_100' → tier='paid', creditos_disponibles += 100 (acumula si ya era paid).
     concepto='pro_mes'  → tier='pro' (dormido — para cuando se lance suscripción).
     """
-    if stripe_id and pago_ya_procesado(stripe_id):
+    if concepto not in _CREDITOS_POR_PACK and concepto != "pro_mes":
+        logger.warning(f"[PAGO] Concepto desconocido: {concepto}")
         return
 
     now = datetime.utcnow().isoformat()
 
     with get_conn() as conn:
+        # Idempotencia atómica: si stripe_id ya existe en pagos, rowcount=0 → return.
+        # Esto cierra la race entre dos webhooks paralelos para el mismo event_id.
+        if stripe_id:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO pagos (user_id, stripe_id, concepto, estado, created_at) "
+                "VALUES (?, ?, ?, 'completado', ?)",
+                (user_id, stripe_id, concepto, now),
+            )
+            if cur.rowcount == 0:
+                return
+
         if concepto in _CREDITOS_POR_PACK:
             row = conn.execute(
                 "SELECT tier, creditos_disponibles FROM usuarios WHERE user_id = ?",
                 (user_id,),
             ).fetchone()
             actuales = (row["creditos_disponibles"] or 0) if row else 0
-            # Si ya era paid, acumula; si era free, empieza desde 0 + pack
             nuevos = actuales + _CREDITOS_POR_PACK[concepto]
             conn.execute(
                 "UPDATE usuarios SET tier = 'paid', creditos_disponibles = ?, "
@@ -480,7 +494,7 @@ def activar_plan(user_id: int, concepto: str, stripe_id: str = "",
                 "updated_at = ? WHERE user_id = ?",
                 (nuevos, stripe_customer_id, now, user_id),
             )
-        elif concepto == "pro_mes":
+        else:  # pro_mes
             conn.execute(
                 "UPDATE usuarios SET tier = 'pro', "
                 "stripe_customer_id = COALESCE(NULLIF(?, ''), stripe_customer_id), "
@@ -488,16 +502,7 @@ def activar_plan(user_id: int, concepto: str, stripe_id: str = "",
                 "updated_at = ? WHERE user_id = ?",
                 (stripe_customer_id, stripe_subscription_id, now, user_id),
             )
-        else:
-            logger.warning(f"[PAGO] Concepto desconocido: {concepto}")
-            return
 
-        if stripe_id:
-            conn.execute(
-                "INSERT OR IGNORE INTO pagos (user_id, stripe_id, concepto, estado, created_at) "
-                "VALUES (?, ?, ?, 'completado', ?)",
-                (user_id, stripe_id, concepto, now),
-            )
         conn.commit()
 
 

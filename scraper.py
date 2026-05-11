@@ -25,6 +25,11 @@ from abc import ABC, abstractmethod
 import httpx
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
+# Cap global de browsers Playwright simultáneos. Cada Chromium consume ~300-500MB
+# RAM. Más de 2 en paralelo tumba servidores pequeños. Los handlers que llegan
+# terceros esperan aquí (no se pierden).
+_PLAYWRIGHT_SEM = asyncio.Semaphore(2)
+
 from config import (
     USER_AGENTS, PROXIES, TOP_RESULTS, MAX_PAGES_DE, MAX_COCHES_RAW,
     ENABLE_AUTOSCOUT24, ENABLE_MOBILE_DE, ENABLE_WALLAPOP, ENABLE_COCHES_NET,
@@ -340,7 +345,7 @@ class ScraperAutoScout24(ScraperDE):
         proxy_cfg = {"server": random.choice(PROXIES)} if PROXIES else None
         url_base = self._construir_url(marca, modelo, filtros)
 
-        async with async_playwright() as p:
+        async with _PLAYWRIGHT_SEM, async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             context = await _nuevo_contexto_stealth(browser, user_agent, proxy_cfg)
             await context.add_init_script(
@@ -698,7 +703,7 @@ class ScraperMobileDe(ScraperDE):
 
         logger.info(f"[MOBILE] URL: {url}")
 
-        async with async_playwright() as p:
+        async with _PLAYWRIGHT_SEM, async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             context = await _nuevo_contexto_stealth(browser, user_agent, proxy_cfg)
             await context.add_init_script(
@@ -1434,7 +1439,7 @@ class ScraperCochesNet:
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         )
         proxy_cfg = {"server": random.choice(PROXIES)} if PROXIES else None
-        async with async_playwright() as p:
+        async with _PLAYWRIGHT_SEM, async_playwright() as p:
             # headless=False evita el anti-bot de coches.net en producción (xvfb-run).
             # Si no hay display, intentamos headless=True como fallback (puede ser detectado,
             # pero al menos extraemos JSON-LD que está en el HTML inicial).
@@ -1725,7 +1730,7 @@ class ScraperCochesNet:
         proxy_cfg = {"server": random.choice(PROXIES)} if PROXIES else None
         anuncios: list = []
 
-        async with async_playwright() as p:
+        async with _PLAYWRIGHT_SEM, async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             context = await _nuevo_contexto_stealth(browser, user_agent, proxy_cfg, locale="es-ES")
             await context.add_init_script(
@@ -1933,7 +1938,7 @@ class ScraperCochesNet:
         if km:
             url += f"&MaxKms={km + KM_TOLERANCIA}"
 
-        async with async_playwright() as p:
+        async with _PLAYWRIGHT_SEM, async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             context = await _nuevo_contexto_stealth(browser, user_agent, proxy_cfg, locale="es-ES")
             await context.add_init_script(

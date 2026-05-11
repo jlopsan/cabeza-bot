@@ -642,6 +642,9 @@ async def _enviar_largo(msg, texto: str, parse_mode: str = "HTML", **kwargs):
 # /analizar — núcleo compartido
 # ════════════════════════════════════════════════════════════════════════════
 
+_ANALISIS_INFLIGHT: dict[str, asyncio.Future] = {}
+
+
 async def _core_analisis(url: str, source_msg, ctx, es_admin: bool, user_id: int):
     """
     Lógica central de análisis de un anuncio. Reutilizada por /analizar y
@@ -669,6 +672,39 @@ async def _core_analisis(url: str, source_msg, ctx, es_admin: bool, user_id: int
                 parse_mode="HTML", reply_markup=teclado,
             )
         return
+
+    # Dedupe inflight: si otra corutina ya está analizando esta URL, esperar a
+    # que termine y leer del caché. Evita scraping + IA duplicados.
+    inflight = _ANALISIS_INFLIGHT.get(url)
+    if inflight is not None:
+        msg = await source_msg.reply_text("⏳ Otra petición ya analiza esta URL. Esperando…")
+        try:
+            await inflight
+        except Exception:
+            pass
+        cached = cache_get(url)
+        if cached:
+            veredicto_cache, contexto_cache, mins_ago = cached
+            prefijo = "<i>♻️ Compartido con otra petición simultánea</i>\n\n"
+            await _enviar_largo(msg, prefijo + veredicto_cache,
+                                parse_mode="HTML", disable_web_page_preview=True)
+            if contexto_cache:
+                ctx.user_data["analisis_qa_ctx"] = contexto_cache
+                teclado = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("💬 Sí, dame preguntas + checklist", callback_data="qa:si"),
+                    InlineKeyboardButton("No, gracias", callback_data="qa:no"),
+                ]])
+                await source_msg.reply_text(
+                    "¿Quieres que te prepare <b>preguntas para el vendedor</b> y un "
+                    "<b>checklist</b> para cuando vayas a verlo en persona?",
+                    parse_mode="HTML", reply_markup=teclado,
+                )
+            return
+        await msg.edit_text("😔 El análisis paralelo no terminó bien. Vuelve a intentarlo.")
+        return
+
+    fut: asyncio.Future = asyncio.get_event_loop().create_future()
+    _ANALISIS_INFLIGHT[url] = fut
 
     msg = await source_msg.reply_text("⏳ Extrayendo datos del anuncio…")
     try:
@@ -807,6 +843,10 @@ async def _core_analisis(url: str, source_msg, ctx, es_admin: bool, user_id: int
             await msg.edit_text("😔 Algo se rompió en el análisis. Reintenta en 1 min.")
         except Exception:
             pass
+    finally:
+        if not fut.done():
+            fut.set_result(None)
+        _ANALISIS_INFLIGHT.pop(url, None)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2336,7 +2376,7 @@ def main():
     logger.info("🔄 Eliminando webhook anterior (si existe) para evitar conflictos...")
     
     init_db()
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).concurrent_updates(5).build()
 
     # Conversación: búsqueda
     conv_buscar = ConversationHandler(
