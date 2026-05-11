@@ -14,8 +14,8 @@ MENSAJE = """\
 Hasta ahora analizabas anuncios sueltos. Ahora puedo decirte \
 directamente qué coche comprar.
 
-Le cuentas tu caso en lenguaje normal — "vivo en Madrid centro, \
-llevo a 2 niños y al perro, máximo 12.000€" — te hago unas \
+Le cuentas tu caso en lenguaje normal. Ej: "vivo en Madrid centro, \
+llevo a 2 niños y al perro, máximo 12.000€". Te hago unas \
 preguntas, y te devuelvo 3 modelos concretos con motor exacto \
 y años recomendados.
 
