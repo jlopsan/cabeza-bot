@@ -131,6 +131,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Tienes <b>{FREE_CREDITOS_DIA} acciones gratuitas al día</b> para empezar.\n\n"
         "/analizar &lt;url&gt; — Analiza un anuncio de Wallapop o Coches.net\n"
         "/ideal — Encuentra tu coche ideal\n"
+        "/comparar — Enfrenta dos coches modelo a modelo\n"
         "/plan — Ver tu uso y plan\n\n"
         "<b>Actualizaciones en:</b>\n"
         "• YouTube: @juanloperaes\n"
