@@ -34,7 +34,8 @@ from config import (
     USER_AGENTS, PROXIES, TOP_RESULTS, MAX_PAGES_DE, MAX_COCHES_RAW,
     ENABLE_AUTOSCOUT24, ENABLE_MOBILE_DE, ENABLE_WALLAPOP, ENABLE_COCHES_NET,
     WALLAPOP_LATITUDE, WALLAPOP_LONGITUDE, WALLAPOP_DISTANCE, WALLAPOP_RESULTS,
-    COCHES_NET_RESULTS,
+    WALLAPOP_RETRY_MAX, WALLAPOP_APPVERSION, WALLAPOP_MPID, WALLAPOP_DEVICEID,
+    COCHES_NET_RESULTS, COCHES_NET_RETRY_MAX,
     AÑO_TOLERANCIA, KM_TOLERANCIA,
     PRECIO_MINIMO_VALIDO, ANTI_SCAM_FACTOR, PRECIO_MEDIO_MUESTRA,
     COLORES_AS24, COLORES_MOBILE,
@@ -924,9 +925,9 @@ class ScraperWallapop:
                                "AppleWebKit/537.36 (KHTML, like Gecko) "
                                "Chrome/145.0.0.0 Mobile Safari/537.36"),
         "deviceos":           "0",
-        "mpid":               "6568109859988379704",
-        "x-appversion":       "817730",
-        "x-deviceid":         "e17cd452-9a0a-466e-a628-6328966ced0d",
+        "mpid":               WALLAPOP_MPID,
+        "x-appversion":       WALLAPOP_APPVERSION,
+        "x-deviceid":         WALLAPOP_DEVICEID,
         "x-deviceos":         "0",
         "sec-ch-ua-mobile":   "?1",
         "Sec-Fetch-Dest":     "empty",
@@ -966,14 +967,38 @@ class ScraperWallapop:
         return self._calcular_precio_medio(precios)
 
     async def _fetch(self, params: dict) -> dict:
-        try:
-            async with httpx.AsyncClient(timeout=20, headers=self._HEADERS) as c:
-                r = await c.get(self._API_URL, params=params)
-                r.raise_for_status()
-                return r.json()
-        except Exception as e:
-            logger.error(f"[Wallapop] Error: {e}")
-            return {}
+        delays = [0, 2, 5]
+        for intento in range(WALLAPOP_RETRY_MAX):
+            delay = delays[intento] if intento < len(delays) else delays[-1]
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                async with httpx.AsyncClient(timeout=20, headers=self._HEADERS) as c:
+                    r = await c.get(self._API_URL, params=params)
+                    if r.status_code == 429:
+                        logger.warning(f"[Wallapop] Rate limit (429) — esperando 10s")
+                        await asyncio.sleep(10)
+                        continue
+                    if r.status_code >= 500:
+                        logger.warning(
+                            f"[Wallapop] Intento {intento+1}/{WALLAPOP_RETRY_MAX} fallido: "
+                            f"HTTP {r.status_code}"
+                        )
+                        continue
+                    r.raise_for_status()
+                    data = r.json()
+                    if intento > 0:
+                        logger.info(f"[Wallapop] Éxito en intento {intento+1}")
+                    return data
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.TimeoutException) as e:
+                logger.warning(
+                    f"[Wallapop] Intento {intento+1}/{WALLAPOP_RETRY_MAX} fallido: {e}"
+                )
+            except Exception as e:
+                logger.error(f"[Wallapop] Error no recuperable: {e}")
+                return {}
+        logger.error(f"[Wallapop] _fetch agotó {WALLAPOP_RETRY_MAX} intentos")
+        return {}
 
     @staticmethod
     def _extraer_items(data: dict) -> list:
@@ -1033,62 +1058,117 @@ class ScraperWallapop:
 
     async def obtener_item(self, item_id: str, url_pagina: str = ""):
         """
-        Busca un anuncio en la Search API por keywords extraídas del slug
-        (más robusto que el item-detail API que requiere hash ID).
-        Devuelve Anuncio o None.
+        Extrae un anuncio individual de Wallapop. 4 estrategias en cascada.
+        Para en la primera que devuelva un Anuncio válido.
         """
-        # Extraer keywords del slug (todo excepto el ID numérico al final)
         slug = url_pagina.split("/item/")[-1] if "/item/" in url_pagina else item_id
-        slug_sin_id = re.sub(r"-\d{6,}$", "", slug.split("?")[0])
-        keywords = " ".join(p for p in slug_sin_id.split("-") if p)
-        if not keywords:
-            keywords = slug_sin_id or item_id
+        slug_limpio = slug.split("?")[0]
+        url = url_pagina or f"https://es.wallapop.com/item/{slug_limpio}"
+        fallos: list[str] = []
 
-        logger.info(f"[Wallapop] Buscando item {item_id} con keywords='{keywords}'")
-
-        params = {
-            "keywords": keywords, "source": "search_box",
+        params_base = {
+            "source": "search_box",
             "latitude": WALLAPOP_LATITUDE, "longitude": WALLAPOP_LONGITUDE,
             "distance": WALLAPOP_DISTANCE, "order_by": "newest",
             "category_id": 100, "section_type": "organic_search_results",
             "items_count": 50,
         }
 
-        data = await self._fetch(params)
-        items = self._extraer_items(data)
-
-        # Buscar el item exacto por numeric ID en web_slug
-        target = None
-        for it in items:
+        # ── S1: keywords del slug → match por web_slug ──────────────────────
+        logger.info(f"[Wallapop S1] item_id={item_id} slug='{slug_limpio}'")
+        slug_sin_id = re.sub(r"-\d{6,}$", "", slug_limpio)
+        keywords_s1 = " ".join(p for p in slug_sin_id.split("-") if p) or slug_sin_id or item_id
+        data_s1 = await self._fetch({**params_base, "keywords": keywords_s1})
+        items_s1 = self._extraer_items(data_s1)
+        for it in items_s1:
             ws = it.get("web_slug", "")
-            if ws.endswith(f"-{item_id}") or ws == slug:
-                target = it
-                break
+            if ws.endswith(f"-{item_id}") or ws == slug_limpio or item_id in ws:
+                logger.info(f"[Wallapop S1 OK] Encontrado por web_slug match")
+                return self._item_a_anuncio(it, item_id, url_pagina=url)
+        fallos.append(f"S1: {len(items_s1)} resultados, ninguno con web_slug terminando en -{item_id}")
 
-        if not target:
-            # Si no encontrado, intentar con el item API usando hash ID
-            # (buscamos el hash en los primeros resultados)
-            logger.warning(f"[Wallapop] Item {item_id} no encontrado en search, intentando API hash")
-            for it in items[:5]:
-                hash_id = it.get("id", "")
-                if hash_id:
-                    try:
-                        async with httpx.AsyncClient(timeout=10, headers=self._HEADERS) as c:
-                            r = await c.get(f"https://api.wallapop.com/api/v3/items/{hash_id}")
-                            if r.status_code == 200:
-                                d = r.json()
-                                if d.get("slug", "").endswith(f"-{item_id}"):
-                                    target = d
-                                    break
-                    except Exception:
-                        continue
+        # ── S2: item_id numérico como keyword directa ───────────────────────
+        logger.info(f"[Wallapop S2] Buscando item_id='{item_id}' como keyword")
+        data_s2 = await self._fetch({**params_base, "keywords": item_id})
+        items_s2 = self._extraer_items(data_s2)
+        for it in items_s2:
+            ws = it.get("web_slug", "")
+            if ws.endswith(f"-{item_id}") or item_id in ws:
+                logger.info(f"[Wallapop S2 OK] Encontrado por ID como keyword")
+                return self._item_a_anuncio(it, item_id, url_pagina=url)
+        fallos.append(f"S2: {len(items_s2)} resultados, ningún web_slug con {item_id}")
 
-        if not target:
-            logger.error(f"[Wallapop] No se pudo obtener el anuncio {item_id}")
-            return None
+        # ── S3: endpoint REST público por ID numérico ───────────────────────
+        logger.info(f"[Wallapop S3] GET /api/v3/items/{item_id}")
+        try:
+            async with httpx.AsyncClient(timeout=15, headers=self._HEADERS) as c:
+                r = await c.get(f"https://api.wallapop.com/api/v3/items/{item_id}")
+            if r.status_code == 200:
+                d = r.json()
+                precio_s3 = 0.0
+                p = d.get("price") or {}
+                if isinstance(p, dict):
+                    precio_s3 = float(p.get("amount") or p.get("value") or 0)
+                elif isinstance(p, (int, float)):
+                    precio_s3 = float(p)
+                if precio_s3 > 0:
+                    logger.info(f"[Wallapop S3 OK] precio={precio_s3:.0f}€")
+                    return self._item_a_anuncio(d, item_id, url_pagina=url)
+                fallos.append(f"S3: HTTP 200 pero precio=0 en la respuesta")
+            else:
+                fallos.append(f"S3: HTTP {r.status_code}")
+        except Exception as e:
+            fallos.append(f"S3: excepción {e}")
 
-        url = url_pagina or f"https://es.wallapop.com/item/{target.get('web_slug', slug)}"
-        return self._item_a_anuncio(target, item_id, url_pagina=url)
+        # ── S4: httpx sobre la web + extracción __NEXT_DATA__ ───────────────
+        logger.info(f"[Wallapop S4] Extrayendo __NEXT_DATA__ de {url}")
+        try:
+            hdrs_web = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                "Accept-Language": "es-ES,es;q=0.9",
+            }
+            async with httpx.AsyncClient(timeout=20, headers=hdrs_web,
+                                         follow_redirects=True) as c:
+                r = await c.get(url)
+            if r.status_code == 200 and len(r.text) > 5_000:
+                import json as _json
+                m = re.search(
+                    r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+                    r.text, re.DOTALL
+                )
+                if m:
+                    nd = _json.loads(m.group(1))
+                    # Wallapop Next.js: props.pageProps.item o props.pageProps.ad
+                    item_data = (
+                        (nd.get("props") or {}).get("pageProps") or {}
+                    )
+                    item_node = (item_data.get("item")
+                                 or item_data.get("ad")
+                                 or item_data.get("listing")
+                                 or {})
+                    if isinstance(item_node, dict) and item_node:
+                        anuncio = self._item_a_anuncio(item_node, item_id, url_pagina=url)
+                        if anuncio and anuncio.precio > 0:
+                            logger.info(f"[Wallapop S4 OK] precio={anuncio.precio:.0f}€ vía __NEXT_DATA__")
+                            return anuncio
+                        fallos.append("S4: __NEXT_DATA__ encontrado pero precio=0")
+                    else:
+                        fallos.append("S4: __NEXT_DATA__ presente pero sin item_node reconocible")
+                else:
+                    fallos.append("S4: HTML recibido pero sin __NEXT_DATA__")
+            else:
+                fallos.append(f"S4: HTTP {r.status_code} o HTML < 5KB")
+        except Exception as e:
+            fallos.append(f"S4: excepción {e}")
+
+        logger.error(
+            f"[Wallapop] No se pudo obtener {item_id}. "
+            + " | ".join(fallos)
+        )
+        return None
 
     async def buscar_items(
         self, keywords: str, año: int, km: int, n: int = 30,
@@ -1414,125 +1494,262 @@ class ScraperCochesNet:
         self, marca: str, modelo: str, año: int, km: int, n: int = 20,
         filtros: dict | None = None,
     ) -> list:
-        # httpx bloqueado por Cloudflare — ir directo a Playwright con semáforo
+        # Intentar httpx primero (evita Playwright si la IP no está bloqueada)
+        try:
+            items_httpx = await self._buscar_httpx(marca, modelo, año, km, n, filtros)
+            if items_httpx:
+                logger.info(f"[coches.net comparables] httpx OK {len(items_httpx)}")
+                return items_httpx
+            logger.info("[coches.net comparables] httpx vacío → Playwright")
+        except Exception as e:
+            logger.info(f"[coches.net comparables] httpx falló ({e}) → Playwright")
+
         async with _COCHES_NET_SEM:
             try:
                 items = await self._buscar_playwright(marca, modelo, año, km, n, filtros or {})
                 if items:
-                    logger.info(f"[coches.net] Playwright OK: {len(items)} items")
+                    logger.info(f"[coches.net comparables] Playwright OK: {len(items)} items")
                 return items
             except Exception as e:
-                logger.warning(f"[coches.net] Playwright falló: {e}")
+                logger.warning(f"[coches.net comparables] Playwright falló: {e}")
                 return []
 
-    async def obtener_anuncio(self, url: str):
-        """Extrae datos de un anuncio individual de coches.net por URL."""
+    @staticmethod
+    def _extraer_json_ld(html_text: str) -> tuple[float, str]:
+        """Extrae precio y título del JSON-LD de una página de coches.net."""
+        import json as _json
+        ld_precio, ld_titulo = 0.0, ""
+        for raw_ld in re.findall(
+            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            html_text, re.DOTALL | re.IGNORECASE
+        ):
+            try:
+                d = _json.loads(raw_ld)
+                nodes = d if isinstance(d, list) else [d]
+                for node in nodes:
+                    offers = node.get('offers', {})
+                    if isinstance(offers, list):
+                        offers = offers[0] if offers else {}
+                    p = float(str(offers.get('price', 0) or 0))
+                    if p >= 1000:
+                        ld_precio = p
+                        ld_titulo = node.get('name', '') or ld_titulo
+                        break
+                if ld_precio > 0:
+                    break
+            except Exception:
+                continue
+        return ld_precio, ld_titulo
+
+    @staticmethod
+    def _construir_anuncio_desde_html(html_text: str, url: str,
+                                       ld_precio: float, ld_titulo: str,
+                                       ua: str = ""):
+        """Construye un Anuncio desde HTML estático (ruta httpx S1)."""
         from models import Anuncio
         from datetime import datetime as _dt, timezone as _tz
 
-        # Coches.net SOLO renderiza la SPA si el UA es Chrome reciente sobre
-        # Windows/Mac. Firefox/Linux UAs disparan su anti-bot y devuelve HTML
-        # mínimo (~8 KB) sin precio real.
-        user_agent = next(
+        titulo = ld_titulo or ""
+        texto = re.sub(r'<[^>]+>', ' ', html_text)
+
+        anno = 0
+        m = re.search(r"\b(19[89]\d|20[0-3]\d)\b", titulo + " " + texto)
+        if m:
+            anno = int(m.group(1))
+        kms = 0
+        m = re.search(r"([\d\.]+)\s*km", texto, re.IGNORECASE)
+        if m:
+            try:
+                kms = int(m.group(1).replace(".", ""))
+            except ValueError:
+                pass
+
+        marca, modelo, provincia = "", "", ""
+        try:
+            raw = url.split("coches.net/", 1)[1].split("?")[0].split("#")[0]
+            skip = {"km-0", "segunda-mano", "ocasion", "ocasión", "coches", ""}
+            parts = [p for p in raw.split("/") if p and p not in skip]
+            if (len(parts) >= 2
+                    and not parts[0].endswith(".aspx")
+                    and "-" not in parts[0]
+                    and len(parts[0]) <= 20
+                    and len(parts[1]) <= 30):
+                marca = parts[0]
+                modelo = parts[1]
+                if len(parts) >= 3 and not parts[2].endswith(".aspx"):
+                    provincia = parts[2].replace("-", " ").title()
+        except Exception:
+            pass
+        if not provincia:
+            m2 = re.search(r"-en-([a-z\-]+?)-\d", url, re.IGNORECASE)
+            if m2:
+                provincia = m2.group(1).replace("-", " ").title()
+
+        fotos = re.findall(r'https://[^\s"\'<>]+\.(?:jpg|jpeg|webp|png)[^\s"\'<>]*', html_text)
+        fotos = [f for f in fotos if "cochesnet" in f or "coches.net" in f][:8]
+        foto = fotos[0] if fotos else ""
+
+        item_id = ""
+        m3 = re.search(r"(\d{6,})", url)
+        if m3:
+            item_id = m3.group(1)
+        if not item_id:
+            item_id = _generar_id("coches.net", titulo[:60], ld_precio, url)
+
+        if ld_precio <= 0 or not (marca or titulo):
+            return None
+
+        return Anuncio(
+            item_id=item_id,
+            fuente="coches.net",
+            marca=(marca or "").lower(),
+            modelo=(modelo or "").lower(),
+            año=anno,
+            km=kms,
+            precio=ld_precio,
+            provincia=provincia,
+            descripcion=titulo[:1500],
+            url=url,
+            foto=foto,
+            motor=titulo[:120],
+            fotos=fotos,
+            capturado_at=_dt.now(_tz.utc).isoformat(),
+        )
+
+    async def obtener_anuncio(self, url: str):
+        """Extrae datos de un anuncio individual de coches.net por URL.
+        S1: httpx con cookies precalentadas (evita Playwright si no hay bloqueo).
+        S2: Playwright headed con stealth mejorado + pre-warm + retry.
+        """
+        from models import Anuncio
+        from datetime import datetime as _dt, timezone as _tz
+
+        ua_chrome = next(
             (ua for ua in USER_AGENTS if "Chrome/" in ua and ("Windows" in ua or "Macintosh" in ua)),
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         )
+
+        # ── S1: httpx con cookies precalentadas ──────────────────────────────
+        logger.info(f"[coches.net S1] httpx prewarming para {url}")
+        try:
+            hdrs_httpx = {
+                "User-Agent": ua_chrome,
+                "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                "Accept-Language": "es-ES,es;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Referer": "https://www.coches.net/",
+            }
+            async with httpx.AsyncClient(
+                timeout=20, headers=hdrs_httpx, follow_redirects=True,
+            ) as c:
+                homepage = await c.get("https://www.coches.net/")
+                if len(homepage.text) >= 10_000:
+                    resp = await c.get(url)
+                    if resp.status_code == 200 and len(resp.text) >= 15_000:
+                        ld_precio, ld_titulo = self._extraer_json_ld(resp.text)
+                        if ld_precio >= 1000:
+                            logger.info(f"[coches.net S1 OK] precio={ld_precio:.0f}€ vía httpx+JSON-LD")
+                            anuncio_s1 = self._construir_anuncio_desde_html(
+                                resp.text, url, ld_precio, ld_titulo, ua_chrome,
+                            )
+                            if anuncio_s1:
+                                return anuncio_s1
+                    logger.info("[coches.net S1] httpx sin JSON-LD válido → S2 Playwright")
+                else:
+                    logger.info(f"[coches.net S1] Homepage < 10KB (IP bloqueada) → S2 Playwright")
+        except Exception as e:
+            logger.info(f"[coches.net S1] httpx falló ({e}) → S2 Playwright")
+
+        # ── S2: Playwright headed con stealth mejorado ────────────────────────
         proxy_cfg = {"server": random.choice(PROXIES)} if PROXIES else None
+        _STEALTH_JS = (
+            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+            "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});"
+            "Object.defineProperty(navigator,'languages',{get:()=>['es-ES','es']});"
+            "window.chrome={runtime:{}};"
+        )
         async with _PLAYWRIGHT_SEM, async_playwright() as p:
-            # headless=False evita el anti-bot de coches.net en producción (xvfb-run).
-            # Si no hay display, intentamos headless=True como fallback (puede ser detectado,
-            # pero al menos extraemos JSON-LD que está en el HTML inicial).
             browser = None
             try:
                 browser = await p.chromium.launch(headless=False)
             except Exception as _e:
                 _emsg = str(_e).lower()
                 if any(x in _emsg for x in ("missing x", "display", "x11", "cannot open")):
-                    logger.warning("[coches.net] Sin display — intentando headless=True")
+                    logger.warning("[coches.net S2] Sin display — intentando headless=True")
                     try:
                         browser = await p.chromium.launch(headless=True)
                     except Exception as _e2:
-                        logger.error(f"[coches.net] headless=True también falló: {_e2}")
+                        logger.error(f"[coches.net S2] headless=True también falló: {_e2}")
                         return None
                 else:
-                    logger.error(f"[coches.net] Error lanzando browser: {_e}")
+                    logger.error(f"[coches.net S2] Error lanzando browser: {_e}")
                     return None
-            context = await _nuevo_contexto_stealth(browser, user_agent, proxy_cfg, locale="es-ES")
-            await context.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-            )
+            context = await _nuevo_contexto_stealth(browser, ua_chrome, proxy_cfg, locale="es-ES")
+            await context.add_init_script(_STEALTH_JS)
             page = await context.new_page()
             try:
-                logger.info(f"[coches.net] Anuncio individual: {url}")
-                await page.goto(url, timeout=30_000, wait_until="domcontentloaded")
-                await asyncio.sleep(random.uniform(2.5, 3.5))
-
-                for sel in ["button#didomi-notice-agree-button",
-                             "button:has-text('Aceptar')",
-                             "button:has-text('Aceptar todo')"]:
-                    try:
-                        btn = page.locator(sel).first
-                        if await btn.is_visible(timeout=2_000):
-                            await btn.click()
-                            await asyncio.sleep(1.0)
-                            break
-                    except Exception:
-                        continue
-
-                # Espera a que la SPA renderice el bloque de detalle (con precio).
-                # Si no aparece en 12s, asumimos que la página fue bloqueada.
+                # Pre-warm: visitar homepage para adquirir cookies de sesión
                 try:
-                    await page.wait_for_selector(
-                        "h1, [class*='DetailHead'], [class*='priceMain'], [class*='DetailPrice']",
-                        timeout=12_000,
-                    )
-                except Exception:
-                    logger.warning("[coches.net] Timeout esperando bloque de detalle")
-
-                texto = ""
-                try:
-                    texto = await page.locator("body").inner_text(timeout=5_000)
-                except Exception:
-                    pass
-                html = ""
-                try:
-                    html = await page.content()
+                    await page.goto("https://www.coches.net/", timeout=10_000, wait_until="load")
                 except Exception:
                     pass
 
-                # --- JSON-LD (server-side, más estable que selectores CSS) ---
-                import json as _json
-                ld_precio = 0.0
-                ld_titulo = ""
-                for raw_ld in re.findall(
-                    r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-                    html, re.DOTALL | re.IGNORECASE
-                ):
-                    try:
-                        d = _json.loads(raw_ld)
-                        items = d if isinstance(d, list) else [d]
-                        for item in items:
-                            offers = item.get('offers', {})
-                            if isinstance(offers, list):
-                                offers = offers[0] if offers else {}
-                            p = float(str(offers.get('price', 0) or 0))
-                            if p >= 1000:
-                                ld_precio = p
-                                ld_titulo = item.get('name', '') or ld_titulo
+                for intento_pw in range(COCHES_NET_RETRY_MAX + 1):
+                    if intento_pw > 0:
+                        logger.info(f"[coches.net S2] Reintento {intento_pw}/{COCHES_NET_RETRY_MAX}")
+                        await asyncio.sleep(5)
+
+                    logger.info(f"[coches.net S2] Navegando a {url}")
+                    await page.goto(url, timeout=30_000, wait_until="domcontentloaded")
+                    await asyncio.sleep(random.uniform(2.5, 3.5))
+
+                    for sel in ["button#didomi-notice-agree-button",
+                                 "button:has-text('Aceptar')",
+                                 "button:has-text('Aceptar todo')"]:
+                        try:
+                            btn = page.locator(sel).first
+                            if await btn.is_visible(timeout=2_000):
+                                await btn.click()
+                                await asyncio.sleep(1.0)
                                 break
-                        if ld_precio > 0:
-                            break
-                    except Exception:
-                        continue
+                        except Exception:
+                            continue
 
-                # Sanity check: página muy pequeña Y sin JSON-LD = bloqueado.
-                if len(html) < 15_000 and ld_precio <= 0:
-                    logger.error(
-                        f"[coches.net] HTML solo {len(html)} bytes y sin JSON-LD — "
-                        "bloqueado por anti-bot."
-                    )
-                    return None
+                    try:
+                        await page.wait_for_selector(
+                            "h1, [class*='DetailHead'], [class*='priceMain'], [class*='DetailPrice']",
+                            timeout=12_000,
+                        )
+                    except Exception:
+                        logger.warning("[coches.net S2] Timeout esperando bloque de detalle")
+
+                    texto = ""
+                    try:
+                        texto = await page.locator("body").inner_text(timeout=5_000)
+                    except Exception:
+                        pass
+                    html = ""
+                    try:
+                        html = await page.content()
+                    except Exception:
+                        pass
+
+                    ld_precio, ld_titulo = self._extraer_json_ld(html)
+
+                    if len(html) < 15_000 and ld_precio <= 0:
+                        if intento_pw < COCHES_NET_RETRY_MAX:
+                            logger.warning(
+                                f"[coches.net S2] HTML {len(html)}B sin JSON-LD — "
+                                f"bloqueado, reintentando ({intento_pw+1}/{COCHES_NET_RETRY_MAX})"
+                            )
+                            continue
+                        logger.error(
+                            f"[coches.net S2] HTML solo {len(html)} bytes y sin JSON-LD "
+                            f"tras {COCHES_NET_RETRY_MAX+1} intentos — bloqueado."
+                        )
+                        return None
+                    break  # HTML OK, salir del loop de retry
 
                 # Precio: usa JSON-LD si disponible, luego CSS selectors.
                 precio = ld_precio
@@ -1730,12 +1947,16 @@ class ScraperCochesNet:
         proxy_cfg = {"server": random.choice(PROXIES)} if PROXIES else None
         anuncios: list = []
 
+        _STEALTH_JS = (
+            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+            "Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3,4,5]});"
+            "Object.defineProperty(navigator,'languages',{get:()=>['es-ES','es']});"
+            "window.chrome={runtime:{}};"
+        )
         async with _PLAYWRIGHT_SEM, async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             context = await _nuevo_contexto_stealth(browser, user_agent, proxy_cfg, locale="es-ES")
-            await context.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
-            )
+            await context.add_init_script(_STEALTH_JS)
             page = await context.new_page()
             try:
                 logger.info(f"[coches.net] Buscando con IA: '{query}'")

@@ -2825,3 +2825,398 @@ async def generar_veredicto_ideal_v2(top3: list[dict], slots: dict) -> str:
 
     raw = await _llamar_ia(system, user_msg, max_tokens=2200)
     return (raw or "").strip()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# /comparar — Fase 4
+# Tres funciones:
+#   1. parsear_comparar_input   → NL → 2 lados {marca, modelo, generacion}
+#   2. enriquecer_modelo        → Tavily 5 queries + síntesis IA (caché 7d)
+#   3. generar_veredicto_comparar → HTML final con ganador
+# ════════════════════════════════════════════════════════════════════════════
+
+_COMPARAR_ENRIQ_TTL_S = 7 * 24 * 3600
+_COMPARAR_ENRIQ_CACHE: dict[str, tuple[float, dict]] = {}
+
+
+async def parsear_comparar_input(texto: str, slots_previos: dict | None = None) -> dict:
+    """
+    Extrae los dos lados de un /comparar. Devuelve:
+    {
+      "lado_a": {"marca": str, "modelo": str, "generacion": str, "version_motor": str},
+      "lado_b": {...},
+      "campos_faltantes": [str]   # e.g. ["lado_b.generacion"]
+    }
+    Si una URL aparece en el texto, NO la mete aquí — la URL la maneja
+    el orquestador antes de llamar a esta función.
+    """
+    texto = (texto or "").strip()
+    if not texto:
+        return {"lado_a": {}, "lado_b": {}, "campos_faltantes": ["lado_a", "lado_b"]}
+
+    prev_json = json.dumps(slots_previos or {}, ensure_ascii=False, default=str)
+
+    system = (
+        "Eres un parser de comparaciones de coches. El usuario quiere comparar "
+        "DOS coches. Tu trabajo: identificar marca, modelo y generación de "
+        "CADA LADO. Devuelve SOLO JSON puro sin backticks. No inventes nada — "
+        "si una pieza no aparece, déjala vacía.\n\n"
+        "Separadores típicos entre lado A y lado B: 'vs', 'VS', 'versus', "
+        "'contra', '|', ' y '. Si hay 3+ candidatos, coge los DOS primeros.\n\n"
+        "Generación: acepta cualquier identificador útil del coche: "
+        "código fábrica (Mk7, FK7, RC, Mk4, B9...), año/rango (2017-2020, "
+        "2015), o nombre comercial de la generación si lo dice ('Golf séptimo'). "
+        "Si solo hay marca+modelo y la pista de generación es ambigua, deja "
+        "generacion vacía.\n\n"
+        "version_motor: solo si el usuario lo dice claro (GTI, Type R, R, RS, "
+        "TDI 150, etc.). Si no lo dice, deja vacío.\n\n"
+        "Schema (rellena lo que detectes):\n"
+        '{'
+        '"lado_a": {"marca": str, "modelo": str, "generacion": str, "version_motor": str},'
+        '"lado_b": {"marca": str, "modelo": str, "generacion": str, "version_motor": str}'
+        '}\n\n'
+        "Ejemplos:\n"
+        " Input: 'Golf 7 GTI vs Civic Type R FK7'\n"
+        " Output: {\"lado_a\":{\"marca\":\"Volkswagen\",\"modelo\":\"Golf\","
+        "\"generacion\":\"Mk7\",\"version_motor\":\"GTI\"},"
+        "\"lado_b\":{\"marca\":\"Honda\",\"modelo\":\"Civic\","
+        "\"generacion\":\"FK7\",\"version_motor\":\"Type R\"}}\n\n"
+        " Input: 'Megane RS contra Leon Cupra'\n"
+        " Output: {\"lado_a\":{\"marca\":\"Renault\",\"modelo\":\"Megane\","
+        "\"generacion\":\"\",\"version_motor\":\"RS\"},"
+        "\"lado_b\":{\"marca\":\"Seat\",\"modelo\":\"Leon\","
+        "\"generacion\":\"\",\"version_motor\":\"Cupra\"}}\n"
+    )
+
+    user_msg = (
+        f"Texto del usuario:\n{texto}\n\n"
+        f"Slots previos (si los rellenas, mantén lo existente):\n{prev_json}\n\n"
+        "Devuelve SOLO JSON. Nada más."
+    )
+
+    raw = await _llamar_ia(system, user_msg, max_tokens=400)
+    if not raw:
+        return {"lado_a": {}, "lado_b": {}, "campos_faltantes": []}
+
+    try:
+        data = json.loads(_limpiar_json(raw))
+        if not isinstance(data, dict):
+            return {"lado_a": {}, "lado_b": {}, "campos_faltantes": []}
+        def _norm(lado: dict) -> dict:
+            lado = lado if isinstance(lado, dict) else {}
+            return {
+                "marca": str(lado.get("marca") or "").strip(),
+                "modelo": str(lado.get("modelo") or "").strip(),
+                "generacion": str(lado.get("generacion") or "").strip(),
+                "version_motor": str(lado.get("version_motor") or "").strip(),
+            }
+        return {
+            "lado_a": _norm(data.get("lado_a")),
+            "lado_b": _norm(data.get("lado_b")),
+        }
+    except Exception as e:
+        logger.warning(f"[COMPARAR] parsear_comparar_input parse error: {e} raw={raw!r}")
+        return {"lado_a": {}, "lado_b": {}, "campos_faltantes": []}
+
+
+async def resolver_generacion_años(marca: str, modelo: str, generacion: str) -> tuple[int, int]:
+    """
+    Resuelve un código de generación (Mk7, FK7, B9, 5ª gen...) al rango de años
+    de producción. Devuelve (año_min, año_max) o (0, 0) si no puede.
+    """
+    system = (
+        "Eres un experto en coches. Devuelve SOLO JSON con el rango de años de "
+        "producción de la generación indicada. "
+        "Formato: {\"año_min\": YYYY, \"año_max\": YYYY}. "
+        "Si no sabes, devuelve {\"año_min\": 0, \"año_max\": 0}. SOLO JSON."
+    )
+    user_msg = f"Coche: {marca} {modelo}\nGeneración / código: {generacion}"
+    raw = await _llamar_ia(system, user_msg, max_tokens=60)
+    if not raw:
+        return 0, 0
+    try:
+        data = json.loads(_limpiar_json(raw))
+        return int(data.get("año_min") or 0), int(data.get("año_max") or 0)
+    except Exception:
+        return 0, 0
+
+
+async def enriquecer_modelo(
+    marca: str, modelo: str, version_motor: str, año_central: int,
+) -> dict:
+    """
+    Trae 5 búsquedas Tavily paralelas + síntesis IA con datos económicos y de
+    fiabilidad del modelo. Cachea 7d.
+
+    Devuelve dict:
+        {
+          "fiabilidad_score": int (0-10),
+          "averias_tipicas": [str, str],
+          "consumo_real_l100": float | None,
+          "mantenimiento_anual_eur": int | None,
+          "depreciacion_pct_3a": int | None,
+          "puntos_fuertes": [str, str],
+          "pega_gorda": str,
+          "fuentes_ok": int (0-5)   # cuántas queries dieron snippets
+        }
+    """
+    vacio = {
+        "fiabilidad_score": 5,
+        "averias_tipicas": [],
+        "consumo_real_l100": None,
+        "mantenimiento_anual_eur": None,
+        "depreciacion_pct_3a": None,
+        "puntos_fuertes": [],
+        "pega_gorda": "",
+        "fuentes_ok": 0,
+    }
+
+    api_key = os.getenv("TAVILY_API_KEY", "")
+    if not api_key:
+        return vacio
+
+    key = f"{marca.lower()}|{modelo.lower()}|{version_motor.lower()}|{año_central}"
+    ahora = time.time()
+    if key in _COMPARAR_ENRIQ_CACHE:
+        ts, cached = _COMPARAR_ENRIQ_CACHE[key]
+        if ahora - ts < _COMPARAR_ENRIQ_TTL_S:
+            logger.info(f"[COMPARAR] enriquecer_modelo cache hit {key}")
+            return cached
+
+    snippets_list: list[tuple[str, str]] = []
+    try:
+        from tavily import AsyncTavilyClient
+        client = AsyncTavilyClient(api_key=api_key)
+
+        version_str = (version_motor or "").strip()
+        sufijo_v = f" {version_str}" if version_str else ""
+
+        queries = [
+            ("fiabilidad", f"{marca} {modelo}{sufijo_v} {año_central} fiabilidad averías típicas problemas"),
+            ("consumo",    f"{marca} {modelo}{sufijo_v} consumo real l/100km"),
+            ("mantenim",   f"{marca} {modelo}{sufijo_v} coste mantenimiento revisión anual"),
+            ("deprec",     f"{marca} {modelo}{sufijo_v} depreciación 3 años valor residual"),
+            ("opiniones",  f"{marca} {modelo}{sufijo_v} opiniones propietarios largo plazo foro"),
+        ]
+        resultados = await asyncio.gather(
+            *(_tavily_search(client, q, DOMINIOS_FOROS_ES_V2, 3) for _, q in queries),
+            return_exceptions=True,
+        )
+        for (etiqueta, _q), r in zip(queries, resultados):
+            if isinstance(r, str) and r:
+                snippets_list.append((etiqueta, r))
+    except Exception as e:
+        logger.warning(f"[COMPARAR] Tavily {marca} {modelo}: {e}")
+
+    fuentes_ok = len(snippets_list)
+    if fuentes_ok == 0:
+        return vacio
+
+    bloques = "\n\n".join(f"### {et}\n{txt}" for et, txt in snippets_list)[:5500]
+
+    system = (
+        "Eres mecánico veterano. Sintetiza datos REALES del modelo a partir "
+        "de los snippets. NO inventes. Si un dato no aparece, déjalo null. "
+        "Devuelve SOLO JSON sin backticks.\n\n"
+        "Schema:\n"
+        '{'
+        '"fiabilidad_score": int (0-10), '
+        '"averias_tipicas": [str, str],  // máx 3, frases cortas con km y €. Ej: "cadena distribución a 120k, ~1500€"'
+        '"consumo_real_l100": float | null,  // l/100km. Solo si los snippets lo mencionan.'
+        '"mantenimiento_anual_eur": int | null,  // € por año aprox.'
+        '"depreciacion_pct_3a": int | null,  // % pérdida a 3 años. Solo si claro.'
+        '"puntos_fuertes": [str, str],  // máx 3, motivos concretos por los que merece la pena'
+        '"pega_gorda": str  // la pega que más duele si compras este modelo, en 1 frase corta'
+        '}'
+    )
+
+    user_msg = (
+        f"MODELO: {marca.title()} {modelo.title()} {version_motor} (año ~{año_central})\n\n"
+        f"SNIPPETS:\n{bloques or '(sin datos disponibles)'}"
+    )
+
+    raw = await _llamar_ia(system, user_msg, max_tokens=700)
+    if not raw:
+        out = {**vacio, "fuentes_ok": fuentes_ok}
+        _COMPARAR_ENRIQ_CACHE[key] = (ahora, out)
+        return out
+
+    def _to_int(v):
+        try:
+            n = int(v)
+            return n if n > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    def _to_float(v):
+        try:
+            f = float(v)
+            return f if f > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    try:
+        data = json.loads(_limpiar_json(raw))
+        if not isinstance(data, dict):
+            raise ValueError("not a dict")
+        out = {
+            "fiabilidad_score": max(0, min(10, int(data.get("fiabilidad_score") or 5))),
+            "averias_tipicas": [str(x)[:140] for x in (data.get("averias_tipicas") or [])][:3],
+            "consumo_real_l100": _to_float(data.get("consumo_real_l100")),
+            "mantenimiento_anual_eur": _to_int(data.get("mantenimiento_anual_eur")),
+            "depreciacion_pct_3a": _to_int(data.get("depreciacion_pct_3a")),
+            "puntos_fuertes": [str(x)[:140] for x in (data.get("puntos_fuertes") or [])][:3],
+            "pega_gorda": str(data.get("pega_gorda") or "")[:240],
+            "fuentes_ok": fuentes_ok,
+        }
+        _COMPARAR_ENRIQ_CACHE[key] = (ahora, out)
+        logger.info(
+            f"[COMPARAR] enriquecer {marca} {modelo} {version_motor}: "
+            f"fiab={out['fiabilidad_score']} fuentes_ok={fuentes_ok}"
+        )
+        return out
+    except Exception as e:
+        logger.warning(f"[COMPARAR] enriquecer_modelo parse error: {e} raw={raw[:200]!r}")
+        out = {**vacio, "fuentes_ok": fuentes_ok}
+        _COMPARAR_ENRIQ_CACHE[key] = (ahora, out)
+        return out
+
+
+async def generar_veredicto_comparar(datos_a: dict, datos_b: dict) -> str:
+    """
+    Genera HTML Telegram con la comparativa de dos coches a nivel modelo y
+    un ganador claro con razonamiento extenso.
+
+    datos_a / datos_b deben contener:
+      marca, modelo, generacion, version_motor, nombre_display, año_min,
+      año_max, n_comparables, mediana, p25, p75, etiqueta_dgt, info_zbe,
+      coste_combustible_anual_eur, perdida_3a_eur, valor_residual_eur,
+      tco_3a_eur, km_año_referencia, precio_litro_referencia,
+      enriquecimiento: {fiabilidad_score, averias_tipicas, consumo_real_l100,
+                        mantenimiento_anual_eur, depreciacion_pct_3a,
+                        puntos_fuertes, pega_gorda, fuentes_ok}
+
+    El campo `nombre_display` de cada coche es OBLIGATORIO en el output:
+    debe aparecer verbatim en cada bloque, viñeta y línea de veredicto.
+    """
+    n1 = datos_a.get("nombre_display") or f"{datos_a.get('marca', '')} {datos_a.get('modelo', '')}".strip()
+    n2 = datos_b.get("nombre_display") or f"{datos_b.get('marca', '')} {datos_b.get('modelo', '')}".strip()
+    payload = {"coche_1": datos_a, "coche_2": datos_b}
+
+    # Alias cortos: modelo + gen corta (≤5 chars) + version_motor corta (≤8 chars)
+    # Ej: Golf Mk7 GTI, Civic FK7 Type R, Serie 3 B8, A4 B9
+    def _alias_corto(datos: dict) -> str:
+        modelo = (datos.get("modelo") or "").strip().title()
+        gen = (datos.get("generacion") or "").strip()
+        ver = (datos.get("version_motor") or "").strip()
+        partes = [modelo]
+        if gen and len(gen) <= 5:
+            partes.append(gen)
+        if ver and len(ver) <= 8:
+            partes.append(ver)
+        return " ".join(p for p in partes if p) or modelo
+
+    a1 = _alias_corto(datos_a)  # ej. "Golf Mk7 GTI", "Civic FK7 Type R"
+    a2 = _alias_corto(datos_b)
+
+    system = (
+        "Eres Juan Lopera. Hablas directo, con datos. Sin relleno. Opinas.\n\n"
+        "NAMING — tres zonas, tres reglas:\n"
+        f"  1. Cabecera 🆚 y bullets de datos en secciones (• Nombre: datos): "
+        f"nombre COMPLETO «{n1}» y «{n2}».\n"
+        f"  2. Resumen rápido (bullets de métricas) y todos los 🏆: "
+        f"alias cortos «{a1}» y «{a2}».\n"
+        f"  3. Párrafos de justificación y veredicto (excepto la tesis inicial): "
+        f"alias cortos «{a1}» y «{a2}».\n"
+        f"  Nunca 'A', 'B', 'el primero', 'el segundo'.\n\n"
+        "DATOS: usa SOLO los números del JSON. No calcules nada; todo está "
+        "pre-calculado (`coste_combustible_anual_eur`, `perdida_3a_eur`, "
+        "`tco_3a_eur`). Si un campo es null, omite la frase.\n\n"
+        "ESTILO: frases cortas, datos concretos, sin coletillas "
+        "('en resumen', 'como puedes ver', 'cabe destacar', 'esto significa que', "
+        "'lo que lo convierte en', 'lo que puede ser un problema para'). "
+        "Sin emojis en texto narrativo — solo en cabeceras de bloque.\n\n"
+        "ESTRUCTURA DE OUTPUT (HTML Telegram):\n\n"
+        f"🆚 <b>{n1} vs {n2}</b>\n"
+        "<i>Años [coche_1.año_min]-[coche_1.año_max] · [coche_2.año_min]-[coche_2.año_max]</i>\n\n"
+        "📊 <b>Resumen rápido</b>\n\n"
+        f"• Precio:          {a1} [mediana]€ · {a2} [mediana]€  🏆 [alias ganador]\n"
+        f"• DGT:             {a1} [etiqueta] · {a2} [etiqueta]  🏆 [alias o 🏁 Empate]\n"
+        f"• Fiabilidad:      {a1} [score]/10 · {a2} [score]/10  🏆 [alias ganador]\n"
+        f"• Consumo:         {a1} [l/100] · {a2} [l/100]  🏆 [alias]  (omitir si null)\n"
+        f"• Mantenimiento:   {a1} ~[€]/año · {a2} ~[€]/año  🏆 [alias]  (omitir si null)\n"
+        f"• Depreciación 3a: {a1} [%] · {a2} [%]  🏆 [alias]  (omitir si null)\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "💶 <b>PRECIO MERCADO</b>\n\n"
+        f"• {n1}: [mediana]€ (P25 [p25]€ – P75 [p75]€, n=[n_comparables])\n"
+        f"• {n2}: [mediana]€ (P25 [p25]€ – P75 [p75]€, n=[n_comparables])\n\n"
+        "🏆 [alias ganador]\n\n"
+        f"[1-2 frases cortas. Usa «{a1}» y «{a2}». Delta en € y %. Por qué "
+        f"uno sale más caro: escasez, demanda, generación nueva, etc.]\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🏷️ <b>DGT y ZBE</b>\n\n"
+        f"• {n1}: etiqueta [etiqueta_dgt] — [info_zbe en 1 frase corta].\n"
+        f"• {n2}: etiqueta [etiqueta_dgt] — [info_zbe en 1 frase corta].\n\n"
+        "🏆 [alias ganador o 🏁 Empate]\n\n"
+        f"[1-2 frases. Usa «{a1}» y «{a2}». Qué supone para usuario en Madrid/BCN "
+        f"y hasta cuándo es seguro. Si empate, di por qué con una frase.]\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🔧 <b>FIABILIDAD</b>\n\n"
+        f"• {n1}: [score]/10 — [avería típica con km y €].\n"
+        f"• {n2}: [score]/10 — [avería típica con km y €].\n\n"
+        "🏆 [alias ganador o 🏁 Empate]\n\n"
+        f"[2-3 frases cortas. Usa «{a1}» y «{a2}». En qué km empiezan los "
+        f"problemas, qué cuenta la comunidad, coste medio del fallo. "
+        f"El lector debe entender el score, no aceptarlo por fe.]\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "⛽ <b>CONSUMO REAL</b>  (omitir bloque si ambos null)\n\n"
+        f"• {n1}: [consumo_real_l100] l/100 — ~[coste_combustible_anual_eur]€/año.\n"
+        f"• {n2}: [consumo_real_l100] l/100 — ~[coste_combustible_anual_eur]€/año.\n\n"
+        "🏆 [alias ganador]\n\n"
+        f"[1 frase. Usa «{a1}» y «{a2}». Delta €/año y para qué uso importa.]\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "💸 <b>MANTENIMIENTO ANUAL</b>  (omitir si ambos null)\n\n"
+        f"• {n1}: ~[mantenimiento_anual_eur]€/año.\n"
+        f"• {n2}: ~[mantenimiento_anual_eur]€/año.\n\n"
+        "🏆 [alias ganador]\n\n"
+        f"[1-2 frases. Usa «{a1}» y «{a2}». Qué incluye, dónde están las "
+        f"sorpresas: taller oficial, piezas, intervalos.]\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📉 <b>DEPRECIACIÓN 3 AÑOS</b>  (omitir si ambos null)\n\n"
+        f"• {n1}: ~[depreciacion_pct_3a]% — pierde ~[perdida_3a_eur]€.\n"
+        f"• {n2}: ~[depreciacion_pct_3a]% — pierde ~[perdida_3a_eur]€.\n\n"
+        "🏆 [alias ganador]\n\n"
+        f"[1 frase. Usa «{a1}» y «{a2}». Por qué uno aguanta más valor.]\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "⚠️ <b>PEGA GORDA</b>\n\n"
+        f"• {n1}: [avería/problema CONCRETO de pega_gorda — menciona km y coste en €].\n"
+        f"• {n2}: [avería/problema CONCRETO de pega_gorda — menciona km y coste en €].\n\n"
+        "IMPORTANTE: no escribas frases genéricas como 'costes de mantenimiento "
+        "elevados' o 'puede presentar problemas'. Sé específico: qué pieza, "
+        "en qué km aparece, cuánto cuesta. Si el campo pega_gorda del JSON "
+        "ya tiene esa info, úsala verbatim.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🏆 <b>VEREDICTO</b>\n\n"
+        "[6-8 frases, estructura:\n"
+        f" 1. Tesis: 'Yo me quedaría con el {n1}.' (o {n2}).\n"
+        " 2-4. Razones con números del JSON (delta €, score, ahorro 3a).\n"
+        f"      Usa «{a1}» y «{a2}» — NO {n1} en cada frase, solo en la tesis.\n"
+        " 5-6. Escenario concreto donde el otro gana (presupuesto, uso urbano...).\n"
+        " 7. Qué revisar al comprar el ganador — específico, no genérico.]\n\n"
+        "REGLAS FINALES:\n"
+        f"- Si fuentes_ok < 2, añade al final: '⚠️ Datos limitados de «{n1}» "
+        f"o «{n2}», interpreta con cautela'.\n"
+        f"- Si n_comparables < 5, añade al inicio: '⚠️ Solo N anuncios de "
+        f"«[nombre completo]», precio orientativo'.\n"
+        "- Devuelve SOLO HTML. Sin backticks ni preámbulos."
+    )
+
+    user_msg = (
+        f"NOMBRES VERBATIM (úsalos sin modificar):\n"
+        f"- coche_1.nombre_display = «{n1}»\n"
+        f"- coche_2.nombre_display = «{n2}»\n\n"
+        f"DATOS:\n{json.dumps(payload, ensure_ascii=False, default=str)}"
+    )
+
+    raw = await _llamar_ia(system, user_msg, max_tokens=2400)
+    return (raw or "").strip()

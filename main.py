@@ -38,6 +38,7 @@ from ideal_pipeline import (
     nueva_sesion, get_sesion, reset_sesion, set_sesion,
     alimentar_slots, ejecutar_pipeline, fase_segunda_ronda,
 )
+import comparar_pipeline
 from ideal_schema import generar_preguntas_clarificacion
 from database import (
     init_db, crear_mision, eliminar_mision,
@@ -2184,6 +2185,128 @@ async def cmd_ideal_v1_disabled(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# /comparar — Fase 4
+# ════════════════════════════════════════════════════════════════════════════
+
+COMPARAR_FILLING = 40
+
+
+@requiere_acceso("/comparar", registrar=False)
+async def cmd_comparar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Entry point /comparar. Crea sesión y pasa a slot-filling si hace falta."""
+    user = update.effective_user
+    allowed, _tier = _check_access(user.id, user.username or "")
+    if not allowed:
+        await update.message.reply_text("⛔ No tienes acceso a este bot.")
+        return ConversationHandler.END
+
+    ctx.user_data["comparar_user_id"] = user.id
+    comparar_pipeline.borrar_sesion(user.id)
+    comparar_pipeline.nueva_sesion(user.id)
+
+    texto = (update.message.text or "").strip()
+    if texto.lower().startswith("/comparar"):
+        texto = texto[9:].strip()
+
+    if not texto:
+        await update.message.reply_text(
+            "🆚 <b>Compara dos coches a nivel modelo.</b>\n\n"
+            "Ejemplos:\n"
+            "• <code>/comparar Golf 7 GTI vs Civic Type R FK7</code>\n"
+            "• <code>/comparar Megane RS contra Leon Cupra</code>\n"
+            "• <code>/comparar &lt;url wallapop&gt; vs &lt;url coches.net&gt;</code>",
+            parse_mode="HTML",
+        )
+        return COMPARAR_FILLING
+
+    return await _comparar_procesar_texto(update, ctx, texto)
+
+
+async def comparar_recibir_texto(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handler de respuestas en estado COMPARAR_FILLING."""
+    user = update.effective_user
+    sesion = comparar_pipeline.get_sesion(user.id)
+    if not sesion:
+        await update.message.reply_text("⏰ Sesión caducada. Vuelve a lanzar /comparar.")
+        return ConversationHandler.END
+
+    texto = (update.message.text or "").strip()
+    if not texto:
+        return COMPARAR_FILLING
+
+    return await _comparar_procesar_texto(update, ctx, texto)
+
+
+async def _comparar_procesar_texto(update: Update, ctx: ContextTypes.DEFAULT_TYPE, texto: str):
+    """Alimenta slots, pregunta si falta info, o lanza pipeline."""
+    user = update.effective_user
+    sesion = comparar_pipeline.get_sesion(user.id) or comparar_pipeline.nueva_sesion(user.id)
+
+    msg_parse = await update.message.reply_text("🤖 Entendiendo qué quieres comparar…")
+    try:
+        completos, siguiente = await comparar_pipeline.alimentar_slots(sesion, texto)
+    except Exception as e:
+        logger.warning(f"[COMPARAR] alimentar_slots: {e}", exc_info=e)
+        await msg_parse.edit_text("⚠️ No te entendí bien. Reformula la comparación.")
+        return COMPARAR_FILLING
+
+    if not completos:
+        await msg_parse.edit_text(siguiente or "¿Puedes ser más concreto?", parse_mode="HTML")
+        return COMPARAR_FILLING
+
+    # Slots completos → pipeline.
+    await msg_parse.edit_text(
+        "🔧 <b>Comparando los dos modelos…</b>\n"
+        "<i>Mercado + DGT + fiabilidad + economía. Tarda menos de un minuto.</i>",
+        parse_mode="HTML",
+    )
+    try:
+        await ctx.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    except Exception:
+        pass
+
+    try:
+        html_veredicto = await asyncio.wait_for(
+            comparar_pipeline.ejecutar_pipeline(sesion),
+            timeout=180,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("[COMPARAR] pipeline timeout")
+        await msg_parse.edit_text("⏱ La comparativa tardó demasiado. Reintenta en 1 min.")
+        comparar_pipeline.borrar_sesion(user.id)
+        return ConversationHandler.END
+    except Exception as e:
+        logger.error(f"[COMPARAR] pipeline error: {e}", exc_info=e)
+        await msg_parse.edit_text("⚠️ Algo se rompió en la comparativa. Reintenta en 1 min.")
+        comparar_pipeline.borrar_sesion(user.id)
+        return ConversationHandler.END
+
+    if not html_veredicto:
+        await msg_parse.edit_text(
+            "😔 No conseguí datos suficientes para una comparativa fiable. "
+            "Prueba con generación distinta o modelos más populares."
+        )
+        comparar_pipeline.borrar_sesion(user.id)
+        return ConversationHandler.END
+
+    await _enviar_largo(
+        msg_parse, html_veredicto,
+        parse_mode="HTML", disable_web_page_preview=True,
+    )
+
+    # Registrar uso (1 crédito) — solo si llegamos al veredicto.
+    try:
+        es_admin = user.id in ADMIN_USER_IDS
+        if not es_admin:
+            registrar_uso(user.id, 1)
+    except Exception as e:
+        logger.warning(f"[COMPARAR] registrar_uso: {e}")
+
+    comparar_pipeline.borrar_sesion(user.id)
+    return ConversationHandler.END
+
+
 async def callback_ideal_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Callback para los botones 'Analizar #N' del resultado /ideal."""
     query = update.callback_query
@@ -2428,11 +2551,24 @@ def main():
         allow_reentry=True,
     )
 
+    # Conversación: /comparar (semana 4)
+    conv_comparar = ConversationHandler(
+        entry_points=[CommandHandler("comparar", cmd_comparar)],
+        states={
+            COMPARAR_FILLING: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, comparar_recibir_texto),
+            ],
+        },
+        fallbacks=[CommandHandler("cancelar", cancelar)],
+        allow_reentry=True,
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("plan", cmd_plan))
     app.add_handler(CommandHandler("analizar", cmd_analizar))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(conv_ideal)
+    app.add_handler(conv_comparar)
     app.add_handler(CallbackQueryHandler(callback_ideal_analizar, pattern=r"^ideal_analizar:\d+$"))
     # /ideal v2 — botones del top3
     app.add_handler(CallbackQueryHandler(callback_ideal_v2_aceptar, pattern=r"^ideal_aceptar:\d+$"))

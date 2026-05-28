@@ -3,6 +3,20 @@
 ## Instrucciones de salida
 Actúa como un cavernícola. Usa oraciones cortas (3-6 palabras). Elimina rellenos, preámbulos y cortesías. Solo información esencial. Habla directo. No expliques. Pero la calidad del codigo tiene que seguir intacta.
 
+## OpenSpec activo
+
+Este proyecto usa **OpenSpec** (`openspec/`). Antes de implementar features nuevas:
+
+1. Leer `openspec/project.md` y los specs relevantes en `openspec/specs/<capability>/spec.md`.
+2. Usar `/opsx:propose "<idea>"` para crear proposal + design + tasks.
+3. Iterar la proposal con el usuario hasta acuerdo.
+4. Usar `/opsx:apply` para implementar siguiendo los tasks.
+5. Usar `/opsx:archive` cuando esté en producción para fusionar deltas en specs.
+
+Capabilities sembradas: `telegram-bot-shell`, `analizar-anuncio`, `recomendador-ideal`, `scraping-multifuente`, `freemium-creditos`, `worker-misiones`, `dataset-historico`.
+
+Consultar specs ANTES de tocar código en zonas estables (especialmente `analizar-anuncio` y `freemium-creditos`).
+
 ## Contexto general
 
 Bot de Telegram (+ futura web pública) que analiza anuncios de coches
@@ -313,6 +327,11 @@ ENABLE_COCHES_NET=true
 FREE_CREDITOS_DIA=3
 PAID_CREDITOS_PACK_30=30
 PAID_CREDITOS_PACK_100=100
+WALLAPOP_RETRY_MAX=3
+COCHES_NET_RETRY_MAX=2
+WALLAPOP_APPVERSION=817730
+WALLAPOP_MPID=6568109859988379704
+WALLAPOP_DEVICEID=e17cd452-9a0a-466e-a628-6328966ced0d
 ```
 
 Arrancar en producción Linux:

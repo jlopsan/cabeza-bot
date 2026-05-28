@@ -47,6 +47,14 @@ WALLAPOP_RESULTS   = 20
 # ─── SCRAPING ESPAÑA: coches.net ─────────────────────────────────────────────
 COCHES_NET_RESULTS = 20
 
+# ─── ROBUSTEZ SCRAPERS ────────────────────────────────────────────────────────
+WALLAPOP_RETRY_MAX  = int(os.getenv("WALLAPOP_RETRY_MAX", "3"))
+COCHES_NET_RETRY_MAX = int(os.getenv("COCHES_NET_RETRY_MAX", "2"))
+# Headers Wallapop API (actualizables sin redeploy via .env)
+WALLAPOP_APPVERSION = os.getenv("WALLAPOP_APPVERSION", "817730")
+WALLAPOP_MPID       = os.getenv("WALLAPOP_MPID", "6568109859988379704")
+WALLAPOP_DEVICEID   = os.getenv("WALLAPOP_DEVICEID", "e17cd452-9a0a-466e-a628-6328966ced0d")
+
 # ─── TOLERANCIAS CRUCE DE → ES ───────────────────────────────────────────────
 AÑO_TOLERANCIA = 1       # ±1 año
 KM_TOLERANCIA  = 20_000  # ±20 000 km
@@ -142,6 +150,10 @@ PAID_CREDITOS_PACK = PAID_CREDITOS_PACK_30   # alias mientras se migra el resto 
 IDEAL_TOP_N          = int(os.getenv("IDEAL_TOP_N", "3"))
 IDEAL_CANDIDATOS_MAX = int(os.getenv("IDEAL_CANDIDATOS_MAX", "5"))
 IDEAL_KM_AÑO_MAX     = int(os.getenv("IDEAL_KM_ANO_MAX", "25000"))
+
+# ─── /comparar ───────────────────────────────────────────────────────────────
+COMPARAR_KM_AÑO_REF       = int(os.getenv("COMPARAR_KM_ANO_REF", "15000"))   # km/año referencia TCO
+COMPARAR_PRECIO_LITRO_EUR  = float(os.getenv("COMPARAR_PRECIO_LITRO_EUR", "1.55"))  # €/L gasolina España
 
 
 # ═════════════════════════════════════════════════════════════════════════════

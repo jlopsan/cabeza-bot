@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 .playwright/
 cabeza_bot.db
+*.bak
