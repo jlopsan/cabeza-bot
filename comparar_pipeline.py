@@ -449,6 +449,7 @@ async def _procesar_lado(lado: LadoComparar) -> dict:
         "mediana": stats["mediana"],
         "p25": stats["p25"],
         "p75": stats["p75"],
+        "combustible": comb,
         "etiqueta_dgt": etiqueta,
         "info_zbe": zbe,
         "enriquecimiento": enriq,

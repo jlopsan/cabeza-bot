@@ -396,6 +396,57 @@ def _limpiar_json(t: str) -> str:
     return m.group(0) if m else t
 
 
+async def parsear_datos_anuncio_manual(texto: str) -> dict:
+    """
+    Extrae {marca, modelo, año, km, precio, descripcion} de texto libre del usuario.
+    Devuelve None en campos que no se pudieron identificar. No lanza excepciones.
+    """
+    system = (
+        "Extrae los datos de un coche de segunda mano del texto del usuario. "
+        "Responde SOLO con JSON puro sin backticks ni explicaciones: "
+        '{"marca":str|null,"modelo":str|null,"año":int|null,"km":int|null,'
+        '"precio":float|null,"descripcion":str|null} '
+        "Ejemplos: "
+        '"golf tdi 2018 150000km 9500€" → {"marca":"Volkswagen","modelo":"Golf","año":2018,"km":150000,"precio":9500.0,"descripcion":null} '
+        '"toyota corolla 2020 85k 12500" → {"marca":"Toyota","modelo":"Corolla","año":2020,"km":85000,"precio":12500.0,"descripcion":null} '
+        '"seat ibiza del 2016 con 90 mil km por 7000 pavos" → {"marca":"Seat","modelo":"Ibiza","año":2016,"km":90000,"precio":7000.0,"descripcion":null} '
+        "Si el texto menciona motor, combustible u otras características, ponlas en descripcion. "
+        "Normaliza marca con mayúscula inicial. modelo en minúsculas. "
+        "km: convierte '85k' → 85000, '90 mil' → 90000. "
+        "precio: convierte 'pavos', 'euros', '€' al número. "
+        "Si un campo no aparece en el texto, devuelve null para ese campo."
+    )
+    try:
+        respuesta = await _llamar_ia(system, texto, max_tokens=200)
+        data = json.loads(_limpiar_json(respuesta))
+
+        def _int_pos(v):
+            try:
+                n = int(v)
+                return n if n > 0 else None
+            except (TypeError, ValueError):
+                return None
+
+        def _float_pos(v):
+            try:
+                f = float(v)
+                return f if f > 0 else None
+            except (TypeError, ValueError):
+                return None
+
+        return {
+            "marca":       str(data["marca"]).strip().title() if data.get("marca") else None,
+            "modelo":      str(data["modelo"]).strip().lower() if data.get("modelo") else None,
+            "año":         _int_pos(data.get("año")),
+            "km":          _int_pos(data.get("km")),
+            "precio":      _float_pos(data.get("precio")),
+            "descripcion": str(data["descripcion"]).strip() if data.get("descripcion") else None,
+        }
+    except Exception as e:
+        logger.warning(f"[MANUAL] Error parseando datos: {e}")
+        return {"marca": None, "modelo": None, "año": None, "km": None, "precio": None, "descripcion": None}
+
+
 async def validar_anuncios_modelo(
     marca_buscada: str,
     modelo_buscado: str,
@@ -1159,7 +1210,7 @@ async def generar_veredicto_analizar(
         "DSG 7v mecatrónico, etc.). Cita fuente de INVESTIGACIÓN si existe.\n"
         "• Alternativas: si en INVESTIGACIÓN o tu conocimiento hay un modelo del "
         "MISMO SEGMENTO Y RANGO DE PRECIO con mejor fiabilidad, dilo CLARO.\n\n"
-        "FORMATO EXACTO de 10 bloques en este orden:\n\n"
+        "FORMATO EXACTO de 12 bloques en este orden:\n\n"
         "<b>🎯 VERSIÓN IDENTIFICADA</b>\n"
         "1 línea técnica: motor, CV, caja, combustible, código motor si aplica.\n\n"
         "<b>⏳ VIDA ÚTIL ESTIMADA</b>\n"
@@ -1174,6 +1225,30 @@ async def generar_veredicto_analizar(
         "(él no necesita saberlo, pero no des los kg como dato del anuncio). "
         "Si NO hay datos suficientes, salta el cálculo y da solo la valoración cualitativa. "
         "Para eléctricos matiza que el par instantáneo compensa el peso de batería.\n\n"
+        "<b>🎮 SENSACIONES DE CONDUCCIÓN</b>\n"
+        "2-3 frases sobre el carácter del motor según la versión identificada. "
+        "Guía de qué esperar al volante según el tipo: "
+        "• Diésel: par desde ~1500rpm, empuje sin esfuerzo en ciudad y autopista, se cansa a altas. "
+        "• Gasolina atmosférico: necesita rpm para rendir, más revvador, sonido más vivo. "
+        "• Turbo gasolina: empuje temprano pero posible turbo lag si la turbo es grande; "
+        "en versiones sport (GTI, ST, RS) valorar si la entrega de potencia cumple expectativas. "
+        "• Híbrido: silencioso en ciudad, motor térmico entra a autopista, par eléctrico inmediato. "
+        "• Eléctrico: par máximo al instante, sin marchas, regeneración al soltar. "
+        "Si la caja es DSG/PDK/CVT menciónalo (respuesta, suavidad, fallos conocidos). "
+        "Si hay datos de foros sobre sensaciones, úsalos. Si no, usa conocimiento del modelo.\n\n"
+        "<b>💨 AERODINÁMICA</b>\n"
+        "2-3 frases usando el marco correcto: el número que importa no es solo el Cx "
+        "sino el SCx = Cd × Área frontal (resistencia aerodinámica total). "
+        "La fórmula real es Fd = ½ × ρ × v² × Cd × A — y la velocidad va al cuadrado: "
+        "a 120 km/h la resistencia es 4× la de 60 km/h. "
+        "Evalúa: (1) SCx estimado según carrocería — turismo bajo ~0.55-0.65 m², "
+        "SUV compacto ~0.70-0.80 m², SUV grande/monovolumen ~0.80-0.95 m²; "
+        "(2) resistencia de presión en la zaga — coches con trasera plana o alta "
+        "(SUV, compactos, monovolúmenes) generan vórtice de baja presión que actúa "
+        "como paracaídas a +100 km/h; berlinas y cupés de zaga inclinada lo evitan; "
+        "(3) impacto práctico: qué supone esto para el consumo en autopista y el ruido de viento. "
+        "Si es versión sport con alerón/difusor, valora si genera downforce real o es decorativo. "
+        "Cx de referencia si lo conoces, pero nunca lo inventes.\n\n"
         "<b>💰 PRECIO vs MERCADO</b>\n"
         "2-3 frases. ¿Barato/justo/caro? Justifica con km, año y equipamiento detectado. "
         "Si la muestra mezcla Wallapop (particulares) y Coches.net (dealers) y la diferencia "
@@ -3168,6 +3243,34 @@ async def generar_veredicto_comparar(datos_a: dict, datos_b: dict) -> str:
         f"[2-3 frases cortas. Usa «{a1}» y «{a2}». En qué km empiezan los "
         f"problemas, qué cuenta la comunidad, coste medio del fallo. "
         f"El lector debe entender el score, no aceptarlo por fe.]\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🎮 <b>SENSACIONES DE CONDUCCIÓN</b>\n\n"
+        f"• {n1}: [carácter del motor en 1 frase: combustible, entrega de par/potencia, caja]\n"
+        f"• {n2}: [ídem]\n\n"
+        "🏆 [alias ganador según perfil de conductor, o 🏁 Empate si estilos similares]\n\n"
+        f"[1-2 frases. Usa «{a1}» y «{a2}». "
+        f"Referencia el campo `combustible` del JSON para derivar el carácter: "
+        f"diésel = par bajo, ideal largos; gasolina atmosférico = revvador; "
+        f"turbo gasolina = empuje temprano, posible turbo lag en versiones normales "
+        f"pero entrega lineal en versiones sport (GTI, ST, Type R…); "
+        f"híbrido/eléctrico = par inmediato, silencioso. "
+        f"Menciona la caja (DSG, PDK, manual, CVT) si es relevante. "
+        f"Para qué perfil de conductor gana cada uno.]\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "💨 <b>AERODINÁMICA</b>\n\n"
+        f"• {n1}: [SCx estimado (Cd × área frontal) + resistencia de presión en zaga en 1 frase]\n"
+        f"• {n2}: [ídem]\n\n"
+        "🏆 [alias ganador o 🏁 Empate]\n\n"
+        f"[1-2 frases. Usa «{a1}» y «{a2}». "
+        f"El número que importa es el SCx = Cd × Área frontal — referencia rangos típicos: "
+        f"turismo bajo ~0.55-0.65 m², SUV compacto ~0.70-0.80 m², SUV grande ~0.80-0.95 m². "
+        f"Explica la resistencia de presión (efecto paracaídas en zaga): "
+        f"traseras planas/altas crean vórtice de baja presión que a 120 km/h actúa como paracaídas; "
+        f"berlinas/cupés con zaga inclinada cierran el flujo limpiamente. "
+        f"La velocidad va al cuadrado — 60→120 km/h multiplica la resistencia por 4: "
+        f"di cuál sale mejor parado en viajes largos y por qué. "
+        f"Si alguno tiene kit aero sport, valora si genera downforce real. "
+        f"No inventes Cx exacto si no lo conoces.]\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
         "⛽ <b>CONSUMO REAL</b>  (omitir bloque si ambos null)\n\n"
         f"• {n1}: [consumo_real_l100] l/100 — ~[coste_combustible_anual_eur]€/año.\n"

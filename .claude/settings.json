@@ -113,7 +113,10 @@
       "Bash(cd /d \"c:\\\\Users\\\\Juan\\\\Documents\\\\cabeza-bot\")",
       "Bash(python -c \"import scraper; print\\('OK scraper'\\)\")",
       "PowerShell($date = Get-Date -Format \"yyyy-MM-dd\"; $src = \"openspec\\\\changes\\\\comparar-coches\"; $dst = \"openspec\\\\changes\\\\archive\\\\$date-comparar-coches\"; Move-Item $src $dst; Write-Host \"Archived to: $dst\")",
-      "PowerShell(openspec list 2>&1)"
+      "PowerShell(openspec list 2>&1)",
+      "PowerShell(python -c \"import ai, comparar_pipeline; print\\('OK'\\)\" 2>&1)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('main.py'\\).read\\(\\)\\); print\\('main.py OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('ai.py'\\).read\\(\\)\\); print\\('ai.py OK'\\)\")"
     ],
     "additionalDirectories": [
       "c:\\Users\\Juan\\.claude\\plans",

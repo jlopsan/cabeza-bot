@@ -33,6 +33,7 @@ from ai import (
     parsear_perfil_ideal, validar_anuncios_modelo,
     investigar_coche, generar_veredicto_ideal,
     brainstorm_candidatos_ideal, seleccionar_top3_con_investigacion,
+    parsear_datos_anuncio_manual,
 )
 from ideal_pipeline import (
     nueva_sesion, get_sesion, reset_sesion, set_sesion,
@@ -653,8 +654,6 @@ async def _core_analisis(url: str, source_msg, ctx, es_admin: bool, user_id: int
     por el botón "Analizar #N" de /ideal.
     source_msg: Message desde donde enviar mensajes de progreso.
     """
-    from models import EstadisticaMercado
-
     cached = cache_get(url)
     if cached:
         veredicto_cache, contexto_cache, mins_ago = cached
@@ -727,7 +726,14 @@ async def _core_analisis(url: str, source_msg, ctx, es_admin: bool, user_id: int
                     "• Wallapop a veces bloquea temporalmente. Prueba en 1 min.\n"
                     "• Comprueba que la URL sea válida y el anuncio siga activo."
                 )
-            await msg.edit_text(f"😔 No pude extraer los datos del anuncio.\n{detalle}")
+            teclado_fallback = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✏️ Introducir datos a mano", callback_data="manual:si"),
+            ]])
+            ctx.user_data["manual_source_msg"] = source_msg
+            await msg.edit_text(
+                f"😔 No pude extraer los datos del anuncio.\n{detalle}",
+                reply_markup=teclado_fallback,
+            )
             return
 
         marca  = anuncio.marca  or "desconocida"
@@ -743,101 +749,7 @@ async def _core_analisis(url: str, source_msg, ctx, es_admin: bool, user_id: int
             parse_mode="HTML",
         )
 
-        try:
-            comparables = await buscar_comparables_todas(marca, modelo, año, km, n=30)
-        except Exception as e:
-            logger.error(f"[BOT] Error buscando comparables: {e}")
-            comparables = []
-
-        comparables = [c for c in comparables if c.item_id != anuncio.item_id]
-        fuentes_count = dict(Counter(c.fuente for c in comparables))
-        logger.info(f"[BOT] Comparables por fuente: {fuentes_count}")
-
-        historico = [a for a in ([anuncio] + comparables) if a.precio > 0 and a.año > 1990]
-        try:
-            guardar_historico_batch(historico)
-        except Exception as e:
-            logger.warning(f"[BOT] Error guardando histórico: {e}")
-
-        precios_comp = [c.precio for c in comparables if c.precio > 0]
-
-        if len(precios_comp) < 3:
-            await msg.edit_text(
-                f"⚠️ Solo encontré {len(precios_comp)} comparable(s) para "
-                f"<b>{html.escape(marca.title())} {html.escape(modelo.upper())}</b> con esos parámetros.\n"
-                f"No hay datos suficientes para un veredicto fiable. Prueba un modelo más común.",
-                parse_mode="HTML",
-            )
-            return
-
-        mediana    = _stats_mod.median(precios_comp)
-        media      = _stats_mod.mean(precios_comp)
-        desviacion = _stats_mod.stdev(precios_comp) if len(precios_comp) > 1 else 0.0
-        precios_ord = sorted(precios_comp)
-        pos_menor   = sum(1 for p in precios_ord if p < anuncio.precio)
-        percentil   = round((pos_menor / len(precios_ord)) * 100)
-        desv_pct    = round(((anuncio.precio - mediana) / mediana) * 100, 1) if mediana else 0.0
-
-        stats = EstadisticaMercado(
-            n_comparables=len(precios_comp),
-            mediana=round(mediana, 0),
-            media=round(media, 0),
-            desviacion=round(desviacion, 0),
-            percentil=percentil,
-            desviacion_pct=desv_pct,
-            precios=precios_ord,
-        )
-
-        await msg.edit_text(
-            f"📊 {stats.n_comparables} comparables encontrados. "
-            f"Mediana: <b>{stats.mediana:,.0f}€</b>\n"
-            f"⏳ Generando veredicto con IA…",
-            parse_mode="HTML",
-        )
-
-        contexto_qa = None
-        try:
-            veredicto, contexto_qa = await generar_veredicto_analizar(
-                anuncio, stats, comparables,
-                fuentes_count=fuentes_count,
-            )
-        except Exception as e:
-            logger.error(f"[BOT] Error generando veredicto: {e}")
-            veredicto = (
-                f"⚠️ No pude generar veredicto IA.\n"
-                f"Precio: {anuncio.precio:,.0f}€ · Mediana: {stats.mediana:,.0f}€"
-            )
-
-        if contexto_qa:
-            try:
-                cache_set(url, veredicto, contexto_qa)
-            except Exception:
-                pass
-
-        cabecera = (
-            f"🔍 <b>{html.escape(marca.title())} {html.escape(modelo.upper())} {año}</b>\n"
-            f"📍 {html.escape(anuncio.provincia or 'España')}  ·  {km:,} km  ·  "
-            f"<a href='{url}'>Ver anuncio</a>\n"
-            f"{'─' * 30}\n\n"
-        )
-
-        await _enviar_largo(
-            msg, cabecera + veredicto,
-            parse_mode="HTML", disable_web_page_preview=True,
-        )
-
-        if contexto_qa:
-            ctx.user_data["analisis_qa_ctx"] = contexto_qa
-            teclado = InlineKeyboardMarkup([[
-                InlineKeyboardButton("💬 Sí, dame preguntas + checklist", callback_data="qa:si"),
-                InlineKeyboardButton("No, gracias", callback_data="qa:no"),
-            ]])
-            await source_msg.reply_text(
-                "¿Quieres que te prepare <b>preguntas para el vendedor</b> y un "
-                "<b>checklist</b> para cuando vayas a verlo en persona?",
-                parse_mode="HTML",
-                reply_markup=teclado,
-            )
+        await _pipeline_analisis(anuncio, msg, source_msg, ctx, url=url)
 
     except Exception:
         logger.error("[BOT] Excepción no capturada en _core_analisis", exc_info=True)
@@ -849,6 +761,125 @@ async def _core_analisis(url: str, source_msg, ctx, es_admin: bool, user_id: int
         if not fut.done():
             fut.set_result(None)
         _ANALISIS_INFLIGHT.pop(url, None)
+
+
+async def _pipeline_analisis(anuncio, msg, source_msg, ctx, url: str | None = None):
+    """
+    Segunda fase del análisis: comparables → estadísticas → veredicto IA.
+    Reutilizada por el flujo URL (_core_analisis) y el flujo manual (_capturar_datos_manuales).
+    msg: Message de progreso (se edita). source_msg: Message original del usuario.
+    url: None en modo manual (omite caché y enlace "Ver anuncio").
+    """
+    from models import EstadisticaMercado
+
+    marca  = anuncio.marca  or "desconocida"
+    modelo = anuncio.modelo or "desconocido"
+    año    = anuncio.año    or 0
+    km     = anuncio.km     or 0
+
+    try:
+        comparables = await buscar_comparables_todas(marca, modelo, año, km, n=30)
+    except Exception as e:
+        logger.error(f"[BOT] Error buscando comparables: {e}")
+        comparables = []
+
+    comparables = [c for c in comparables if c.item_id != anuncio.item_id]
+    fuentes_count = dict(Counter(c.fuente for c in comparables))
+    logger.info(f"[BOT] Comparables por fuente: {fuentes_count}")
+
+    historico = [a for a in ([anuncio] + comparables) if a.precio > 0 and a.año > 1990]
+    try:
+        guardar_historico_batch(historico)
+    except Exception as e:
+        logger.warning(f"[BOT] Error guardando histórico: {e}")
+
+    precios_comp = [c.precio for c in comparables if c.precio > 0]
+
+    if len(precios_comp) < 3:
+        await msg.edit_text(
+            f"⚠️ Solo encontré {len(precios_comp)} comparable(s) para "
+            f"<b>{html.escape(marca.title())} {html.escape(modelo.upper())}</b> con esos parámetros.\n"
+            f"No hay datos suficientes para un veredicto fiable. Prueba un modelo más común.",
+            parse_mode="HTML",
+        )
+        return
+
+    mediana    = _stats_mod.median(precios_comp)
+    media      = _stats_mod.mean(precios_comp)
+    desviacion = _stats_mod.stdev(precios_comp) if len(precios_comp) > 1 else 0.0
+    precios_ord = sorted(precios_comp)
+    pos_menor   = sum(1 for p in precios_ord if p < anuncio.precio)
+    percentil   = round((pos_menor / len(precios_ord)) * 100)
+    desv_pct    = round(((anuncio.precio - mediana) / mediana) * 100, 1) if mediana else 0.0
+
+    stats = EstadisticaMercado(
+        n_comparables=len(precios_comp),
+        mediana=round(mediana, 0),
+        media=round(media, 0),
+        desviacion=round(desviacion, 0),
+        percentil=percentil,
+        desviacion_pct=desv_pct,
+        precios=precios_ord,
+    )
+
+    await msg.edit_text(
+        f"📊 {stats.n_comparables} comparables encontrados. "
+        f"Mediana: <b>{stats.mediana:,.0f}€</b>\n"
+        f"⏳ Generando veredicto con IA…",
+        parse_mode="HTML",
+    )
+
+    contexto_qa = None
+    try:
+        veredicto, contexto_qa = await generar_veredicto_analizar(
+            anuncio, stats, comparables,
+            fuentes_count=fuentes_count,
+        )
+    except Exception as e:
+        logger.error(f"[BOT] Error generando veredicto: {e}")
+        veredicto = (
+            f"⚠️ No pude generar veredicto IA.\n"
+            f"Precio: {anuncio.precio:,.0f}€ · Mediana: {stats.mediana:,.0f}€"
+        )
+
+    if url and contexto_qa:
+        try:
+            cache_set(url, veredicto, contexto_qa)
+        except Exception:
+            pass
+
+    if url:
+        cabecera = (
+            f"🔍 <b>{html.escape(marca.title())} {html.escape(modelo.upper())} {año}</b>\n"
+            f"📍 {html.escape(anuncio.provincia or 'España')}  ·  {km:,} km  ·  "
+            f"<a href='{url}'>Ver anuncio</a>\n"
+            f"{'─' * 30}\n\n"
+        )
+    else:
+        cabecera = (
+            f"🔍 <b>{html.escape(marca.title())} {html.escape(modelo.upper())} {año}</b>\n"
+            f"📍 {html.escape(anuncio.provincia or 'España')}  ·  {km:,} km  ·  "
+            f"📋 Datos introducidos manualmente\n"
+            f"{'─' * 30}\n\n"
+        )
+
+    await _enviar_largo(
+        msg, cabecera + veredicto,
+        parse_mode="HTML", disable_web_page_preview=True,
+    )
+
+    if contexto_qa:
+        ctx.user_data["analisis_qa_ctx"] = contexto_qa
+        teclado = InlineKeyboardMarkup([[
+            InlineKeyboardButton("💬 Sí, dame preguntas + checklist", callback_data="qa:si"),
+            InlineKeyboardButton("No, gracias", callback_data="qa:no"),
+        ]])
+        await source_msg.reply_text(
+            "¿Quieres que te prepare <b>preguntas para el vendedor</b> y un "
+            "<b>checklist</b> para cuando vayas a verlo en persona?",
+            parse_mode="HTML",
+            reply_markup=teclado,
+        )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -872,10 +903,13 @@ async def cmd_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _re.IGNORECASE,
     )
     if not url_match:
+        ctx.user_data["esperando_datos_manuales"] = True
+        ctx.user_data["manual_source_msg"] = update.message
         await update.message.reply_text(
-            "🔍 Pégame la URL del anuncio (Wallapop o Coches.net).\n"
-            "• <code>/analizar https://es.wallapop.com/item/...</code>\n"
-            "• <code>/analizar https://www.coches.net/...-kovn.aspx</code>",
+            "📋 Escríbeme los datos del coche:\n\n"
+            "<b>Marca, modelo, año, km y precio</b>\n"
+            "Ej: <code>VW Golf 2019 · 150.000 km · 9.500€</code>\n\n"
+            "<i>También puedes añadir el combustible o descripción si lo tienes.</i>",
             parse_mode="HTML",
         )
         return
@@ -889,6 +923,8 @@ async def cmd_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ════════════════════════════════════════════════════════════════════════════
 
 async def cancelar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.pop("esperando_datos_manuales", None)
+    ctx.user_data.pop("manual_source_msg", None)
     await update.message.reply_text("❌ Operación cancelada.")
     return ConversationHandler.END
 
@@ -2492,6 +2528,88 @@ async def callback_pago(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# Análisis manual (sin URL): callback + handler de captura
+# ════════════════════════════════════════════════════════════════════════════
+
+_PROMPT_DATOS_MANUALES = (
+    "📋 Escríbeme los datos del coche:\n\n"
+    "<b>Marca, modelo, año, km y precio</b>\n"
+    "Ej: <code>VW Golf 2019 · 150.000 km · 9.500€</code>\n\n"
+    "<i>También puedes añadir el combustible o descripción si lo tienes.</i>"
+)
+
+
+async def callback_manual(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Botón '✏️ Introducir datos a mano' tras fallo de scraping."""
+    query = update.callback_query
+    await query.answer()
+    ctx.user_data["esperando_datos_manuales"] = True
+    await query.message.reply_text(_PROMPT_DATOS_MANUALES, parse_mode="HTML")
+
+
+async def _capturar_datos_manuales(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Intercepta el siguiente mensaje del usuario cuando está en modo manual."""
+    if not ctx.user_data.get("esperando_datos_manuales"):
+        return
+
+    texto = update.message.text or ""
+    datos = await parsear_datos_anuncio_manual(texto)
+
+    campos_criticos = ["marca", "modelo", "año", "km", "precio"]
+    faltantes = [c for c in campos_criticos if not datos.get(c)]
+
+    if faltantes:
+        nombres = {"marca": "marca", "modelo": "modelo", "año": "año",
+                   "km": "kilómetros", "precio": "precio"}
+        lista = ", ".join(nombres[f] for f in faltantes)
+        await update.message.reply_text(
+            f"⚠️ Faltan: <b>{lista}</b>.\n"
+            f"Escríbelos junto con el resto de datos.",
+            parse_mode="HTML",
+        )
+        return
+
+    ctx.user_data.pop("esperando_datos_manuales", None)
+
+    from models import Anuncio
+    import uuid
+
+    anuncio = Anuncio(
+        item_id=f"manual_{uuid.uuid4().hex[:8]}",
+        fuente="manual",
+        marca=datos["marca"],
+        modelo=datos["modelo"],
+        año=datos["año"],
+        km=datos["km"],
+        precio=datos["precio"],
+        provincia="",
+        descripcion=datos.get("descripcion") or "",
+        url="",
+    )
+
+    marca  = anuncio.marca.title()
+    modelo = anuncio.modelo.upper()
+    año    = anuncio.año
+    km     = anuncio.km
+
+    msg = await update.message.reply_text(
+        f"✅ <b>{html.escape(marca)} {html.escape(modelo)}</b> "
+        f"{año} · {km:,} km · <b>{anuncio.precio:,.0f}€</b>\n\n"
+        f"⏳ Buscando comparables en Wallapop y Coches.net…",
+        parse_mode="HTML",
+    )
+
+    try:
+        await _pipeline_analisis(anuncio, msg, update.message, ctx, url=None)
+    except Exception:
+        logger.error("[BOT] Error en pipeline manual", exc_info=True)
+        try:
+            await msg.edit_text("😔 Algo se rompió en el análisis. Reintenta en 1 min.")
+        except Exception:
+            pass
+
+
 def main():
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_TOKEN no configurado. Revisa tu archivo .env")
@@ -2566,6 +2684,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("plan", cmd_plan))
+    app.add_handler(CommandHandler("cancelar", cancelar))
     app.add_handler(CommandHandler("analizar", cmd_analizar))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(conv_ideal)
@@ -2582,6 +2701,9 @@ def main():
     # app.add_handler(CallbackQueryHandler(callback_misiones, pattern=r"^(pausar|activar|eliminar)_\d+$"))
     app.add_handler(CallbackQueryHandler(callback_qa, pattern=r"^qa:(si|no)$"))
     app.add_handler(CallbackQueryHandler(callback_pago, pattern=r"^pagar_pack_(30|100)$"))
+    app.add_handler(CallbackQueryHandler(callback_manual, pattern=r"^manual:si$"))
+    # Handler de captura de datos manuales (grupo 1, después del logger global en -1)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _capturar_datos_manuales), group=1)
 
     # Manejador global de errores
     app.add_error_handler(error_handler)
