@@ -70,7 +70,7 @@ DB_PATH = os.getenv("DB_PATH", "cabeza_bot.db")
 # ─── IA (SambaNova - Llama 4 Maverick) ──────────────────────────────────────
 SAMBANOVA_API_KEY  = os.getenv("SAMBANOVA_API_KEY", "")
 SAMBANOVA_BASE_URL  = os.getenv("SAMBANOVA_BASE_URL", "https://api.sambanova.ai/v1")
-AI_MODEL            = os.getenv("AI_MODEL", "Llama-4-Maverick-17B-128E-Instruct")
+AI_MODEL            = os.getenv("AI_MODEL", "DeepSeek-V3.1")
 AI_MODEL_FALLBACK   = os.getenv("AI_MODEL_FALLBACK", "Meta-Llama-3.3-70B-Instruct")
 
 # ─── TAVILY (investigación experta del coche) ───────────────────────────────
