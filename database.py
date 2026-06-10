@@ -3,7 +3,7 @@ import sqlite3
 import json
 import logging
 from datetime import datetime, timedelta
-from config import DB_PATH, ALLOWED_USER_IDS, FREE_CREDITOS_DIA, PAID_CREDITOS_PACK_30, PAID_CREDITOS_PACK_100
+from config import DB_PATH, ALLOWED_USER_IDS, FREE_CREDITOS_DIA, PAID_CREDITOS_PACK_100
 
 logger = logging.getLogger(__name__)
 
@@ -450,7 +450,6 @@ def puede_analizar(user_id: int) -> tuple[bool, int]:
 
 
 _CREDITOS_POR_PACK = {
-    "pack_30":  PAID_CREDITOS_PACK_30,
     "pack_100": PAID_CREDITOS_PACK_100,
 }
 
@@ -459,7 +458,6 @@ def activar_plan(user_id: int, concepto: str, stripe_id: str = "",
                  stripe_customer_id: str = "", stripe_subscription_id: str = ""):
     """
     Activa el plan tras pago confirmado. Idempotente via stripe_id.
-    concepto='pack_30'  → tier='paid', creditos_disponibles += 30  (acumula si ya era paid).
     concepto='pack_100' → tier='paid', creditos_disponibles += 100 (acumula si ya era paid).
     concepto='pro_mes'  → tier='pro' (dormido — para cuando se lance suscripción).
     """

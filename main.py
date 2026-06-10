@@ -23,7 +23,7 @@ from telegram.ext import (
 
 from config import TELEGRAM_TOKEN, TOP_RESULTS, MIN_BENEFICIO, ALLOWED_USER_IDS, ADMIN_USER_IDS
 from config import IDEAL_TOP_N, IDEAL_KM_AÑO_MAX
-from config import STRIPE_API_KEY, STRIPE_PRICE_PACK_30, STRIPE_PRICE_PACK_100
+from config import STRIPE_API_KEY, STRIPE_PRICE_PACK_100
 from permisos import requiere_acceso
 from ai import (
     parsear_filtros_nl, parsear_modelo_nl, enriquecer_coches,
@@ -50,7 +50,7 @@ from database import (
     registrar_evento, resumen_stats,
     puede_usar, registrar_uso,
 )
-from config import FREE_ANALISIS_MAX, FREE_VENTANA_HORAS, FREE_CREDITOS_DIA, PAID_CREDITOS_PACK_30, PAID_CREDITOS_PACK_100
+from config import FREE_ANALISIS_MAX, FREE_VENTANA_HORAS, FREE_CREDITOS_DIA, PAID_CREDITOS_PACK_100
 from scraper import (
     buscar_y_cruzar, buscar_coches_alemania,
     obtener_anuncio_por_url, buscar_comparables_todas,
@@ -181,8 +181,7 @@ async def cmd_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"🆓 <b>Plan FREE</b>\n"
                 f"Acciones de hoy: <b>{usados}/{FREE_CREDITOS_DIA}</b>\n"
                 f"⏳ Reset en: <b>{cuando}</b>\n\n"
-                f"💳 Pack {PAID_CREDITOS_PACK_30} acciones — 4.90€ (sin caducidad)\n"
-                f"💎 Pack {PAID_CREDITOS_PACK_100} acciones — 9.90€ (sin caducidad)\n\n"
+                f"💎 Pack {PAID_CREDITOS_PACK_100} acciones — 9.99€ (sin caducidad)\n\n"
             )
 
     await update.message.reply_text(
@@ -2474,7 +2473,6 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ════════════════════════════════════════════════════════════════════════════
 
 _PAGO_PRODUCTOS = {
-    "pagar_pack_30":  ("pack_30",  STRIPE_PRICE_PACK_30),
     "pagar_pack_100": ("pack_100", STRIPE_PRICE_PACK_100),
 }
 
@@ -2700,7 +2698,7 @@ def main():
     # app.add_handler(conv_calcular)
     # app.add_handler(CallbackQueryHandler(callback_misiones, pattern=r"^(pausar|activar|eliminar)_\d+$"))
     app.add_handler(CallbackQueryHandler(callback_qa, pattern=r"^qa:(si|no)$"))
-    app.add_handler(CallbackQueryHandler(callback_pago, pattern=r"^pagar_pack_(30|100)$"))
+    app.add_handler(CallbackQueryHandler(callback_pago, pattern=r"^pagar_pack_100$"))
     app.add_handler(CallbackQueryHandler(callback_manual, pattern=r"^manual:si$"))
     # Handler de captura de datos manuales (grupo 1, después del logger global en -1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _capturar_datos_manuales), group=1)

@@ -15,7 +15,7 @@ from fastapi import FastAPI, Request, HTTPException
 
 from config import (
     STRIPE_API_KEY, STRIPE_WEBHOOK_SEC, TELEGRAM_TOKEN,
-    PAID_CREDITOS_PACK_30, PAID_CREDITOS_PACK_100, FREE_CREDITOS_DIA,
+    PAID_CREDITOS_PACK_100, FREE_CREDITOS_DIA,
 )
 from database import activar_plan, desactivar_pro, pago_ya_procesado
 
@@ -54,7 +54,7 @@ async def stripe_webhook(request: Request):
         # El concepto viaja en metadata desde callback_pago.
         # Si falta, inferir por mode (suscripción → pro, pago → pack_30).
         concepto = _field(meta, "concepto") or (
-            "pro_mes" if _field(session, "mode") == "subscription" else "pack_30"
+            "pro_mes" if _field(session, "mode") == "subscription" else "pack_100"
         )
         if user_id:
             activar_plan(
@@ -119,13 +119,7 @@ def _field(obj, key, default=None):
 async def _notificar_user(user_id: int, concepto: str):
     if not TELEGRAM_TOKEN:
         return
-    if concepto == "pack_30":
-        texto = (
-            f"✅ <b>Pack activado.</b>\n\n"
-            f"{PAID_CREDITOS_PACK_30} acciones disponibles, sin caducidad. ¡Vamos!"
-            f"Usa /plan para ver tu número de usos restante."
-        )
-    elif concepto == "pack_100":
+    if concepto == "pack_100":
         texto = (
             f"✅ <b>Pack activado.</b>\n\n"
             f"{PAID_CREDITOS_PACK_100} acciones disponibles, sin caducidad. ¡Vamos!\n\n"
