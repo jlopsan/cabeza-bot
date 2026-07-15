@@ -40,9 +40,9 @@ Cavernícola. Oraciones 3-6 palabras. Cero rellenos, preámbulos o cortesías. I
 - ✅ S0 Identidad + landing + vídeo manifiesto
 - ✅ S1 `/analizar <url>` (v4 en producción)
 - ✅ S2 `/ideal` recomendador
-- ✅ S3 freemium con Stripe (3 free/día, pack 30 a 4.90€, pack 100 a 9.90€)
-- 🟡 S4 `/comparar` (handler existe, falta spec + pipeline final)
-- ⬜ S5 `/tasar`
+- ✅ S3 freemium con Stripe (3 free de por vida, pack 30 a 4.90€, pack 100 a 9.90€)
+- ✅ S4 `/comparar`
+- ✅ S5 `/tasar` (valor + banda de negociación, afinado por CV/combustible)
 - ⬜ S6 `/alertas`
 - ⬜ S7 `/importar_alemania` (puerto del /buscar antiguo)
 - ⬜ S8 Web pública con endpoints
@@ -50,7 +50,7 @@ Cavernícola. Oraciones 3-6 palabras. Cero rellenos, preámbulos o cortesías. I
 
 ## Modelo de negocio actual
 
-- **FREE**: 3 acciones/día (reset medianoche UTC, combinadas entre comandos)
+- **FREE**: 3 acciones de por vida (una vez por usuario nuevo, sin reset, combinadas entre comandos)
 - **PACK CHICO**: 30 acciones — 4.90€ (pago único, sin caducidad, acumulables)
 - **PACK GRANDE**: 100 acciones — 9.90€ (pago único, sin caducidad, acumulables)
 - **PRO mensual**: dormido (código listo, se activa con 4-5 features)

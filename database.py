@@ -2,8 +2,8 @@
 import sqlite3
 import json
 import logging
-from datetime import datetime, timedelta
-from config import DB_PATH, ALLOWED_USER_IDS, FREE_CREDITOS_DIA, PAID_CREDITOS_PACK_100
+from datetime import datetime
+from config import DB_PATH, ALLOWED_USER_IDS, FREE_CREDITOS, PAID_CREDITOS_PACK_100
 
 logger = logging.getLogger(__name__)
 
@@ -313,10 +313,10 @@ def obtener_tier(user_id: int) -> str:
     return u["tier"] if u else "free"
 
 
-# ─── FREEMIUM: créditos diarios unificados ────────────────────────────────
+# ─── FREEMIUM: créditos unificados ─────────────────────────────────────────
 #
 # Modelo Plan A:
-#   free  → FREE_CREDITOS_DIA créditos/día, reset a medianoche UTC
+#   free  → FREE_CREDITOS créditos de por vida, una sola vez, SIN reset
 #   paid  → créditos del pack comprado, sin caducidad (creditos_disponibles)
 #   pro   → ilimitado (dormido — para cuando se lance suscripción)
 #
@@ -332,7 +332,7 @@ def get_o_crear_usuario(user_id: int, username: str = "",
             "INSERT OR IGNORE INTO usuarios "
             "(user_id, username, first_name, tier, creditos_disponibles, created_at, updated_at) "
             "VALUES (?, ?, ?, 'free', ?, ?, ?)",
-            (user_id, username, first_name, FREE_CREDITOS_DIA, now, now),
+            (user_id, username, first_name, FREE_CREDITOS, now, now),
         )
         conn.execute(
             "UPDATE usuarios SET username = ?, first_name = ?, updated_at = ? "
@@ -346,52 +346,30 @@ def get_o_crear_usuario(user_id: int, username: str = "",
     return dict(row)
 
 
-def _reset_diario_necesario(ultimo_reset: str) -> bool:
-    """True si no hay reset hoy (UTC)."""
-    if not ultimo_reset:
-        return True
-    try:
-        return datetime.fromisoformat(ultimo_reset).date() < datetime.utcnow().date()
-    except ValueError:
-        return True
-
-
 def puede_usar(user_id: int, coste: int = 1) -> tuple[bool, int]:
     """
     Devuelve (puede, creditos_restantes).
     - Whitelist/admin → ilimitado.
     - pro  → siempre puede.
-    - free → reset diario automático; bloquea si creditos_disponibles < coste.
-    - paid → descuenta de creditos_disponibles (sin caducidad); si se agota → free.
+    - free → créditos de por vida; bloquea si creditos_disponibles < coste. SIN reset.
+    - paid → descuenta de creditos_disponibles (sin caducidad).
     """
     if ALLOWED_USER_IDS and user_id in ALLOWED_USER_IDS:
         return True, 999
 
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT tier, creditos_disponibles, ultimo_reset_diario "
-            "FROM usuarios WHERE user_id = ?",
+            "SELECT tier, creditos_disponibles FROM usuarios WHERE user_id = ?",
             (user_id,),
         ).fetchone()
         if not row:
-            return True, FREE_CREDITOS_DIA
+            return True, FREE_CREDITOS
 
-        tier      = row["tier"] or "free"
-        creditos  = row["creditos_disponibles"] if row["creditos_disponibles"] is not None else FREE_CREDITOS_DIA
-        reset_str = row["ultimo_reset_diario"] or ""
+        tier     = row["tier"] or "free"
+        creditos = row["creditos_disponibles"] if row["creditos_disponibles"] is not None else FREE_CREDITOS
 
         if tier == "pro":
             return True, 999
-
-        if tier == "free":
-            if _reset_diario_necesario(reset_str):
-                creditos = FREE_CREDITOS_DIA
-                conn.execute(
-                    "UPDATE usuarios SET creditos_disponibles = ?, ultimo_reset_diario = ? "
-                    "WHERE user_id = ?",
-                    (creditos, datetime.utcnow().isoformat(), user_id),
-                )
-                conn.commit()
 
         return creditos >= coste, max(creditos, 0)
 
@@ -400,9 +378,9 @@ def registrar_uso(user_id: int, coste: int = 1):
     """
     Descuenta créditos según el tier. Whitelist no descuenta.
     - pro:  no hace nada (ilimitado).
-    - free: descuenta de creditos_disponibles (ya reseteados si era necesario).
-    - paid: descuenta de creditos_disponibles; si llega a 0, vuelve a free con
-            reset diario para que no quede en -1.
+    - free: descuenta de creditos_disponibles (de por vida, sin reset).
+    - paid: descuenta de creditos_disponibles; al llegar a 0 queda bloqueado
+            hasta recargar pack (el tier se mantiene paid).
     """
     if ALLOWED_USER_IDS and user_id in ALLOWED_USER_IDS:
         return
@@ -423,19 +401,11 @@ def registrar_uso(user_id: int, coste: int = 1):
             return
 
         nuevo = max(creditos - coste, 0)
-
-        if tier == "paid" and nuevo == 0:
-            conn.execute(
-                "UPDATE usuarios SET creditos_disponibles = 0, tier = 'free', "
-                "ultimo_reset_diario = '', updated_at = ? WHERE user_id = ?",
-                (now, user_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE usuarios SET creditos_disponibles = ?, updated_at = ? "
-                "WHERE user_id = ?",
-                (nuevo, now, user_id),
-            )
+        conn.execute(
+            "UPDATE usuarios SET creditos_disponibles = ?, updated_at = ? "
+            "WHERE user_id = ?",
+            (nuevo, now, user_id),
+        )
         conn.commit()
 
 
@@ -505,13 +475,13 @@ def activar_plan(user_id: int, concepto: str, stripe_id: str = "",
 
 
 def desactivar_pro(user_id: int):
-    """Llamado cuando Stripe cancela la suscripción. Vuelve a free con reset limpio."""
+    """Llamado cuando Stripe cancela la suscripción. Vuelve a free."""
     now = datetime.utcnow().isoformat()
     with get_conn() as conn:
         conn.execute(
             "UPDATE usuarios SET tier = 'free', creditos_disponibles = ?, "
-            "ultimo_reset_diario = '', updated_at = ? WHERE user_id = ?",
-            (FREE_CREDITOS_DIA, now, user_id),
+            "updated_at = ? WHERE user_id = ?",
+            (FREE_CREDITOS, now, user_id),
         )
         conn.commit()
 
@@ -523,22 +493,6 @@ def pago_ya_procesado(stripe_id: str) -> bool:
             "SELECT 1 FROM pagos WHERE stripe_id = ?", (stripe_id,)
         ).fetchone()
     return row is not None
-
-
-def minutos_hasta_reset(user_id: int) -> int:
-    """Minutos restantes hasta la medianoche UTC (reset diario free). 0 si ya pasó."""
-    now = datetime.utcnow()
-    manana = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT tier, ultimo_reset_diario FROM usuarios WHERE user_id = ?", (user_id,)
-        ).fetchone()
-    if not row or (row["tier"] or "free") != "free":
-        return 0
-    if _reset_diario_necesario(row["ultimo_reset_diario"] or ""):
-        return 0
-    delta = manana - now
-    return max(int(delta.total_seconds() // 60), 0)
 
 
 # ─── EVENTOS (uso de comandos) ─────────────────────────────────────────────

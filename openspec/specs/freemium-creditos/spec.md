@@ -2,30 +2,30 @@
 
 ## Purpose
 
-Define el sistema unificado de créditos: FREE 3/día (reset medianoche UTC), PACK 30 (4.90€), PACK 100 (9.90€), ambos sin caducidad y acumulables. Tier PRO (suscripción mensual) está dormido pero listo. El decorator `@requiere_acceso(comando)` aplica la regla en cada handler. Pago vía Stripe Checkout con idempotencia por `stripe_id`. Archivos: [permisos.py](../../../permisos.py), [database.py](../../../database.py), [webhook.py](../../../webhook.py), [config.py](../../../config.py).
+Define el sistema unificado de créditos: FREE 3 de por vida (una vez por usuario, sin reset), PACK 30 (4.90€), PACK 100 (9.90€), ambos sin caducidad y acumulables. Tier PRO (suscripción mensual) está dormido pero listo. El decorator `@requiere_acceso(comando)` aplica la regla en cada handler. Pago vía Stripe Checkout con idempotencia por `stripe_id`. Archivos: [permisos.py](../../../permisos.py), [database.py](../../../database.py), [webhook.py](../../../webhook.py), [config.py](../../../config.py).
 
 ## Requirements
 
 ### Requirement: Tres tiers de usuario
 La columna `tier` en `usuarios` MUST aceptar exactamente tres valores: `free`, `paid`, `pro`. El comportamiento por tier:
-- `free`: 3 créditos/día con reset diario. Bloquea si `creditos_disponibles < coste`.
-- `paid`: créditos acumulados sin caducidad. Cuando llega a 0 → vuelve a `free` con 3 créditos.
+- `free`: `FREE_CREDITOS` créditos de por vida (dados una vez al crear el usuario, SIN reset). Bloquea si `creditos_disponibles < coste`.
+- `paid`: créditos acumulados sin caducidad. Cuando llega a 0 → sigue `paid` bloqueado hasta recargar pack.
 - `pro`: siempre pasa, no descuenta (DORMIDO hasta lanzar PRO).
 
-#### Scenario: Usuario free agota créditos del día
-- **WHEN** un usuario free con `creditos_disponibles=0` y reset de hoy llama un comando
-- **THEN** el decorator bloquea y envía paywall con botones de Pack 30 y Pack 100
+#### Scenario: Usuario free agota sus créditos
+- **WHEN** un usuario free con `creditos_disponibles=0` llama un comando
+- **THEN** el decorator bloquea y envía paywall con botón de Pack 100
 
 #### Scenario: Usuario paid agota pack
 - **WHEN** un usuario paid descuenta su último crédito
-- **THEN** su tier vuelve a `free` con 3 créditos y `ultimo_reset_diario` puesto a hoy
+- **THEN** queda en `creditos_disponibles=0` con tier `paid`; el siguiente intento recibe el paywall de recarga de pack
 
-### Requirement: Reset diario automático a medianoche UTC
-El método `puede_usar(user_id, coste)` para tier `free` MUST detectar si `ultimo_reset_diario` es anterior al día UTC actual y resetear `creditos_disponibles` a `FREE_CREDITOS_DIA` (default 3) antes de evaluar.
+### Requirement: Créditos free de por vida sin reset
+El método `puede_usar(user_id, coste)` para tier `free` MUST evaluar `creditos_disponibles >= coste` SIN regenerar créditos. Los `FREE_CREDITOS` (default 3) se otorgan una sola vez en `get_o_crear_usuario` y no se renuevan por tiempo. No existe reset diario ni ventana temporal.
 
-#### Scenario: Usuario free vuelve al día siguiente
-- **WHEN** un usuario que agotó ayer envía un comando hoy
-- **THEN** `puede_usar` resetea sus créditos a 3, descuenta 1 y deja `restantes=2`
+#### Scenario: Usuario free agotado vuelve otro día
+- **WHEN** un usuario que agotó sus 3 créditos envía un comando días después
+- **THEN** `puede_usar` devuelve `(False, 0)` — no se regeneran créditos; solo un pack lo desbloquea
 
 ### Requirement: Decorator @requiere_acceso aplica coste por comando
 El decorator `requiere_acceso(comando)` MUST consultar `COSTE_COMANDO[comando]` (default 1 si falta) y:

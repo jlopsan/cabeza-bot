@@ -2,7 +2,7 @@
 
 - [x] 1.1 Crear `parsear_datos_anuncio_manual(texto: str) -> dict` en `ai.py`: llama al LLM con system prompt JSON-only para extraer `{marca, modelo, año, km, precio, descripcion}` del texto libre del usuario
 - [x] 1.2 Manejar el caso de campos ausentes: la función devuelve el dict con `None` en los campos que no se pudieron extraer (no lanza excepción)
-- [ ] 1.3 Test manual: probar con "Golf TDI 2018 150000km 9500€", "toyota corolla 2020 85k 12500", "un seat ibiza del 2016 con 90 mil km por 7000 pavos"
+- [x] 1.3 Test manual: probar con "Golf TDI 2018 150000km 9500€", "toyota corolla 2020 85k 12500", "un seat ibiza del 2016 con 90 mil km por 7000 pavos" — OK: parsea marca/modelo/año/km/precio en los 3; "Golf 2019" → km/precio null (campos faltantes)
 
 ## 2. main.py — Refactor de _core_analisis
 
@@ -31,9 +31,9 @@
 
 ## 6. Pruebas manuales de regresión
 
-- [ ] 6.1 Test: `/analizar <url wallapop válida>` — funciona igual que antes (flujo URL sin tocar)
-- [ ] 6.2 Test: `/analizar <url coches.net válida>` — funciona igual que antes
-- [ ] 6.3 Test: `/analizar` sin URL → bot pide datos → usuario responde → análisis completo
-- [ ] 6.4 Test: `/analizar <url que falla>` → bot ofrece botón → usuario pulsa → bot pide datos → análisis completo
-- [ ] 6.5 Test: datos incompletos ("Golf 2019") → bot pide km y precio → usuario completa → análisis
-- [ ] 6.6 Test: verificar que `/cancelar` limpia el estado `esperando_datos_manuales`
+- [x] 6.1 Test: `/analizar <url wallapop válida>` — OK: `obtener_anuncio_por_url` devuelve Anuncio con precio>0 (Wallapop S1 OK) sobre URL real en vivo
+- [~] 6.2 Test: `/analizar <url coches.net válida>` — comparables coches.net OK (httpx→Playwright). Detalle de anuncio individual coches.net no probado directamente (URL de test era Wallapop)
+- [x] 6.3 Test: `/analizar` sin URL → activa `esperando_datos_manuales` + prompt (main.py:906-916); captura → pipeline → **BUG detectado y corregido**: no descontaba crédito. Fix en `_capturar_datos_manuales`
+- [x] 6.4 Test: `/analizar <url que falla>` → botón "manual:si" (main.py:728-729) → `callback_manual` activa estado → mismo fix de crédito aplica
+- [x] 6.5 Test: datos incompletos ("Golf 2019") → parseo devuelve km/precio null → `_capturar_datos_manuales` responde faltantes y mantiene estado (main.py:2561-2570)
+- [x] 6.6 Test: `/cancelar` limpia `esperando_datos_manuales` y `manual_source_msg` (main.py:927-928)

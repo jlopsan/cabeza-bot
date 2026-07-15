@@ -136,13 +136,10 @@ STRIPE_PRICE_PRO      = os.getenv("STRIPE_PRICE_PRO", "")      # dormido — fut
 STRIPE_WEBHOOK_SEC    = os.getenv("STRIPE_WEBHOOK_SEC", "")    # whsec_xxx
 
 # ─── FREEMIUM ────────────────────────────────────────────────────────────────
-FREE_CREDITOS_DIA       = int(os.getenv("FREE_CREDITOS_DIA", "3"))         # créditos/día en plan free
+# Créditos gratis de por vida: N por usuario nuevo, una sola vez, sin reset.
+# Env FREE_CREDITOS (nuevo); acepta FREE_CREDITOS_DIA legacy por compatibilidad.
+FREE_CREDITOS           = int(os.getenv("FREE_CREDITOS", os.getenv("FREE_CREDITOS_DIA", "3")))
 PAID_CREDITOS_PACK_100  = int(os.getenv("PAID_CREDITOS_PACK_100", "100"))  # pack 9.99€
-
-# Aliases legacy
-FREE_ANALISIS_MAX  = FREE_CREDITOS_DIA
-FREE_VENTANA_HORAS = 0   # ya no se usa ventana, reseteo diario
-PAID_CREDITOS_PACK = PAID_CREDITOS_PACK_100
 
 # ─── /ideal ──────────────────────────────────────────────────────────────────
 IDEAL_TOP_N          = int(os.getenv("IDEAL_TOP_N", "3"))

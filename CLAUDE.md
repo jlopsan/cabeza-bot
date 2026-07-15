@@ -80,8 +80,8 @@ no vía web de usuario.
 ### Semana 1 — `/analizar <url>` ✅ HECHO (v4 en producción)
 ### Semana 2 — `/ideal` Recomendador ✅ HECHO
 ### Semana 3 — Sistema freemium con Stripe ✅ HECHO
-### Semana 4 — `/comparar` Comparador
-### Semana 5 — `/tasar` Tasar coche con precio real de mercado
+### Semana 4 — `/comparar` Comparador ✅ HECHO
+### Semana 5 — `/tasar` Tasar coche con precio real de mercado ✅ HECHO
 ### Semana 6 — `/alertas` Alertas de chollos
 ### Semana 7 — `/importar_alemania` (puerto del /buscar antiguo)
 ### Semana 8 — Web pública con endpoints del bot
@@ -107,7 +107,7 @@ no vía web de usuario.
 ### Modelo de negocio HOY (2 features: /analizar + /ideal)
 
 ```
-Plan FREE:        3 acciones/día (reset medianoche UTC, combinadas entre todos los comandos)
+Plan FREE:        3 acciones de por vida (una sola vez por usuario nuevo, SIN reset, combinadas entre todos los comandos)
 PACK CHICO:      30 acciones — 4.90€  (pago único, sin caducidad, se acumulan)
 PACK GRANDE:    100 acciones — 9.90€  (pago único, sin caducidad, se acumulan)
 ```
@@ -117,8 +117,9 @@ PACK GRANDE:    100 acciones — 9.90€  (pago único, sin caducidad, se acumul
 reescribir webhook ni paywall.
 
 **Por qué estos números:**
-- 3 al día (no 3 cada 3h): el free anterior permitía 24/día en la práctica.
-  "Al día" es más simple de comunicar y genera retención (el user vuelve mañana).
+- 3 de por vida (no 3/día): el free diario permitía uso indefinido gratis (el
+  power user nunca pagaba). 3 totales fuerza la decisión de compra tras probar
+  el producto. Prueba real → conversión, no free eterno.
 - 30 en pack chico: cubre el ciclo completo de compra (20-40 anuncios en 2-4 semanas).
 - 100 en pack grande: power user — el que va a comprar coche en serio o el que
   cubre a familia/amigos. Margen para escalar a PRO cuando exista.
@@ -142,12 +143,13 @@ suscripción y el pack 100 actúa como antesala (mismo precio que PRO).
 
 ### Diseño técnico (implementado)
 
-**BD: créditos unificados** — tabla `usuarios` con dos columnas nuevas:
+**BD: créditos unificados** — tabla `usuarios`:
 ```sql
 creditos_disponibles  INTEGER DEFAULT 3   -- se descuenta con cada acción
-ultimo_reset_diario   TEXT    DEFAULT ''  -- ISO timestamp del último reset
+ultimo_reset_diario   TEXT    DEFAULT ''  -- LEGACY: columna inerte, ya no se lee ni escribe
 ```
-El reset es diario (medianoche UTC). No hay ventana de horas.
+No hay reset. Los 3 créditos free se dan una vez al crear el usuario y no se
+renuevan. `ultimo_reset_diario` se conserva por compatibilidad con BDs antiguas.
 
 **Mapa de costes en `permisos.py`:**
 ```python
@@ -163,10 +165,10 @@ Hoy todo cuesta 1. Para añadir un comando nuevo: una línea en este dict
 + `@requiere_acceso("/nuevo")` en el handler. Nada más.
 
 **Flujo de créditos:**
-- `free`: reset automático si `ultimo_reset_diario` es de ayer o antes.
-  Bloquea si `creditos_disponibles < coste`.
+- `free`: 3 créditos de por vida (dados al crear el usuario). Bloquea si
+  `creditos_disponibles < coste`. No se renuevan nunca.
 - `paid`: descuenta de `creditos_disponibles` (sin caducidad).
-  Cuando llega a 0 → vuelve a `free` con reset limpio.
+  Cuando llega a 0 → sigue `paid` bloqueado hasta recargar pack.
   Si recarga otro pack → se acumulan (actuales + 30 ó actuales + 100).
 - `pro`: siempre pasa, no descuenta nada (dormido — para cuando se lance suscripción).
 
@@ -189,7 +191,7 @@ STRIPE_PRICE_PACK_30=price_...       (producto "Pack 30 acciones", pago único, 
 STRIPE_PRICE_PACK_100=price_...      (producto "Pack 100 acciones", pago único, 9.90€)
 STRIPE_PRICE_PRO=price_...           (DORMIDO — futuro PRO mensual 9.90€)
 STRIPE_WEBHOOK_SEC=whsec_...         (del stripe CLI o del dashboard)
-FREE_CREDITOS_DIA=3                  (default 3, configurable por env)
+FREE_CREDITOS=3                      (default 3, de por vida; acepta FREE_CREDITOS_DIA legacy)
 PAID_CREDITOS_PACK_30=30             (default 30, configurable por env)
 PAID_CREDITOS_PACK_100=100           (default 100, configurable por env)
 ```
@@ -258,7 +260,7 @@ precio vs mercado, red flags, etiqueta DGT, historial del modelo.
 
 Estoy en construcción pública. Cada semana una función nueva.
 
-Tienes 3 acciones gratuitas al día para empezar.
+Tienes 3 acciones gratuitas para empezar.
 
 /analizar <url> — Analiza cualquier anuncio de Wallapop o Coches.net
 /ayuda — Qué puedo hacer
@@ -324,7 +326,7 @@ ANALISIS_CACHE_TTL_S=1800
 HISTORICO_RETENCION_DIAS=180
 ENABLE_VISION=false
 ENABLE_COCHES_NET=true
-FREE_CREDITOS_DIA=3
+FREE_CREDITOS=3
 PAID_CREDITOS_PACK_30=30
 PAID_CREDITOS_PACK_100=100
 WALLAPOP_RETRY_MAX=3
@@ -426,6 +428,36 @@ Webhook expuesto a Internet:
 - [ ] Crear productos en Stripe Dashboard (modo test).
 - [ ] Test con Stripe CLI modo test (5 escenarios).
 - [ ] Configurar webhook en Stripe Dashboard apuntando a producción.
+
+### 2026-07-11 — Sesión /tasar (Semana 5) ✅ HECHO
+- OpenSpec change `tasar-coche` (proposal + design + specs + tasks).
+- `/tasar`: valoración por precio de mercado. Sin URL, sin precio.
+  Salida = valor + banda de negociación (±8%), no min/max del mercado.
+- Reusa `buscar_comparables_todas` + `parsear_datos_anuncio_manual`.
+  Helper compartido `_calcular_stats_precios` (refactor de `/analizar`, sin regresión).
+- `_tasar_desde_precios`: recorte iterativo por ratio a la mediana
+  (quita gama alta/outliers). Genérico, sin parsear motor.
+- Afinado por motor: `_extraer_cv` + `_detectar_combustible` + `_filtrar_por_motor`
+  (cascada cv/comb/pool). Si pides CV, NUNCA cae al pool base
+  (bug cazado: GTI daba precio de Golf base).
+- Estado propio `esperando_datos_tasar`, handler group=2, limpieza cruzada con `/analizar`.
+- Cobro en éxito (`registrar=False` + `registrar_uso` en render OK). Admin no paga.
+- Fix previo detectado en /analizar manual: no descontaba crédito → corregido.
+- Tests live: Golf 2018 sin motor 13.890€ · 150cv diésel 15.990€ ·
+  GTI 245 22.637€ · Golf R 300 24.740€. Regresión `/analizar` OK.
+
+### 2026-07-15 — Freemium: free de por vida (antes 3/día)
+- Cambio de modelo: FREE pasa de 3 acciones/día con reset a **3 de por vida**,
+  una sola vez por usuario nuevo, SIN reset. Fuerza decisión de compra tras probar.
+- `database.py`: `puede_usar` free ya no regenera (borrado `_reset_diario_necesario`
+  y `minutos_hasta_reset`). `registrar_uso` paid→0 se queda `paid` bloqueado
+  (antes volvía a free). `ultimo_reset_diario` queda como columna legacy inerte.
+- `config.py`: `FREE_CREDITOS_DIA` → `FREE_CREDITOS` (env acepta el nombre viejo
+  por compat). Borrados alias legacy `FREE_ANALISIS_MAX`/`FREE_VENTANA_HORAS`.
+- Copy actualizado: `/start`, `/plan`, paywall, webhook cancelación, broadcast.
+- Test: nuevo=3 → gasta 3 → bloqueado → día simulado NO regenera → pack=100 OK.
+- Descubierto de paso: `eventos_comando` + `/log_cmd` (group=-1) + `/stats` YA
+  registran uso histórico desde mayo. No hace falta `uso_log` (era duplicado).
 
 ---
 

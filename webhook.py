@@ -15,7 +15,7 @@ from fastapi import FastAPI, Request, HTTPException
 
 from config import (
     STRIPE_API_KEY, STRIPE_WEBHOOK_SEC, TELEGRAM_TOKEN,
-    PAID_CREDITOS_PACK_100, FREE_CREDITOS_DIA,
+    PAID_CREDITOS_PACK_100, FREE_CREDITOS,
 )
 from database import activar_plan, desactivar_pro, pago_ya_procesado
 
@@ -133,8 +133,7 @@ async def _notificar_user(user_id: int, concepto: str):
     elif concepto == "cancelado":
         texto = (
             "ℹ️ Tu suscripción PRO ha sido cancelada.\n"
-            f"Has vuelto al plan gratuito ({FREE_CREDITOS_DIA} acciones al día, "
-            "reset medianoche UTC)."
+            f"Has vuelto al plan gratuito ({FREE_CREDITOS} acciones)."
         )
     else:
         return

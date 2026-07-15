@@ -28,7 +28,7 @@ Cada uno con:
 Pruébala ahora:
 /ideal
 
-Cuesta 1 crédito. Tienes 3 gratis al día.\
+Cuesta 1 crédito. Tienes 3 gratis para empezar.\
 """
 
 API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"

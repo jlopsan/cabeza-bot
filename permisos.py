@@ -11,8 +11,8 @@ from functools import wraps
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from config import FREE_CREDITOS_DIA, PAID_CREDITOS_PACK_100, ADMIN_USER_IDS
-from database import get_o_crear_usuario, puede_usar, registrar_uso, minutos_hasta_reset
+from config import FREE_CREDITOS, PAID_CREDITOS_PACK_100, ADMIN_USER_IDS
+from database import get_o_crear_usuario, puede_usar, registrar_uso
 
 # Coste en créditos de cada comando.
 # Hoy todo cuesta 1 — bucket unificado igual que "3 acciones/día".
@@ -64,9 +64,9 @@ def requiere_acceso(comando: str, registrar: bool = True):
                     InlineKeyboardButton(f"💎 {PAID_CREDITOS_PACK_100} acciones — 9.99€", callback_data="pagar_pack_100"),
                 ]])
                 await update.effective_message.reply_text(
-                    f"ℹ️ Esta es tu última acción gratuita de hoy. "
-                    f"Mañana tienes {FREE_CREDITOS_DIA} nuevas.\n\n"
-                    f"O continúa ahora con un pack sin caducidad:",
+                    "ℹ️ Esta es tu última acción gratuita. "
+                    "No hay más gratis después.\n\n"
+                    "Sigue con un pack sin caducidad:",
                     parse_mode="HTML",
                     reply_markup=keyboard,
                 )
@@ -88,32 +88,23 @@ def _construir_info(user_id: int, puede: bool, restantes: int) -> dict:
     u = obtener_usuario(user_id) or {}
     plan = u.get("tier", "free")
 
-    if not puede and plan == "free":
-        mins = minutos_hasta_reset(user_id)
-        h, m = divmod(mins, 60)
-        siguiente = f"{h}h {m}min" if h else "mañana al mediodía (UTC)"
-    else:
-        siguiente = ""
-
     return {
-        "plan":            plan,
-        "restantes":       restantes,
-        "siguiente_reset": siguiente,
+        "plan":      plan,
+        "restantes": restantes,
     }
 
 
 async def _enviar_paywall(update: Update, info: dict, comando: str):
-    plan      = info["plan"]
-    siguiente = info.get("siguiente_reset", "")
+    plan = info["plan"]
 
     if plan == "free":
         texto = (
-            f"⚡ <b>Has agotado tus {FREE_CREDITOS_DIA} acciones gratuitas de hoy.</b>\n\n"
-            f"Reset: <b>{siguiente}</b>\n\n"
+            f"⚡ <b>Has agotado tus {FREE_CREDITOS} acciones gratuitas.</b>\n\n"
+            "Son de por vida, no se renuevan.\n\n"
             "El bot cruza el precio con el mercado real, investiga el "
             "historial del modelo, detecta red flags y calcula la "
             "etiqueta DGT. Todo en segundos.\n\n"
-            "Para seguir analizando ahora — pack sin caducidad:\n"
+            "Para seguir analizando — pack sin caducidad:\n"
             f"• <b>9.99€</b> — {PAID_CREDITOS_PACK_100} acciones\n\n"
             "Los ingresos financian el proyecto."
         )

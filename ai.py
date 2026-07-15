@@ -447,6 +447,53 @@ async def parsear_datos_anuncio_manual(texto: str) -> dict:
         return {"marca": None, "modelo": None, "año": None, "km": None, "precio": None, "descripcion": None}
 
 
+def _texto_tasacion_fallback(t: dict, con_km: bool) -> str:
+    """Texto determinista de tasación cuando la IA no está disponible."""
+    lineas = [
+        f"Valor de mercado: {t['valor']:,.0f}€. Sobre {t['n']} anuncios comparables.",
+        f"Si compras, oferta {t['oferta']:,.0f}€.",
+        f"Si vendes, pide {t['pide']:,.0f}€.",
+    ]
+    if t.get("excluidos"):
+        lineas.append(f"Dejé fuera {t['excluidos']} de gama alta o precio anómalo.")
+    if not con_km:
+        lineas.append("Sin km, la horquilla es amplia. Dame los km para afinar.")
+    return "\n".join(lineas)
+
+
+async def generar_texto_tasacion(marca: str, modelo: str, año: int, km: int,
+                                 t: dict, con_km: bool, criterio_motor: str | None = None) -> str:
+    """
+    Consejo de precio humanizado (tono Juan). Nunca lanza excepción:
+    si la IA falla o hace timeout, devuelve el texto determinista.
+    """
+    coche = f"{marca} {modelo} {año}"
+    if criterio_motor:
+        coche += f" {criterio_motor}"
+    coche += (f" con {km} km" if con_km else " (sin km)")
+    system = (
+        "Eres Juan Lopera, experto en coches usados. Tono directo, con datos, "
+        "sin rellenos ni cortesías ni saludos. Máximo 4 frases cortas. "
+        "Explica el valor de mercado, qué ofertar si compras y qué pedir si vendes. "
+        "Si la tasación es de un motor concreto, tenlo en cuenta. "
+        "Si se excluyeron anuncios de gama alta, dilo en una frase. "
+        "Si no hay km, avisa de que la estimación es amplia. "
+        "No inventes datos fuera de los números que te doy."
+    )
+    filtro = f" Motor tasado: {criterio_motor}." if criterio_motor else ""
+    user = (
+        f"Coche: {coche}. Comparables usados: {t['n']} (excluidos {t['excluidos']} de gama alta/anómalos).{filtro} "
+        f"Valor: {t['valor']:.0f}€. Oferta si compras: {t['oferta']:.0f}€. Pide si vendes: {t['pide']:.0f}€."
+    )
+    try:
+        txt = (await _llamar_ia(system, user, max_tokens=220) or "").strip()
+        if txt:
+            return txt
+    except Exception as e:
+        logger.warning(f"[TASAR] IA falló, uso fallback: {e}")
+    return _texto_tasacion_fallback(t, con_km)
+
+
 async def validar_anuncios_modelo(
     marca_buscada: str,
     modelo_buscado: str,

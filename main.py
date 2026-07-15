@@ -33,7 +33,7 @@ from ai import (
     parsear_perfil_ideal, validar_anuncios_modelo,
     investigar_coche, generar_veredicto_ideal,
     brainstorm_candidatos_ideal, seleccionar_top3_con_investigacion,
-    parsear_datos_anuncio_manual,
+    parsear_datos_anuncio_manual, generar_texto_tasacion,
 )
 from ideal_pipeline import (
     nueva_sesion, get_sesion, reset_sesion, set_sesion,
@@ -46,11 +46,11 @@ from database import (
     obtener_misiones_usuario, pausar_mision, activar_mision,
     registrar_usuario, obtener_tier, obtener_usuario,
     guardar_historico_batch,
-    get_o_crear_usuario, puede_analizar, registrar_analisis, minutos_hasta_reset,
+    get_o_crear_usuario, puede_analizar, registrar_analisis,
     registrar_evento, resumen_stats,
     puede_usar, registrar_uso,
 )
-from config import FREE_ANALISIS_MAX, FREE_VENTANA_HORAS, FREE_CREDITOS_DIA, PAID_CREDITOS_PACK_100
+from config import FREE_CREDITOS, PAID_CREDITOS_PACK_100
 from scraper import (
     buscar_y_cruzar, buscar_coches_alemania,
     obtener_anuncio_por_url, buscar_comparables_todas,
@@ -129,8 +129,9 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Analizo anuncios de coches usados en España en tiempo real: "
         "precio vs mercado, red flags, etiqueta DGT, historial del modelo.\n\n"
         "Estoy en construcción pública. Cada semana una función nueva.\n\n"
-        f"Tienes <b>{FREE_CREDITOS_DIA} acciones gratuitas al día</b> para empezar.\n\n"
+        f"Tienes <b>{FREE_CREDITOS} acciones gratuitas</b> para empezar.\n\n"
         "/analizar &lt;url&gt; — Analiza un anuncio de Wallapop o Coches.net\n"
+        "/tasar — Cuánto vale un coche en el mercado\n"
         "/ideal — Encuentra tu coche ideal\n"
         "/comparar — Enfrenta dos coches modelo a modelo\n"
         "/plan — Ver tu uso y plan\n\n"
@@ -170,17 +171,10 @@ async def cmd_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"Acciones disponibles: <b>{creditos}</b> (sin caducidad)\n\n"
             )
         else:
-            usados = max(FREE_CREDITOS_DIA - creditos, 0)
-            mins = minutos_hasta_reset(user.id)
-            if mins <= 0:
-                cuando = "medianoche UTC"
-            else:
-                h, m = divmod(mins, 60)
-                cuando = f"{h}h {m}min" if h else f"{m} min"
             cuerpo = (
                 f"🆓 <b>Plan FREE</b>\n"
-                f"Acciones de hoy: <b>{usados}/{FREE_CREDITOS_DIA}</b>\n"
-                f"⏳ Reset en: <b>{cuando}</b>\n\n"
+                f"Acciones restantes: <b>{creditos}/{FREE_CREDITOS}</b> (de por vida)\n"
+                f"Al agotarlas, no se renuevan.\n\n"
                 f"💎 Pack {PAID_CREDITOS_PACK_100} acciones — 9.99€ (sin caducidad)\n\n"
             )
 
@@ -749,6 +743,8 @@ async def _core_analisis(url: str, source_msg, ctx, es_admin: bool, user_id: int
         )
 
         await _pipeline_analisis(anuncio, msg, source_msg, ctx, url=url)
+        if not (update.effective_user.id in ADMIN_USER_IDS):
+            registrar_uso(update.effective_user.id, 1)
 
     except Exception:
         logger.error("[BOT] Excepción no capturada en _core_analisis", exc_info=True)
@@ -760,6 +756,136 @@ async def _core_analisis(url: str, source_msg, ctx, es_admin: bool, user_id: int
         if not fut.done():
             fut.set_result(None)
         _ANALISIS_INFLIGHT.pop(url, None)
+
+
+def _calcular_stats_precios(precios: list[float]) -> dict | None:
+    """
+    Estadística de una lista de precios de comparables.
+    Devuelve {n, mediana, media, desviacion, p25, p75} o None si <3 precios.
+    No depende de ningún precio de partida — sirve a /analizar y /tasar.
+    """
+    precios = sorted(p for p in precios if p > 0)
+    if len(precios) < 3:
+        return None
+    q = _stats_mod.quantiles(precios, n=4)  # [p25, p50, p75]
+    return {
+        "n":          len(precios),
+        "mediana":    round(_stats_mod.median(precios), 0),
+        "media":      round(_stats_mod.mean(precios), 0),
+        "desviacion": round(_stats_mod.stdev(precios), 0) if len(precios) > 1 else 0.0,
+        "p25":        round(q[0], 0),
+        "p75":        round(q[2], 0),
+    }
+
+
+# ── Motor: extracción de CV y combustible para afinar la tasación ──────────
+_CV_TOL = 20  # ± CV para considerar "mismo motor"
+
+
+def _extraer_cv(texto: str) -> int | None:
+    """CV de un texto libre o título de anuncio. Convierte kW→CV si hace falta."""
+    t = texto or ""
+    m = _re.search(r"(\d{2,3})\s*cv\b", t, _re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    m = _re.search(r"(\d{2,3})\s*kw\b", t, _re.IGNORECASE)
+    if m:
+        return round(int(m.group(1)) * 1.35962)
+    return None
+
+
+def _detectar_combustible(texto: str) -> str | None:
+    """Combustible normalizado desde texto libre o título."""
+    t = (texto or "").lower()
+    if any(k in t for k in ("phev", "enchufable")):
+        return "híbrido enchufable"
+    if any(k in t for k in ("híbrido", "hibrido", "hybrid", "hev")):
+        return "híbrido"
+    if any(k in t for k in ("eléctric", "electric", "e-golf", "kwh", " ev ")):
+        return "eléctrico"
+    if any(k in t for k in ("tdi", "diesel", "diésel", "dci", "hdi", "cdti", "gasoil", "gasóleo", "bluehdi")):
+        return "diésel"
+    if any(k in t for k in ("tsi", "tfsi", "gasolina", "mpi", "vti", "puretech", "gti", "tce")):
+        return "gasolina"
+    return None
+
+
+def _texto_motor(c) -> str:
+    """Campos de un Anuncio donde puede venir el motor."""
+    return f"{c.titulo or ''} {c.motor or ''} {c.modelo or ''}"
+
+
+def _match_cv(comparables, cv_obj, comb_obj, tol):
+    out = []
+    for c in comparables:
+        cvc = _extraer_cv(_texto_motor(c))
+        if cvc and abs(cvc - cv_obj) <= tol:
+            if comb_obj and _detectar_combustible(_texto_motor(c)) not in (comb_obj, None):
+                continue
+            out.append(c)
+    return out
+
+
+def _filtrar_por_motor(comparables, cv_obj, comb_obj):
+    """
+    Filtra comparables al motor pedido. Devuelve (lista, criterio_legible|None, modo).
+    modo: 'cv'   → coincidencia por CV (aunque sean pocos: mejor 1 del motor correcto
+                    que muchos del equivocado; jamás cae al pool base si pediste CV).
+          'comb' → solo combustible (≥3).
+          'pool' → sin filtro de motor.
+    """
+    if cv_obj:
+        crit = f"≈{cv_obj} CV" + (f" · {comb_obj}" if comb_obj else "")
+        # CV exacto y luego ampliado. Se usa lo que haya (≥1), no se cae al pool base.
+        for tol in (_CV_TOL, _CV_TOL * 2):
+            m = _match_cv(comparables, cv_obj, comb_obj, tol)
+            if len(m) >= 3:
+                return m, crit, "cv"
+        m = _match_cv(comparables, cv_obj, comb_obj, _CV_TOL * 2)
+        if m:
+            return m, crit, "cv"
+        # 0 anuncios de ese CV → intenta combustible; si no, pool (con aviso en pipeline).
+    if comb_obj:
+        t2 = [c for c in comparables if _detectar_combustible(_texto_motor(c)) == comb_obj]
+        if len(t2) >= 3:
+            return t2, comb_obj, "comb"
+    return comparables, None, "pool"
+
+
+# Banda de negociación sobre el valor de mercado (±%).
+_TASAR_MARGEN = 0.08
+# Recorte por ratio a la mediana: quita variantes de gama alta (GTI/R…)
+# y precios anómalos sin depender del acabado/motor del texto.
+_TASAR_RATIO_LO, _TASAR_RATIO_HI = 0.55, 1.40
+
+
+def _tasar_desde_precios(precios: list[float], min_n: int = 3, recortar: bool = True) -> dict | None:
+    """
+    Valor de tasación + banda de negociación. None si hay menos de `min_n` precios.
+    Con `recortar` (default), quita iterativamente los precios lejos de la mediana
+    (gama alta y outliers) — útil cuando el conjunto mezcla acabados. Se desactiva
+    cuando el conjunto ya está filtrado por motor (homogéneo) o es muy pequeño.
+    """
+    core = sorted(p for p in precios if p > 0)
+    if len(core) < max(min_n, 1):
+        return None
+    if recortar and len(core) >= 4:
+        for _ in range(3):
+            med = _stats_mod.median(core)
+            recortado = [p for p in core if med * _TASAR_RATIO_LO <= p <= med * _TASAR_RATIO_HI]
+            if len(recortado) < 3 or len(recortado) == len(core):
+                break
+            core = recortado
+    valor = _stats_mod.median(core)
+    n_total = len([p for p in precios if p > 0])
+    return {
+        "n_total":   n_total,
+        "n":         len(core),
+        "excluidos": n_total - len(core),
+        "valor":     round(valor, 0),
+        "oferta":    round(valor * (1 - _TASAR_MARGEN), 0),
+        "pide":      round(valor * (1 + _TASAR_MARGEN), 0),
+    }
 
 
 async def _pipeline_analisis(anuncio, msg, source_msg, ctx, url: str | None = None):
@@ -794,7 +920,8 @@ async def _pipeline_analisis(anuncio, msg, source_msg, ctx, url: str | None = No
 
     precios_comp = [c.precio for c in comparables if c.precio > 0]
 
-    if len(precios_comp) < 3:
+    st = _calcular_stats_precios(precios_comp)
+    if st is None:
         await msg.edit_text(
             f"⚠️ Solo encontré {len(precios_comp)} comparable(s) para "
             f"<b>{html.escape(marca.title())} {html.escape(modelo.upper())}</b> con esos parámetros.\n"
@@ -803,19 +930,16 @@ async def _pipeline_analisis(anuncio, msg, source_msg, ctx, url: str | None = No
         )
         return
 
-    mediana    = _stats_mod.median(precios_comp)
-    media      = _stats_mod.mean(precios_comp)
-    desviacion = _stats_mod.stdev(precios_comp) if len(precios_comp) > 1 else 0.0
     precios_ord = sorted(precios_comp)
     pos_menor   = sum(1 for p in precios_ord if p < anuncio.precio)
     percentil   = round((pos_menor / len(precios_ord)) * 100)
-    desv_pct    = round(((anuncio.precio - mediana) / mediana) * 100, 1) if mediana else 0.0
+    desv_pct    = round(((anuncio.precio - st["mediana"]) / st["mediana"]) * 100, 1) if st["mediana"] else 0.0
 
     stats = EstadisticaMercado(
-        n_comparables=len(precios_comp),
-        mediana=round(mediana, 0),
-        media=round(media, 0),
-        desviacion=round(desviacion, 0),
+        n_comparables=st["n"],
+        mediana=st["mediana"],
+        media=st["media"],
+        desviacion=st["desviacion"],
         percentil=percentil,
         desviacion_pct=desv_pct,
         precios=precios_ord,
@@ -885,7 +1009,7 @@ async def _pipeline_analisis(anuncio, msg, source_msg, ctx, url: str | None = No
 # /analizar <url> — semana 1
 # ════════════════════════════════════════════════════════════════════════════
 
-@requiere_acceso("/analizar")
+@requiere_acceso("/analizar", registrar=False)
 async def cmd_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     allowed, _tier = _check_access(user.id, user.username or "")
@@ -902,6 +1026,7 @@ async def cmd_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         _re.IGNORECASE,
     )
     if not url_match:
+        ctx.user_data.pop("esperando_datos_tasar", None)
         ctx.user_data["esperando_datos_manuales"] = True
         ctx.user_data["manual_source_msg"] = update.message
         await update.message.reply_text(
@@ -924,6 +1049,7 @@ async def cmd_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cancelar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("esperando_datos_manuales", None)
     ctx.user_data.pop("manual_source_msg", None)
+    ctx.user_data.pop("esperando_datos_tasar", None)
     await update.message.reply_text("❌ Operación cancelada.")
     return ConversationHandler.END
 
@@ -2185,7 +2311,6 @@ async def callback_ideal_v2_ninguno(update: Update, ctx: ContextTypes.DEFAULT_TY
         info = _construir_info(user.id, puede, restantes)
         await _enviar_paywall(update, info, "/ideal")
         return
-    registrar_uso(user.id, 1)
 
     msg = await query.message.reply_text(
         "🔄 <b>Buscando otra ronda con enfoques distintos…</b>",
@@ -2213,6 +2338,8 @@ async def callback_ideal_v2_ninguno(update: Update, ctx: ContextTypes.DEFAULT_TY
         html_veredicto = ""
 
     await _ideal_v2_render_top3(sesion, html_veredicto, msg)
+    if not (user.id in ADMIN_USER_IDS):
+        registrar_uso(user.id, 1)
 
 
 # Mantenido por compatibilidad si quedasen botones antiguos
@@ -2372,8 +2499,6 @@ async def callback_ideal_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         return
 
     await _core_analisis(url, query.message, ctx, es_admin, user.id)
-    if not es_admin:
-        registrar_analisis(user.id)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2542,6 +2667,7 @@ async def callback_manual(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Botón '✏️ Introducir datos a mano' tras fallo de scraping."""
     query = update.callback_query
     await query.answer()
+    ctx.user_data.pop("esperando_datos_tasar", None)
     ctx.user_data["esperando_datos_manuales"] = True
     await query.message.reply_text(_PROMPT_DATOS_MANUALES, parse_mode="HTML")
 
@@ -2600,12 +2726,186 @@ async def _capturar_datos_manuales(update: Update, ctx: ContextTypes.DEFAULT_TYP
 
     try:
         await _pipeline_analisis(anuncio, msg, update.message, ctx, url=None)
+        if not (update.effective_user.id in ADMIN_USER_IDS):
+            registrar_uso(update.effective_user.id, 1)
     except Exception:
         logger.error("[BOT] Error en pipeline manual", exc_info=True)
         try:
             await msg.edit_text("😔 Algo se rompió en el análisis. Reintenta en 1 min.")
         except Exception:
             pass
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# /tasar — Tasación por precio de mercado (semana 5)
+# ════════════════════════════════════════════════════════════════════════════
+
+_PROMPT_DATOS_TASAR = (
+    "🧮 Dime qué coche tasar:\n\n"
+    "<b>Marca, modelo, año, km y motor</b>\n"
+    "Ej: <code>VW Golf 2018 · 2.0 TDI 150cv · 120.000 km</code>\n\n"
+    "<i>El motor (CV o diésel/gasolina) afina mucho el precio. "
+    "km y motor son opcionales. Sin precio: yo te lo estimo.</i>"
+)
+
+
+def _confianza_tasar(n: int) -> str:
+    """Score de confianza por nº de comparables."""
+    if n >= 10:
+        return "🟢 Alta"
+    if n >= 5:
+        return "🟡 Media"
+    return "🔴 Baja"
+
+
+@requiere_acceso("/tasar", registrar=False)
+async def cmd_tasar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Tasa un coche contra el mercado. Datos en la misma línea o en el siguiente mensaje."""
+    # Evita colisión con el flujo manual de /analizar.
+    ctx.user_data.pop("esperando_datos_manuales", None)
+
+    texto = (update.message.text or "").split(maxsplit=1)
+    resto = texto[1].strip() if len(texto) > 1 else ""
+
+    if resto:
+        await _intentar_tasar(update, ctx, resto)
+        return
+
+    ctx.user_data["esperando_datos_tasar"] = True
+    await update.message.reply_text(_PROMPT_DATOS_TASAR, parse_mode="HTML")
+
+
+async def _capturar_datos_tasar(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Intercepta el siguiente mensaje cuando el usuario está en modo tasación."""
+    if not ctx.user_data.get("esperando_datos_tasar"):
+        return
+    await _intentar_tasar(update, ctx, update.message.text or "")
+
+
+async def _intentar_tasar(update: Update, ctx: ContextTypes.DEFAULT_TYPE, texto: str):
+    """Parsea datos, valida críticos y lanza la tasación. Precio ignorado."""
+    datos = await parsear_datos_anuncio_manual(texto)
+
+    criticos = ["marca", "modelo", "año"]
+    faltantes = [c for c in criticos if not datos.get(c)]
+    if faltantes:
+        nombres = {"marca": "marca", "modelo": "modelo", "año": "año"}
+        lista = ", ".join(nombres[f] for f in faltantes)
+        ctx.user_data["esperando_datos_tasar"] = True
+        await update.message.reply_text(
+            f"⚠️ Faltan: <b>{lista}</b>.\n"
+            f"Escríbelos junto con el resto.",
+            parse_mode="HTML",
+        )
+        return
+
+    ctx.user_data.pop("esperando_datos_tasar", None)
+
+    marca  = datos["marca"]
+    modelo = datos["modelo"]
+    año    = datos["año"]
+    km     = datos.get("km") or 0
+    con_km = km > 0
+
+    # Motor: se busca en el texto libre y en la descripción parseada por IA.
+    fuente_motor = f"{texto} {datos.get('descripcion') or ''}"
+    cv_obj   = _extraer_cv(fuente_motor)
+    comb_obj = _detectar_combustible(fuente_motor)
+
+    cab_km    = f" · {km:,} km" if con_km else ""
+    cab_motor = _cab_motor(cv_obj, comb_obj)
+    msg = await update.message.reply_text(
+        f"🧮 <b>{html.escape(marca.title())} {html.escape(modelo.upper())}</b> "
+        f"{año}{cab_km}{cab_motor}\n\n"
+        f"⏳ Buscando comparables en Wallapop y Coches.net…",
+        parse_mode="HTML",
+    )
+    await _pipeline_tasacion(
+        marca, modelo, año, km, con_km, cv_obj, comb_obj, msg, update.effective_user.id,
+    )
+
+
+def _cab_motor(cv_obj, comb_obj) -> str:
+    """Sufijo de cabecera con el motor pedido, si hay."""
+    partes = []
+    if cv_obj:
+        partes.append(f"{cv_obj} CV")
+    if comb_obj:
+        partes.append(comb_obj)
+    return f" · {' '.join(partes)}" if partes else ""
+
+
+async def _pipeline_tasacion(marca, modelo, año, km, con_km, cv_obj, comb_obj, msg, user_id):
+    """Comparables → filtro de motor → estadística → texto. Cobra 1 crédito solo si entrega tasación."""
+    try:
+        comparables = await buscar_comparables_todas(
+            marca, modelo, año, km if con_km else 0, n=30,
+        )
+    except Exception as e:
+        logger.error(f"[TASAR] Error buscando comparables: {e}")
+        comparables = []
+
+    historico = [c for c in comparables if c.precio > 0 and c.año > 1990]
+    try:
+        guardar_historico_batch(historico)
+    except Exception as e:
+        logger.warning(f"[TASAR] Error guardando histórico: {e}")
+
+    # Filtro por motor (CV/combustible) si el usuario lo dio. Cascada con fallback.
+    comps_precio = [c for c in comparables if c.precio > 0]
+    comps_motor, criterio, modo = _filtrar_por_motor(comps_precio, cv_obj, comb_obj)
+
+    # CV-strict: acepta muestra pequeña (n≥1), sin recorte (ya homogéneo).
+    # comb/pool: mínimo 3 y recorte de gama alta/outliers.
+    min_n    = 1 if modo == "cv" else 3
+    recortar = modo != "cv"
+    t = _tasar_desde_precios([c.precio for c in comps_motor], min_n=min_n, recortar=recortar)
+
+    if t is None:
+        await msg.edit_text(
+            f"⚠️ Solo encontré {len(comps_motor)} comparable(s) para "
+            f"<b>{html.escape(marca.title())} {html.escape(modelo.upper())}</b>"
+            f"{' con ese motor' if (cv_obj or comb_obj) else ''}.\n"
+            f"No hay datos para tasar. Prueba con menos detalle o un modelo más común.",
+            parse_mode="HTML",
+        )
+        return  # sin cobro
+
+    fuentes_count = dict(Counter(c.fuente for c in comps_motor))
+    logger.info(
+        f"[TASAR] valor={t['valor']:.0f} n={t['n']} excluidos={t['excluidos']} "
+        f"modo={modo} motor={criterio!r} fuentes={fuentes_count}"
+    )
+
+    texto_ia = await generar_texto_tasacion(marca, modelo, año, km, t, con_km, criterio)
+
+    cab_km    = f" · {km:,} km" if con_km else ""
+    cab_motor = _cab_motor(cv_obj, comb_obj)
+    nota_excl = f" · {t['excluidos']} de gama alta/anómalos fuera" if t["excluidos"] else ""
+    if modo == "cv":
+        pequena = " (muestra pequeña)" if t["n"] < 3 else ""
+        nota_motor = f"🔧 Motor: {criterio}{pequena}\n"
+    elif modo == "comb":
+        nota_motor = f"🔧 Combustible: {criterio}\n"
+    elif cv_obj or comb_obj:
+        nota_motor = "🔧 Sin anuncios de ese motor — taso el modelo completo.\n"
+    else:
+        nota_motor = ""
+    render = (
+        f"🧮 <b>Tasación · {html.escape(marca.title())} {html.escape(modelo.upper())}</b> "
+        f"{año}{cab_km}{cab_motor}\n\n"
+        f"💶 Valor de mercado: <b>{t['valor']:,.0f}€</b>\n"
+        f"💸 Si compras, oferta: <b>{t['oferta']:,.0f}€</b>\n"
+        f"🏷️ Si vendes, pide: <b>{t['pide']:,.0f}€</b>\n\n"
+        f"{nota_motor}"
+        f"📊 {t['n']} comparables{nota_excl} · Confianza: {_confianza_tasar(t['n'])}\n\n"
+        f"{html.escape(texto_ia)}\n\n"
+        f"<i>El acabado y el motor mueven el precio. Afínalo con /analizar sobre un anuncio.</i>"
+    )
+    await msg.edit_text(render, parse_mode="HTML", disable_web_page_preview=True)
+
+    if user_id not in ADMIN_USER_IDS:
+        registrar_uso(user_id, 1)
 
 
 def main():
@@ -2684,6 +2984,7 @@ def main():
     app.add_handler(CommandHandler("plan", cmd_plan))
     app.add_handler(CommandHandler("cancelar", cancelar))
     app.add_handler(CommandHandler("analizar", cmd_analizar))
+    app.add_handler(CommandHandler("tasar", cmd_tasar))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(conv_ideal)
     app.add_handler(conv_comparar)
@@ -2702,6 +3003,9 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_manual, pattern=r"^manual:si$"))
     # Handler de captura de datos manuales (grupo 1, después del logger global en -1)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _capturar_datos_manuales), group=1)
+    # Captura de datos de tasación (grupo 2 — independiente del manual; cada uno
+    # actúa solo si su clave de estado está activa)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _capturar_datos_tasar), group=2)
 
     # Manejador global de errores
     app.add_error_handler(error_handler)
