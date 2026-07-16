@@ -9,26 +9,24 @@ import httpx
 from config import TELEGRAM_TOKEN, DB_PATH
 
 MENSAJE = """\
-🎯 ¡Nueva función! /ideal
+Hay dos momentos en los que todo el mundo se hace la misma pregunta: ¿a cuánto está esto realmente?
 
-Hasta ahora analizabas anuncios sueltos. Ahora puedo decirte \
-directamente qué coche comprar.
+Cuando vas a vender tu coche y no sabes si pedir 8.000€ o 9.500€. Y cuando ves un anuncio y no sabes si el precio es justo o te están intentando colar algo. La mayoría mira dos o tres anuncios parecidos y tira de intuición. Eso no es un precio, es una apuesta.
 
-Le cuentas tu caso en lenguaje normal. Ej: "vivo en Madrid centro, \
-llevo a 2 niños y al perro, máximo 12.000€". Te hago unas \
-preguntas, y te devuelvo 3 modelos concretos con motor exacto \
-y años recomendados.
+Acabo de meter en el bot una función que hace ese trabajo bien: /tasar
 
-Cada uno con:
-- Anuncios reales de Wallapop que encajan ahora mismo
-- Lo que dicen propietarios en foros
-- Averías típicas: a qué km aparecen y cuánto cuestan
-- Por qué encaja con TU caso concreto
+Le pasas la marca, el modelo y el año. Motor y km son opcionales, pero si los das afina más. El bot rastrea Wallapop y Coches.net en tiempo real y te dice:
 
-Pruébala ahora:
-/ideal
+- El precio real de mercado para ese coche exacto, no una estimación genérica
+- A cuánto puedes venderlo tú para que se mueva rápido sin regalarlo
+- A cuánto tienes que comprarlo para que sea un buen negocio
 
-Cuesta 1 crédito. Tienes 3 gratis para empezar.\
+Nada de tablas de amortización genéricas. Precio sacado de anuncios reales que hay ahora mismo en el mercado.
+
+Para probarlo escribe /tasar aquí mismo.
+Tienes 3 créditos gratis. Una tasación cuesta 1.
+
+Juan Lopera · Coches con cabeza · juanlopera.es\
 """
 
 API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
