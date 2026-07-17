@@ -15,7 +15,7 @@ from fastapi import FastAPI, Request, HTTPException
 
 from config import (
     STRIPE_API_KEY, STRIPE_WEBHOOK_SEC, TELEGRAM_TOKEN,
-    PAID_CREDITOS_PACK_100, FREE_CREDITOS,
+    PAID_CREDITOS_PACK_10, PAID_CREDITOS_PACK_100, FREE_CREDITOS,
 )
 from database import activar_plan, desactivar_pro, pago_ya_procesado
 
@@ -119,7 +119,13 @@ def _field(obj, key, default=None):
 async def _notificar_user(user_id: int, concepto: str):
     if not TELEGRAM_TOKEN:
         return
-    if concepto == "pack_100":
+    if concepto == "pack_10":
+        texto = (
+            f"✅ <b>Pack activado.</b>\n\n"
+            f"{PAID_CREDITOS_PACK_10} acciones disponibles, sin caducidad. ¡Vamos!\n\n"
+            f"Usa /plan para ver tu número de usos restante."
+        )
+    elif concepto == "pack_100":
         texto = (
             f"✅ <b>Pack activado.</b>\n\n"
             f"{PAID_CREDITOS_PACK_100} acciones disponibles, sin caducidad. ¡Vamos!\n\n"

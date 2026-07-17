@@ -11,7 +11,7 @@ from functools import wraps
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from config import FREE_CREDITOS, PAID_CREDITOS_PACK_100, ADMIN_USER_IDS
+from config import FREE_CREDITOS, PAID_CREDITOS_PACK_10, PAID_CREDITOS_PACK_100, ADMIN_USER_IDS
 from database import get_o_crear_usuario, puede_usar, registrar_uso
 
 # Coste en créditos de cada comando.
@@ -60,9 +60,10 @@ def requiere_acceso(comando: str, registrar: bool = True):
                 return
 
             if info["plan"] == "free" and restantes == coste:
-                keyboard = InlineKeyboardMarkup([[
-                    InlineKeyboardButton(f"💎 {PAID_CREDITOS_PACK_100} acciones — 9.99€", callback_data="pagar_pack_100"),
-                ]])
+                keyboard = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"⭐ {PAID_CREDITOS_PACK_100} análisis — 9,99€", callback_data="pagar_pack_100")],
+                    [InlineKeyboardButton(f"🔍 {PAID_CREDITOS_PACK_10} análisis — 2,99€", callback_data="pagar_pack_10")],
+                ])
                 await update.effective_message.reply_text(
                     "ℹ️ Esta es tu última acción gratuita. "
                     "No hay más gratis después.\n\n"
@@ -99,14 +100,18 @@ async def _enviar_paywall(update: Update, info: dict, comando: str):
 
     if plan == "free":
         texto = (
-            f"⚡ <b>Has agotado tus {FREE_CREDITOS} acciones gratuitas.</b>\n\n"
-            "Son de por vida, no se renuevan.\n\n"
-            "El bot cruza el precio con el mercado real, investiga el "
-            "historial del modelo, detecta red flags y calcula la "
-            "etiqueta DGT. Todo en segundos.\n\n"
-            "Para seguir analizando — pack sin caducidad:\n"
-            f"• <b>9.99€</b> — {PAID_CREDITOS_PACK_100} acciones\n\n"
-            "Los ingresos financian el proyecto."
+            f"⚡ <b>Has usado tus {FREE_CREDITOS} análisis gratuitos.</b>\n\n"
+            "Un fallo comprando coche usado cuesta de media\n"
+            "2.000-6.000€ en averías que nadie te contó.\n"
+            "Un informe oficial de UN solo coche: 8,50€.\n\n"
+            "Sigue filtrando timos:\n\n"
+            f"🔍 <b>{PAID_CREDITOS_PACK_10} análisis — 2,99€</b>\n"
+            "   Para cerrar la compra que tienes entre manos.\n\n"
+            f"⭐ <b>{PAID_CREDITOS_PACK_100} análisis — 9,99€</b> · MEJOR VALOR\n"
+            "   10 céntimos por coche. Sin caducidad: para esta\n"
+            "   compra, la próxima y la del cuñado.\n\n"
+            "Soy Juan (@juanlopera.es en TikTok). Esto lo he hecho yo\n"
+            "y respondo personalmente cualquier duda aquí mismo."
         )
     elif plan == "paid":
         texto = (
@@ -119,9 +124,10 @@ async def _enviar_paywall(update: Update, info: dict, comando: str):
             "Desbloquea todas las funciones:"
         )
 
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton(f"💎 {PAID_CREDITOS_PACK_100} acciones — 9.99€", callback_data="pagar_pack_100"),
-    ]])
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"⭐ {PAID_CREDITOS_PACK_100} análisis — 9,99€", callback_data="pagar_pack_100")],
+        [InlineKeyboardButton(f"🔍 {PAID_CREDITOS_PACK_10} análisis — 2,99€", callback_data="pagar_pack_10")],
+    ])
     await update.effective_message.reply_text(
         texto, parse_mode="HTML", reply_markup=keyboard
     )

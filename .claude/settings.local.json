@@ -17,7 +17,9 @@
       "Bash(sqlite3 cabeza_bot.db \"SELECT COUNT\\(*\\) FROM eventos_comando;\")",
       "Bash(python -m py_compile config.py database.py permisos.py main.py webhook.py broadcast.py)",
       "Bash(python -m py_compile broadcast.py)",
-      "Bash(python -c \"import ast,io; src=open\\('broadcast.py',encoding='utf-8'\\).read\\(\\); print\\('OK, largo mensaje:', len\\([l for l in src.splitlines\\(\\)]\\)\\)\")"
+      "Bash(python -c \"import ast,io; src=open\\('broadcast.py',encoding='utf-8'\\).read\\(\\); print\\('OK, largo mensaje:', len\\([l for l in src.splitlines\\(\\)]\\)\\)\")",
+      "Bash(python -m py_compile config.py database.py permisos.py main.py webhook.py)",
+      "Bash(python -m py_compile permisos.py)"
     ]
   }
 }

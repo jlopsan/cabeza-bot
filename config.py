@@ -131,6 +131,7 @@ MIN_BENEFICIO = 3_000
 
 # ─── STRIPE ──────────────────────────────────────────────────────────────────
 STRIPE_API_KEY        = os.getenv("STRIPE_API_KEY", "")
+STRIPE_PRICE_PACK_10  = os.getenv("STRIPE_PRICE_PACK_10", "")  # price_xxx pago único 2.99€
 STRIPE_PRICE_PACK_100 = os.getenv("STRIPE_PRICE_PACK_100", "") # price_xxx pago único 9.99€
 STRIPE_PRICE_PRO      = os.getenv("STRIPE_PRICE_PRO", "")      # dormido — futuro: PRO mensual
 STRIPE_WEBHOOK_SEC    = os.getenv("STRIPE_WEBHOOK_SEC", "")    # whsec_xxx
@@ -139,6 +140,7 @@ STRIPE_WEBHOOK_SEC    = os.getenv("STRIPE_WEBHOOK_SEC", "")    # whsec_xxx
 # Créditos gratis de por vida: N por usuario nuevo, una sola vez, sin reset.
 # Env FREE_CREDITOS (nuevo); acepta FREE_CREDITOS_DIA legacy por compatibilidad.
 FREE_CREDITOS           = int(os.getenv("FREE_CREDITOS", os.getenv("FREE_CREDITOS_DIA", "3")))
+PAID_CREDITOS_PACK_10   = int(os.getenv("PAID_CREDITOS_PACK_10", "10"))   # pack 2.99€
 PAID_CREDITOS_PACK_100  = int(os.getenv("PAID_CREDITOS_PACK_100", "100"))  # pack 9.99€
 
 # ─── /ideal ──────────────────────────────────────────────────────────────────
