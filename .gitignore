@@ -5,4 +5,7 @@ __pycache__/
 *.pyc
 .playwright/
 cabeza_bot.db
+cabeza_bot.db-shm
+cabeza_bot.db-wal
+cabeza_bot.db-journal
 *.bak
