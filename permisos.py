@@ -108,15 +108,14 @@ async def _enviar_paywall(update: Update, info: dict, comando: str):
             f"🔍 <b>{PAID_CREDITOS_PACK_10} análisis — 2,99€</b>\n"
             "   Para cerrar la compra que tienes entre manos.\n\n"
             f"⭐ <b>{PAID_CREDITOS_PACK_100} análisis — 9,99€</b> · MEJOR VALOR\n"
-            "   10 céntimos por coche. Sin caducidad: para esta\n"
-            "   compra, la próxima y la del cuñado.\n\n"
-            "Soy Juan (@juanlopera.es en TikTok). Esto lo he hecho yo\n"
-            "y respondo personalmente cualquier duda aquí mismo."
+            "   Para buscar a fondo: compara todos los que\n"
+            "   quieras hasta dar con el bueno. Sin caducidad."
         )
     elif plan == "paid":
         texto = (
-            "📦 <b>Has consumido todas las acciones del pack.</b>\n\n"
-            "Recarga otro pack:"
+            "⚡ <b>Has agotado tus análisis.</b>\n\n"
+            "Recarga y sigue donde lo dejaste. Los análisis nuevos\n"
+            "se acumulan con los que compres después y no caducan."
         )
     else:
         texto = (

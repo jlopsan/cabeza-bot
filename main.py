@@ -173,7 +173,7 @@ async def cmd_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         else:
             cuerpo = (
                 f"🆓 <b>Plan FREE</b>\n"
-                f"Acciones restantes: <b>{creditos}/{FREE_CREDITOS}</b> (de por vida)\n"
+                f"Acciones restantes: <b>{creditos}/{FREE_CREDITOS}</b> \n"
                 f"Al agotarlas, no se renuevan.\n\n"
                 f"🔍 Pack {PAID_CREDITOS_PACK_10} acciones — 2,99€ (sin caducidad)\n"
                 f"⭐ Pack {PAID_CREDITOS_PACK_100} acciones — 9,99€ (sin caducidad)\n\n"

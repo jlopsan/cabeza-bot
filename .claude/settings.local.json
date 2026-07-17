@@ -19,7 +19,18 @@
       "Bash(python -m py_compile broadcast.py)",
       "Bash(python -c \"import ast,io; src=open\\('broadcast.py',encoding='utf-8'\\).read\\(\\); print\\('OK, largo mensaje:', len\\([l for l in src.splitlines\\(\\)]\\)\\)\")",
       "Bash(python -m py_compile config.py database.py permisos.py main.py webhook.py)",
-      "Bash(python -m py_compile permisos.py)"
+      "Bash(python -m py_compile permisos.py)",
+      "Bash(python3 -c ' *)",
+      "Bash(tasklist //FI \"IMAGENAME eq python.exe\" //FO CSV)",
+      "Bash(tasklist //FI \"IMAGENAME eq stripe.exe\" //FO CSV)",
+      "Bash(tasklist //V //FO CSV)",
+      "PowerShell(Get-CimInstance Win32_Process -Filter \"Name='python.exe'\")",
+      "Bash(tasklist //FI \"IMAGENAME eq uvicorn.exe\")",
+      "Bash(where stripe *)",
+      "Bash(echo \"exit=$?\")",
+      "PowerShell(Get-CimInstance Win32_Process -Filter \"Name='python.exe' and ProcessId=22276 or Name='python.exe' and ProcessId=4356\")",
+      "Bash(taskkill //PID 4356 //F)",
+      "Bash(timeout 3 cat \"C:\\\\Users\\\\Juan\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-Juan-Documents-cabeza-bot\\\\03d8b383-d7d0-46d2-85ba-ee94c9e8a8a9\\\\tasks\\\\bohwa18i3.output\")"
     ]
   }
 }
