@@ -635,6 +635,232 @@ class ScraperAutoScout24(ScraperDE):
             except Exception:
                 continue
 
+    # ── SNIPER: detección barata (fase 1) + URL normalizada para agrupar ──────
+
+    def url_deteccion_normalizada(self, marca: str, modelo: str, filtros: dict) -> str:
+        """
+        URL de detección DETERMINISTA (params ordenados) para que el worker
+        agrupe misiones con filtros equivalentes en un solo scrapeo.
+        Ordena por publicación reciente (sort=age&desc=1).
+        """
+        filtros = filtros or {}
+        marca_slug  = marca.lower().strip().replace(" ", "-")
+        modelo_slug = modelo.lower().strip().replace(" ", "-")
+        ruta = f"{marca_slug}/{modelo_slug}"
+
+        params: dict[str, str] = {"sort": "age", "desc": "1", "ustate": "N,U"}
+        mapa = {
+            "km_max": "kmto", "km_min": "kmfrom",
+            "year_min": "fregfrom", "year_max": "fregto",
+            "price_max": "priceto", "price_min": "pricefrom",
+            "power_min": "powerfrom", "power_max": "powerto",
+        }
+        for kf, ku in mapa.items():
+            if filtros.get(kf):
+                params[ku] = str(filtros[kf])
+
+        comb = str(filtros.get("combustible", "")).lower().strip()
+        if comb in COMBUSTIBLES_AS24:
+            params["fuel"] = COMBUSTIBLES_AS24[comb]
+        caja = str(filtros.get("caja", "")).lower().strip()
+        if caja in ("automatico", "automático", "auto", "dsg", "pdk"):
+            params["gear"] = "A"
+        elif caja in ("manual", "manuales"):
+            params["gear"] = "M"
+
+        qs = "&".join(f"{k}={params[k]}" for k in sorted(params))
+        return f"{self.BASE_URL}/{ruta}?{qs}"
+
+    async def buscar_deteccion(self, marca: str, modelo: str, filtros: dict,
+                               paginas: int | None = None) -> tuple[list[dict], str]:
+        """
+        Detección barata para el sniper: SOLO fase 1 (listado) ordenado por más
+        reciente. Devuelve (anuncios, señal) con señal ∈ {'ok','vacio','fallo'}:
+          - 'ok'    : HTML válido con anuncios.
+          - 'vacio' : HTML válido, 0 anuncios (mercado sin stock — NO es fallo).
+          - 'fallo' : excepción/timeout/estructura rota (el breaker puede actuar).
+        """
+        from config import SNIPER_DETECCION_PAGINAS
+        filtros = filtros or {}
+        paginas = paginas or SNIPER_DETECCION_PAGINAS
+        user_agent = random.choice(USER_AGENTS)
+        proxy_cfg = {"server": random.choice(PROXIES)} if PROXIES else None
+        url_base = self.url_deteccion_normalizada(marca, modelo, filtros)
+
+        async with _PLAYWRIGHT_SEM, async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await _nuevo_contexto_stealth(browser, user_agent, proxy_cfg)
+            await context.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+            )
+            try:
+                anuncios, estructura_ok = await self._fase1_deteccion(context, url_base, paginas)
+                if not estructura_ok:
+                    logger.warning(f"[AS24] Detección: estructura inesperada en {url_base}")
+                    return [], "fallo"
+                if anuncios:
+                    _persistir_de_historico(anuncios, marca, modelo)
+                    return anuncios, "ok"
+                return [], "vacio"
+            except Exception as e:
+                logger.error(f"[AS24] Detección falló: {e}")
+                return [], "fallo"
+            finally:
+                await browser.close()
+
+    async def _fase1_deteccion(self, context, url_base: str,
+                               paginas: int) -> tuple[list[dict], bool]:
+        """
+        Extrae el listado (sin visitar detalles) de las primeras `paginas`.
+        Devuelve (anuncios, estructura_ok). estructura_ok=False solo si la página
+        cargó pero NO tiene ni tarjetas ni landmark de resultados (HTML roto/bloqueo).
+        """
+        resultados: list[dict] = []
+        estructura_ok = True
+        page = await context.new_page()
+        try:
+            for pagina in range(1, paginas + 1):
+                url = url_base if pagina == 1 else f"{url_base}&page={pagina}"
+                await page.goto(url, timeout=60_000, wait_until="domcontentloaded")
+                await asyncio.sleep(random.uniform(1.5, 3.0))  # jitter
+                if pagina == 1:
+                    await self._aceptar_cookies(page)
+
+                tiene_cards = False
+                try:
+                    await page.wait_for_selector(self.SELECTORS["card"], state="attached", timeout=10_000)
+                    tiene_cards = True
+                except Exception:
+                    tiene_cards = False
+
+                if not tiene_cards:
+                    # ¿vacío legítimo o estructura rota? Buscamos landmark de resultados.
+                    if pagina == 1:
+                        estructura_ok = await self._pagina_tiene_landmark(page)
+                    break
+
+                cards = page.locator(self.SELECTORS["card"])
+                total = await cards.count()
+                for i in range(total):
+                    if len(resultados) >= MAX_COCHES_RAW:
+                        break
+                    coche = await self._extraer_card_basico(cards.nth(i), i)
+                    if coche:
+                        resultados.append(coche)
+
+                if len(resultados) >= MAX_COCHES_RAW:
+                    break
+                if not await page.locator(self.SELECTORS["next"]).count():
+                    break
+        except PWTimeout:
+            logger.error("[AS24] Timeout en detección")
+            estructura_ok = False
+        except Exception as e:
+            logger.error(f"[AS24] Error detección listado: {e}")
+            estructura_ok = False
+        finally:
+            await page.close()
+        return resultados, estructura_ok
+
+    async def _pagina_tiene_landmark(self, page) -> bool:
+        """
+        True si la página parece una búsqueda válida (aunque sin resultados):
+        distingue 'mercado vacío' (True) de 'HTML roto/bloqueo' (False).
+        """
+        # Texto alemán típico de "sin resultados" → vacío legítimo.
+        try:
+            body = (await page.inner_text("body"))[:4000].lower()
+        except Exception:
+            return False
+        señales_vacio = ["keine fahrzeuge", "0 angebote", "keine angebote",
+                          "leider", "keine treffer"]
+        if any(s in body for s in señales_vacio):
+            return True
+        # Landmark de la página de resultados (cabecera/formulario de búsqueda).
+        for sel in ["[class*='ListHeader']", "[data-testid*='SortDropdown']",
+                     "[class*='ListPage']", "form[role='search']", "h1"]:
+            try:
+                if await page.locator(sel).first.count():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def obtener_detalle_candidato(self, coche: dict) -> dict:
+        """
+        Visita el detalle de UN candidato y rellena campos para la cuenta:
+        co2, potencia (PS), nº propietarios, vendedor (haendler/particular),
+        es_netto (MwSt. ausweisbar), caja, combustible, descripción.
+        NUNCA llama a IA. Muta y devuelve el dict.
+        """
+        coche.setdefault("cv", 0)
+        coche.setdefault("propietarios", 0)
+        coche.setdefault("vendedor", "")
+        coche.setdefault("es_netto", False)
+        link = coche.get("link")
+        if not link:
+            return coche
+        user_agent = random.choice(USER_AGENTS)
+        proxy_cfg = {"server": random.choice(PROXIES)} if PROXIES else None
+        async with _PLAYWRIGHT_SEM, async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await _nuevo_contexto_stealth(browser, user_agent, proxy_cfg)
+            page = await context.new_page()
+            try:
+                await page.goto(link, timeout=25_000, wait_until="domcontentloaded")
+                await asyncio.sleep(random.uniform(0.8, 1.5))
+
+                # CO₂
+                for sel in ["dt:has-text('CO₂') + dd", "dt:has-text('CO2') + dd",
+                             "span:has-text('g/km')"]:
+                    try:
+                        elem = page.locator(sel).first
+                        if await elem.count():
+                            val = _parse_numero(await elem.inner_text())
+                            if 20 <= val <= 400:
+                                coche["co2"] = val
+                                break
+                    except Exception:
+                        continue
+
+                datos = await page.evaluate("""
+                    () => {
+                        const r = {};
+                        for (const dt of document.querySelectorAll('dt')) {
+                            const label = (dt.innerText || '').trim().toLowerCase();
+                            const dd = dt.nextElementSibling;
+                            if (!dd) continue;
+                            const val = (dd.innerText || '').trim();
+                            if (label.includes('getriebe'))   r.caja = val;
+                            if (label.includes('kraftstoff')) r.combustible = val;
+                            if (label.includes('leistung'))   r.potencia = val;
+                            if (label.includes('fahrzeughalter')) r.propietarios = val;
+                        }
+                        const t = (document.body.innerText || '').toLowerCase();
+                        r.netto = t.includes('mwst. ausweisbar') || t.includes('mwst ausweisbar')
+                                  || t.includes('nettopreis');
+                        r.privado = t.includes('privatverkäufer') || t.includes('privatanbieter')
+                                    || t.includes('privatverkauf');
+                        return r;
+                    }
+                """)
+                if datos:
+                    coche["caja"]        = _normalizar_caja_de(datos.get("caja", "")) or coche.get("caja", "")
+                    coche["combustible"] = _normalizar_combustible_de(datos.get("combustible", "")) or coche.get("combustible", "")
+                    pot = _parse_numero(datos.get("potencia", "") or "0")
+                    if pot > 0:
+                        coche["cv"] = int(pot)
+                    prop = _parse_numero(datos.get("propietarios", "") or "0")
+                    if prop > 0:
+                        coche["propietarios"] = int(prop)
+                    coche["es_netto"] = bool(datos.get("netto"))
+                    coche["vendedor"] = "particular" if datos.get("privado") else "haendler"
+            except Exception as e:
+                logger.debug(f"[AS24] Detalle candidato falló {link}: {e}")
+            finally:
+                await browser.close()
+        return coche
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # MOBILE.DE  (Query texto alemán → su buscador IA filtra)
@@ -2222,6 +2448,41 @@ class ScraperCochesNet:
 # ════════════════════════════════════════════════════════════════════════════
 # FUNCIONES PÚBLICAS
 # ════════════════════════════════════════════════════════════════════════════
+
+def _persistir_de_historico(anuncios: list[dict], marca: str, modelo: str) -> int:
+    """
+    Persiste los anuncios DE (dicts del scraper) en historico_precios con
+    fuente='autoscout24'. Mismos filtros de calidad que ES: precio>0, año>1990.
+    El dataset DE vs ES es un activo del producto.
+    """
+    from models import Anuncio
+    from database import guardar_historico_batch
+    lote = []
+    for a in anuncios:
+        try:
+            precio = float(a.get("precio", 0) or 0)
+            año    = int(a.get("año", 0) or 0)
+        except (ValueError, TypeError):
+            continue
+        if precio <= 0 or año <= 1990:
+            continue
+        lote.append(Anuncio(
+            item_id=str(a.get("id", "")),
+            fuente="autoscout24",
+            marca=marca, modelo=modelo,
+            año=año, km=int(a.get("km", 0) or 0), precio=precio,
+            provincia="DE", descripcion=a.get("descripcion", ""),
+            url=a.get("link", ""), foto=a.get("foto", ""),
+            titulo=a.get("titulo", ""),
+        ))
+    if not lote:
+        return 0
+    try:
+        return guardar_historico_batch(lote)
+    except Exception as e:
+        logger.warning(f"[AS24] persistir histórico DE falló: {e}")
+        return 0
+
 
 async def buscar_coches_alemania(
     marca: str, modelo: str, filtros: dict | None = None,

@@ -51,13 +51,13 @@ Si no cabe todo, cerrar en este orden. El vídeo NO sale hasta que 1-3 estén pr
 
 ## 4. Scraper AutoScout24 (robustez + extracción)
 
-- [ ] 4.1 `buscar_deteccion(marca, modelo, filtros)` → fase 1 (listado) ordenado por publicación reciente, 1-2 páginas; devuelve anuncios + señal `ok|fallo|vacio`.
-- [ ] 4.2 `url_deteccion_normalizada(marca, modelo, filtros)` determinista para agrupar (clave de scrapeo).
-- [ ] 4.3 Fase 2 ampliada: potencia, nº propietarios, `vendedor` (haendler/particular), `es_netto`. Campos ausentes → vacío/0, sin IA.
-- [ ] 4.4 Retirar `estimar_co2` (IA) del path del scraper de misiones.
-- [ ] 4.5 Distinguir `fallo` (excepción/timeout/HTML roto) vs `vacio` (HTML válido, 0 resultados) en el retorno.
-- [ ] 4.6 Persistir anuncios DE en `historico_precios` con `fuente='autoscout24'` (precio>0, año>1990).
-- [ ] 4.7 Mantener jitter/backoff/rotación UA existentes; log claro en degradación.
+- [x] 4.1 `ScraperAutoScout24.buscar_deteccion(...)` → fase 1 (listado) ordenado por reciente, N páginas (`SNIPER_DETECCION_PAGINAS`); devuelve `(anuncios, señal)` con `ok|vacio|fallo`.
+- [x] 4.2 `url_deteccion_normalizada(...)` determinista (params ordenados) para agrupar por clave de scrapeo.
+- [x] 4.3 `obtener_detalle_candidato(coche)` NUEVO: co2, `cv` (potencia PS), `propietarios`, `vendedor` (haendler/particular), `es_netto`. Ausentes → vacío/0. (No toca el `_fase2_detalles` legacy.)
+- [x] 4.4 El path de misiones (`obtener_detalle_candidato`) NO llama a IA. `estimar_co2` queda solo en el path legacy.
+- [x] 4.5 `_pagina_tiene_landmark` distingue `fallo` (HTML roto/timeout/sin landmark) de `vacio` (landmark o texto "keine Fahrzeuge" con 0 tarjetas).
+- [x] 4.6 `_persistir_de_historico` persiste DE en `historico_precios` con `fuente='autoscout24'` (precio>0, año>1990) vía `Anuncio` + `guardar_historico_batch`.
+- [x] 4.7 jitter en detección, rotación UA y `_PLAYWRIGHT_SEM` reusados; log claro en degradación. (Backoff explícito → lo aplica el breaker del worker, grupo 6.)
 
 ## 5. Pipeline sniper (sniper_pipeline.py — compartido bot+worker)
 
