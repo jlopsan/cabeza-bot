@@ -744,8 +744,8 @@ async def _core_analisis(url: str, source_msg, ctx, es_admin: bool, user_id: int
         )
 
         await _pipeline_analisis(anuncio, msg, source_msg, ctx, url=url)
-        if not (update.effective_user.id in ADMIN_USER_IDS):
-            registrar_uso(update.effective_user.id, 1)
+        if not es_admin:
+            registrar_uso(user_id, 1)
 
     except Exception:
         logger.error("[BOT] Excepción no capturada en _core_analisis", exc_info=True)

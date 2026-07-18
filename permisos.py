@@ -23,6 +23,9 @@ COSTE_COMANDO: dict[str, int] = {
     "/comparar": 1,  # semana 4
     "/tasar":    1,  # semana 5
     "/alertas":  1,  # semana 6 — puede subir a 5 cuando sea tiempo real
+    # /sniper: gate mínimo del decorator = 1 crédito. El coste REAL depende del
+    # tier (free 1 una-sola-vez / paid 5) y se resuelve en el handler, no aquí.
+    "/sniper":   1,
 }
 
 

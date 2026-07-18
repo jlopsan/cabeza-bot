@@ -1,0 +1,124 @@
+# Orden de corte (regla #3 — una cosa al 100%)
+
+Si no cabe todo, cerrar en este orden. El vídeo NO sale hasta que 1-3 estén probados con casos reales.
+1. `/sniper` crea misión + worker vigila + alerta con dedup (mínimo publicable)
+2. Cuenta de importación en la alerta (IEDMT estimado)
+3. Comparación con mercado ES + margen neto
+4. Freemium + límites por tier
+5. Deep link + embudo instrumentado
+6. Gestión de misiones (pausar/editar/borrar)
+
+## 0. Preparación y decisiones abiertas
+
+- [x] 0.1 Confirmado por Juan (2026-07-18): paid 5 créditos/misión + 3 activas; free UNA sola vez (1 crédito, 2 restantes para otros comandos) + 1 activa. IEDMT estimación con disclaimer (BOE fase 2). Sniper adelanta a S6 y cubre S7.
+- [x] 0.2 Confirmado: sniper delante de `/alertas` (S6); `/sniper` cubre `/importar_alemania` (S7).
+- [ ] 0.3 Verificar tramos IEDMT 2026 en `config.py` contra fuente oficial vigente (0/4,75/9,75/14,75 · cortes 120/159/199).
+- [ ] 0.4 Rama de trabajo desde `main`; no tocar código vivo hasta que la regresión esté cubierta.
+
+## 1. Config y feature flag
+
+- [ ] 1.1 `config.py`: `ENABLE_SNIPER` (env, default false en prod).
+- [ ] 1.2 `config.py`: costes fijos por env — `COSTE_TRANSPORTE=1000`, `COSTE_COC_GESTION=400`, `COSTE_HOMOLOGACION_ITV=300`, `COSTE_TASAS_DGT=100` (sustituyen a 1200/350 hardcoded).
+- [ ] 1.3 `config.py`: umbrales `SNIPER_UMBRAL_EUR=1500`, `SNIPER_UMBRAL_PCT=10`, `SNIPER_ALERTAS_PASADA=3`.
+- [ ] 1.4 `config.py`: ciclo — `SNIPER_INTERVAL_MINUTES` (existe), `SNIPER_BUDGET_S=150`, `SNIPER_MAX_SCRAPES_HORA=60`, `SNIPER_CB_FALLOS=3`, `SNIPER_CB_PAUSA_MIN=30`, `SNIPER_MISION_DIAS=30`.
+- [ ] 1.5 `config.py`: valoración — `VALORACION_TTL_H=12`, banda km = 20000.
+- [ ] 1.6 `config.py`: heurística CO₂ determinista por combustible × año (tabla de g/km típicos) para cuando el anuncio no trae CO₂.
+- [ ] 1.7 `config.py`/`permisos.py`: `COSTE_COMANDO["/sniper"] = 1` (gate mínimo), `COSTE_SNIPER_FREE=1`, `COSTE_SNIPER_PAID=5`, `MISIONES_MAX = {"free":1, "paid":3, "pro":999}` (env-configurable). Free = un solo uso de por vida (contar eventos `mision_creada`).
+
+## 2. Migraciones BD (aditivas, sin romper prod)
+
+- [ ] 2.1 `misiones`: `ALTER ADD` `marca`, `modelo`, `umbral_margen_eur`, `umbral_margen_pct`, `expira_at`, `snapshot_sembrado`, `last_run_at`, `alertas_total`, `ultimo_error` (try/except por columna, patrón existente).
+- [ ] 2.2 `usuarios`: `ALTER ADD` `fuente_captacion`, `fuente_captacion_at`.
+- [ ] 2.3 Tabla `alertas_enviadas(id, mision_id, anuncio_id, huella, tipo, precio, margen_eur, margen_pct, url, ts)` con `UNIQUE(mision_id, anuncio_id)` + índices por `mision_id` y `huella`.
+- [ ] 2.4 Tabla `valoraciones_mercado(marca, modelo, año, km_banda, mediana, n_comparables, precios_json, actualizado_at)` con `UNIQUE(marca, modelo, año, km_banda)`.
+- [ ] 2.5 Tabla `eventos(id, user_id, evento, meta, ts)` + índice por `evento`.
+- [ ] 2.6 Tabla `estado_fuentes(fuente, fallos_seguidos, pausada_hasta, scrapes_hora_json)`.
+- [ ] 2.7 Migración de datos: marcar misiones pre-v2 (sin `marca`/`modelo`) como `EXPIRADA`.
+- [ ] 2.8 Funciones DB misiones v2: `crear_mision_sniper`, `obtener_misiones_sniper_activas`, `obtener_misiones_usuario`, `pausar/reanudar/borrar/renovar_mision`, `editar_umbral`, `set_last_run/ultimo_error`, `expirar_vencidas`.
+- [ ] 2.9 Funciones DB dedup/snapshot: `sembrar_snapshot`, `anuncio_ya_visto(mision_id, anuncio_id)`, `huella_reciente(huella, dias)`, `registrar_visto`, `registrar_alerta`.
+- [ ] 2.10 Funciones DB valoración: `get_valoracion(marca, modelo, año, km_banda)`, `upsert_valoracion`, `valoracion_caducada`.
+- [ ] 2.11 Funciones DB eventos/fuentes: `registrar_evento_embudo`, `get_estado_fuente`, `incr_fallo_fuente`, `reset_fuente`, `incr_scrape_hora`, `scrapes_ultima_hora`.
+- [ ] 2.12 Funciones DB captación: `set_fuente_captacion` (first-touch, no sobrescribe).
+- [ ] 2.13 Incluir `alertas_enviadas` y `eventos` en `purgar_historico_antiguo` (180 días).
+
+## 3. Cálculo de importación (calculator.py)
+
+- [ ] 3.1 Reescribir `calcular_landing_price(precio_de, mediana_es, co2)` → base IEDMT = `mediana_es` (NO precio DE); desglose transporte + COC/gestión + homologación/ITV + tasas DGT + IEDMT.
+- [ ] 3.2 `calcular_margen(precio_de, mediana_es, co2)` → `{margen_eur, margen_pct, importacion, iedmt, tipo_iedmt}`.
+- [ ] 3.3 `estimar_co2_deterministico(combustible, año)` en calculator/config (sin IA).
+- [ ] 3.4 Detección nuevo fiscal (`<6 meses` o `<6.000 km`) y flag Netto → banderas para la tarjeta.
+- [ ] 3.5 Verificar `calcular_tipo_iedmt` usa los cortes correctos; tests unitarios de los 4 tramos + caso CO₂=0.
+
+## 4. Scraper AutoScout24 (robustez + extracción)
+
+- [ ] 4.1 `buscar_deteccion(marca, modelo, filtros)` → fase 1 (listado) ordenado por publicación reciente, 1-2 páginas; devuelve anuncios + señal `ok|fallo|vacio`.
+- [ ] 4.2 `url_deteccion_normalizada(marca, modelo, filtros)` determinista para agrupar (clave de scrapeo).
+- [ ] 4.3 Fase 2 ampliada: potencia, nº propietarios, `vendedor` (haendler/particular), `es_netto`. Campos ausentes → vacío/0, sin IA.
+- [ ] 4.4 Retirar `estimar_co2` (IA) del path del scraper de misiones.
+- [ ] 4.5 Distinguir `fallo` (excepción/timeout/HTML roto) vs `vacio` (HTML válido, 0 resultados) en el retorno.
+- [ ] 4.6 Persistir anuncios DE en `historico_precios` con `fuente='autoscout24'` (precio>0, año>1990).
+- [ ] 4.7 Mantener jitter/backoff/rotación UA existentes; log claro en degradación.
+
+## 5. Pipeline sniper (sniper_pipeline.py — compartido bot+worker)
+
+- [ ] 5.1 `clave_scrapeo(mision)` → URL normalizada (delega en scraper 4.2).
+- [ ] 5.2 `valorar_mercado_es(marca, modelo, año, km)` → usa `buscar_comparables_todas` + `_calcular_stats_precios` de `/analizar`; upsert en `valoraciones_mercado`; persiste comparables en histórico.
+- [ ] 5.3 `evaluar_candidato(anuncio, valoracion)` → filtros → cuenta importación (calculator) → `{alerta: bool, margen, confianza}` con umbral doble €/%.
+- [ ] 5.4 `render_tarjeta_alerta(anuncio, valoracion, cuenta)` → formato del vídeo, `html.escape`, confianza 🟢/🟡/🔴, avisos IVA/Netto, botón "Ver anuncio", sin desglose si CO₂ estimado.
+- [ ] 5.5 `sembrar_snapshot(mision, anuncios)` y `detectar_nuevos(mision, anuncios)` (ID + huella).
+- [ ] 5.6 `confianza(n_comparables)` → ≥8 🟢, 4-7 🟡, <4 🔴 + texto de advertencia.
+
+## 6. Worker (worker.py)
+
+- [ ] 6.1 Reescribir `_ciclo_sniper`: respeta `ENABLE_SNIPER`, circuit breaker (pausa si `pausada_hasta`), cap scrapes/hora, presupuesto `SNIPER_BUDGET_S`, orden por `last_run_at` ASC.
+- [ ] 6.2 Agrupar misiones activas por `clave_scrapeo`; un scrapeo por clave por pasada.
+- [ ] 6.3 Por clave: detección (fase 1) → por misión del grupo: snapshot inicial si no sembrado, si no detectar nuevos → pre-filtro margen → fase 2 solo candidatos → evaluar → alertar (máx `SNIPER_ALERTAS_PASADA`).
+- [ ] 6.4 Refresco de valoración: máx 1 caducada por pasada; candidatos sin valoración fresca no se marcan vistos.
+- [ ] 6.5 Actualizar `last_run_at`, `alertas_total`, `ultimo_error`; `expirar_vencidas` al inicio de pasada.
+- [ ] 6.6 Circuit breaker: `fallo` → `incr_fallo_fuente`; a `SNIPER_CB_FALLOS` → `pausada_hasta`; `ok` → `reset_fuente`; `vacio` no cuenta.
+- [ ] 6.7 Registrar evento `alerta_enviada` por alerta.
+- [ ] 6.8 Eliminar `_ciclo_normal`, `procesar_mision` legacy, `_get_beneficio_coche`; `_ciclo_health` intacto; `gather` = sniper + health.
+
+## 7. Bot — flujo /sniper (main.py)
+
+- [ ] 7.1 `cmd_sniper`: sin args → listado de misiones con botones; con args → flujo de creación NL.
+- [ ] 7.2 Creación: `@requiere_acceso("/sniper", registrar=False)`; parseo NL (1 llamada IA), slot-filling multi-turn de marca/modelo, confirmación de slots.
+- [ ] 7.3 Chequeo pre-creación (paywall específico si falla): free = un solo uso histórico (contar `mision_creada`); límite de misiones activas por tier; créditos suficientes para el coste del tier (paid necesita 5).
+- [ ] 7.4 Al confirmar: valorar mercado ES en caliente, `crear_mision_sniper`, `registrar_uso(user_id, coste_por_tier)` (free 1 / paid 5), `registrar_evento_embudo(mision_creada)`, mensaje de vigilancia activa.
+- [ ] 7.5 Callbacks de gestión: pausar/reanudar/borrar/editar-umbral/renovar (gratis); confirmación en borrar y renovar.
+- [ ] 7.6 Registrar `CommandHandler("sniper")` + alias `CommandHandler("buscar")` (mismo entry) + `CallbackQueryHandler` de gestión.
+- [ ] 7.7 Paywall específico del sniper en `permisos.py`/main con evento `paywall_visto` meta=sniper.
+
+## 8. Deep links y embudo (main.py)
+
+- [ ] 8.1 `start`: leer `ctx.args`; `set_fuente_captacion` first-touch; `registrar_evento_embudo(start, payload)`.
+- [ ] 8.2 Bienvenida contextual si payload `v_sniper*`.
+- [ ] 8.3 `cmd_stats_sniper` (solo admin): misiones por estado, alertas 24h/7d, estado breaker, conversión por `fuente_captacion`.
+
+## 9. Limpieza del legacy (solo tras regresión verde)
+
+- [ ] 9.1 `main.py`: eliminar `TIER_LIMITS`, `_tier_puede`, ConversationHandler `/buscar` interactivo, `/calcular`, y sus handlers comentados.
+- [ ] 9.2 `calculator.py`: eliminar `calcular_sniper_score`, `formato_sniper_score`, `formato_tarjeta`; conservar `calcular_precio_maximo_de` como helper (sin handler).
+- [ ] 9.3 `scraper.py`: eliminar `buscar_y_cruzar`, `buscar_coches_alemania` si ya no los usa nadie (verificar imports en worker y main).
+- [ ] 9.4 Grep de referencias muertas (`calcular_sniper_score`, `precio_objetivo_es`, `buscar_y_cruzar`) → 0 usos vivos.
+
+## 10. Tests manuales con casos reales (criterios de aceptación)
+
+- [ ] 10.1 Crear misión real (BMW 320d 2019-2021, <25.000€, <100.000 km): primera pasada siembra snapshot SIN alertas.
+- [ ] 10.2 Anuncio nuevo genera alerta en <10 min; el mismo anuncio no vuelve a alertar; re-publicación (ID nuevo, misma huella) no alerta.
+- [ ] 10.3 Reinicio del worker no re-alerta ni pierde snapshot.
+- [ ] 10.4 Cuenta a mano contra 2-3 anuncios reales: IEDMT del tramo correcto según CO₂, margen coherente con mediana ES.
+- [ ] 10.5 Caso sin CO₂ → tarjeta "IEDMT estimado" sin romper.
+- [ ] 10.6 Caso nuevo fiscal (<6.000 km) → aviso de IVA; caso Netto → flag.
+- [ ] 10.7 AutoScout24 caído (simular fallo) → circuit breaker pausa 30 min, log claro, resto del bot vivo.
+- [ ] 10.8 Deep link `?start=v_sniper_alemania` → `fuente_captacion` persistida + onboarding contextual.
+- [ ] 10.9 Freemium: free 1 misión → segunda bloqueada con paywall sniper; cobro 5 créditos solo al crear; alertas no descuentan.
+- [ ] 10.10 Presupuesto: 30 misiones simuladas → pasada respeta `SNIPER_BUDGET_S` y reparte por `last_run_at`.
+- [ ] 10.11 REGRESIÓN: `/analizar` v4, `/ideal`, `/comparar`, `/tasar` y ciclo health intactos.
+
+## 11. Despliegue
+
+- [ ] 11.1 Deploy con `ENABLE_SNIPER=false`; verificar regresión en prod.
+- [ ] 11.2 `ENABLE_SNIPER=true` con misión admin 48h; validar snapshot/dedup/latencia/cuenta.
+- [ ] 11.3 Abrir a usuarios + publicar vídeo solo tras 1-3 probados.
+- [ ] 11.4 Actualizar CLAUDE.md (roadmap S7 cubierta, tono/arquitectura) y `openspec/project.md`.

@@ -1,8 +1,9 @@
 # database.py - Gestión de SQLite para misiones de monitoreo + usuarios
 import sqlite3
 import json
+import hashlib
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from config import DB_PATH, ALLOWED_USER_IDS, FREE_CREDITOS, PAID_CREDITOS_PACK_10, PAID_CREDITOS_PACK_100
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,26 @@ def init_db():
             conn.execute("DROP TABLE misiones_old")
         conn.commit()
 
+        # Migración misiones v2 (sniper Alemania): columnas aditivas.
+        for col, ddl in [
+            ("marca",             "TEXT    DEFAULT ''"),
+            ("modelo",            "TEXT    DEFAULT ''"),
+            ("umbral_margen_eur", "INTEGER DEFAULT 0"),
+            ("umbral_margen_pct", "REAL    DEFAULT 0"),
+            ("expira_at",         "TEXT    DEFAULT ''"),
+            ("snapshot_sembrado", "INTEGER DEFAULT 0"),
+            ("last_run_at",       "TEXT    DEFAULT ''"),
+            ("alertas_total",     "INTEGER DEFAULT 0"),
+            ("ultimo_error",      "TEXT    DEFAULT ''"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE misiones ADD COLUMN {col} {ddl}")
+            except sqlite3.OperationalError:
+                pass  # Ya existe
+        # NOTA: la expiración de misiones legacy (pre-v2) se hará al activar el
+        # worker v2 (grupo 6), no aquí, para que esta migración sea 100% aditiva.
+        conn.commit()
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS oportunidades_enviadas (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,6 +120,9 @@ def init_db():
             # Plan A: créditos diarios unificados
             ("creditos_disponibles",   "INTEGER DEFAULT 3"),
             ("ultimo_reset_diario",    "TEXT    DEFAULT ''"),
+            # Deep links / captación (sniper Alemania)
+            ("fuente_captacion",       "TEXT    DEFAULT ''"),
+            ("fuente_captacion_at",    "TEXT    DEFAULT ''"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE usuarios ADD COLUMN {col} {ddl}")
@@ -171,6 +195,67 @@ def init_db():
             )
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_eideal_user ON eventos_ideal(user_id)")
+
+        # ── SNIPER ALEMANIA ──────────────────────────────────────────────────
+        # Snapshot + alertas: dedup Y dataset del "caso real del sniper".
+        # tipo ∈ {'snapshot','alerta'}. UNIQUE(mision_id, anuncio_id) hace de dedup.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS alertas_enviadas (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                mision_id   INTEGER NOT NULL,
+                anuncio_id  TEXT    NOT NULL,
+                huella      TEXT    DEFAULT '',
+                tipo        TEXT    DEFAULT 'alerta',
+                precio      REAL    DEFAULT 0,
+                margen_eur  REAL    DEFAULT 0,
+                margen_pct  REAL    DEFAULT 0,
+                url         TEXT    DEFAULT '',
+                ts          TEXT    NOT NULL,
+                UNIQUE(mision_id, anuncio_id)
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_alertas_mision ON alertas_enviadas(mision_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_alertas_huella ON alertas_enviadas(huella)")
+
+        # Valoración de mercado ES cacheada por modelo+año+banda de km.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS valoraciones_mercado (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                marca          TEXT    NOT NULL,
+                modelo         TEXT    NOT NULL,
+                año            INTEGER NOT NULL,
+                km_banda       INTEGER NOT NULL,
+                mediana        REAL    DEFAULT 0,
+                n_comparables  INTEGER DEFAULT 0,
+                precios_json   TEXT    DEFAULT '[]',
+                actualizado_at TEXT    NOT NULL,
+                UNIQUE(marca, modelo, año, km_banda)
+            )
+        """)
+
+        # Embudo de conversión genérico (start → misión → alerta → pago).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS eventos (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id  INTEGER NOT NULL,
+                evento   TEXT    NOT NULL,
+                meta     TEXT    DEFAULT '',
+                ts       TEXT    NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_eventos_evento ON eventos(evento)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_eventos_user   ON eventos(user_id)")
+
+        # Estado de fuentes DE para el circuit breaker (persistido → sobrevive reinicios).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS estado_fuentes (
+                fuente           TEXT PRIMARY KEY,
+                fallos_seguidos  INTEGER DEFAULT 0,
+                pausada_hasta    TEXT    DEFAULT '',
+                scrapes_hora_json TEXT   DEFAULT '[]'
+            )
+        """)
+
         conn.commit()
 
 
@@ -626,15 +711,30 @@ def scanner_marcar_enviado(coche_id: str):
 # ─── HISTÓRICO DE PRECIOS ────────────────────────────────────────────────────
 
 def purgar_historico_antiguo(dias: int = 180) -> int:
-    """Elimina entradas de historico_precios anteriores a N días. Devuelve filas borradas."""
+    """
+    Elimina entradas anteriores a N días de historico_precios y, de paso, de las
+    tablas del sniper que crecen sin parar (alertas_enviadas, eventos).
+    Devuelve filas borradas de historico_precios (compat con llamadas existentes).
+    """
+    n = 0
     try:
         with get_conn() as conn:
             cur = conn.execute(
                 "DELETE FROM historico_precios WHERE capturado_at < datetime('now', ?)",
                 (f"-{dias} days",),
             )
-            conn.commit()
             n = cur.rowcount
+            # Purga de tablas sniper (columna ts). Purgar dedup viejo es seguro:
+            # un anuncio vivo >180 días re-alertando una vez es irrelevante.
+            for tabla in ("alertas_enviadas", "eventos"):
+                try:
+                    conn.execute(
+                        f"DELETE FROM {tabla} WHERE ts < datetime('now', ?)",
+                        (f"-{dias} days",),
+                    )
+                except sqlite3.OperationalError:
+                    pass  # tabla aún no creada en BDs antiguas
+            conn.commit()
             if n:
                 logger.info(f"[HIST] Purgados {n} registros con más de {dias} días")
             return n

@@ -30,7 +30,24 @@
       "Bash(echo \"exit=$?\")",
       "PowerShell(Get-CimInstance Win32_Process -Filter \"Name='python.exe' and ProcessId=22276 or Name='python.exe' and ProcessId=4356\")",
       "Bash(taskkill //PID 4356 //F)",
-      "Bash(timeout 3 cat \"C:\\\\Users\\\\Juan\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-Juan-Documents-cabeza-bot\\\\03d8b383-d7d0-46d2-85ba-ee94c9e8a8a9\\\\tasks\\\\bohwa18i3.output\")"
+      "Bash(timeout 3 cat \"C:\\\\Users\\\\Juan\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-Juan-Documents-cabeza-bot\\\\03d8b383-d7d0-46d2-85ba-ee94c9e8a8a9\\\\tasks\\\\bohwa18i3.output\")",
+      "Bash(grep -iE \"\\\\.db\\($|-\\)\")",
+      "Bash(git rm *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "PowerShell(openspec new change \"sniper-alemania\")",
+      "PowerShell(openspec status --change \"sniper-alemania\" --json)",
+      "PowerShell(openspec instructions proposal --change \"sniper-alemania\" --json)",
+      "PowerShell(openspec instructions design --change \"sniper-alemania\" --json)",
+      "PowerShell(openspec instructions specs --change \"sniper-alemania\" --json)",
+      "PowerShell(openspec instructions tasks --change \"sniper-alemania\" --json)",
+      "PowerShell(openspec validate \"sniper-alemania\" --strict)",
+      "PowerShell(openspec status --change \"sniper-alemania\")",
+      "Bash(git checkout *)",
+      "Bash(python -c \"import config; print\\('config OK', config.ENABLE_SNIPER, config.COSTES_FIJOS_IMPORTACION, config.MISIONES_MAX, config.COSTE_SNIPER_PAID\\)\")",
+      "Bash(python -m py_compile main.py)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('database.py',encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('config.py',encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('permisos.py',encoding='utf-8'\\).read\\(\\)\\); print\\('SYNTAX OK los 3'\\)\")"
     ]
   }
 }

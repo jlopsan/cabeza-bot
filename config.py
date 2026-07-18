@@ -92,8 +92,49 @@ ANALISIS_CACHE_TTL_S  = int(os.getenv("ANALISIS_CACHE_TTL_S", "1800"))   # 30 mi
 HISTORICO_RETENCION_DIAS = int(os.getenv("HISTORICO_RETENCION_DIAS", "180"))
 
 # ─── WORKER ──────────────────────────────────────────────────────────────────
-WORKER_INTERVAL_MINUTES    = 15    # misiones normales
-SNIPER_INTERVAL_MINUTES    = 3     # misiones sniper (alertas rápidas)
+WORKER_INTERVAL_MINUTES    = 15    # misiones normales (legacy, en retirada)
+SNIPER_INTERVAL_MINUTES    = int(os.getenv("SNIPER_INTERVAL_MINUTES", "3"))
+
+# ─── SNIPER ALEMANIA ─────────────────────────────────────────────────────────
+# Feature flag: en prod arrancar en false hasta publicar el vídeo.
+ENABLE_SNIPER = os.getenv("ENABLE_SNIPER", "false").lower() in ("1", "true", "yes")
+
+# Umbral doble de alerta (deben cumplirse ambos). Editable por misión.
+SNIPER_UMBRAL_EUR = int(os.getenv("SNIPER_UMBRAL_EUR", "1500"))
+SNIPER_UMBRAL_PCT = float(os.getenv("SNIPER_UMBRAL_PCT", "10"))
+
+# Máximo de alertas por misión y pasada (anti-spam).
+SNIPER_ALERTAS_PASADA = int(os.getenv("SNIPER_ALERTAS_PASADA", "3"))
+
+# Presupuesto y caps del ciclo.
+SNIPER_BUDGET_S        = int(os.getenv("SNIPER_BUDGET_S", "150"))
+SNIPER_MAX_SCRAPES_HORA = int(os.getenv("SNIPER_MAX_SCRAPES_HORA", "60"))
+
+# Circuit breaker por fuente DE.
+SNIPER_CB_FALLOS   = int(os.getenv("SNIPER_CB_FALLOS", "3"))
+SNIPER_CB_PAUSA_MIN = int(os.getenv("SNIPER_CB_PAUSA_MIN", "30"))
+
+# Vida de una misión sin renovar.
+SNIPER_MISION_DIAS = int(os.getenv("SNIPER_MISION_DIAS", "30"))
+
+# Valoración de mercado ES cacheada.
+VALORACION_TTL_H   = int(os.getenv("VALORACION_TTL_H", "12"))
+VALORACION_KM_BANDA = int(os.getenv("VALORACION_KM_BANDA", "20000"))  # ancho de banda de km
+
+# Páginas de la fase de detección (listado AS24 ordenado por reciente).
+SNIPER_DETECCION_PAGINAS = int(os.getenv("SNIPER_DETECCION_PAGINAS", "2"))
+
+# ─── FREEMIUM SNIPER ─────────────────────────────────────────────────────────
+# Coste por tier al crear misión. free = 1 crédito UNA sola vez de por vida;
+# paid = 5 por misión; pro no descuenta (dormido).
+COSTE_SNIPER_FREE = int(os.getenv("COSTE_SNIPER_FREE", "1"))
+COSTE_SNIPER_PAID = int(os.getenv("COSTE_SNIPER_PAID", "5"))
+# Máximo de misiones ACTIVAS por tier.
+MISIONES_MAX = {
+    "free": int(os.getenv("MISIONES_MAX_FREE", "1")),
+    "paid": int(os.getenv("MISIONES_MAX_PAID", "3")),
+    "pro":  int(os.getenv("MISIONES_MAX_PRO", "999")),
+}
 
 # ─── SCANNER (gancho gratuito) ──────────────────────────────────────────────
 SCANNER_CHANNEL_ID = os.getenv("SCANNER_CHANNEL_ID", "")  # @tu_canal o -100XXXX
@@ -114,17 +155,55 @@ SCANNER_MODELS = [
     ("audi", "q5", {"year_min": 2018, "km_max": 120000}),
 ]
 
-# ─── COSTES FIJOS IMPORTACIÓN (€) ────────────────────────────────────────────
+# ─── COSTES FIJOS IMPORTACIÓN (€) — LEGACY (calculator + scanner + worker) ────
+# NO tocar los valores: los usan scanner.py y el cálculo legacy en producción.
 COSTE_TRANSPORTE   = 1_200
 COSTE_GESTORIA_ITV =   350
 
+# ─── COSTES FIJOS SNIPER (€) — cuenta de importación v2 (aislada del legacy) ──
+# Desglose granular 2026 (env-configurable). Solo los usa la cuenta del sniper.
+SNIPER_COSTE_TRANSPORTE   = int(os.getenv("SNIPER_COSTE_TRANSPORTE", "1000"))
+SNIPER_COSTE_COC_GESTION  = int(os.getenv("SNIPER_COSTE_COC_GESTION", "400"))
+SNIPER_COSTE_HOMOLOG_ITV  = int(os.getenv("SNIPER_COSTE_HOMOLOG_ITV", "300"))
+SNIPER_COSTE_TASAS_DGT    = int(os.getenv("SNIPER_COSTE_TASAS_DGT", "100"))
+
+# Suma de costes fijos de importación que usa la cuenta del sniper.
+SNIPER_COSTES_FIJOS = (
+    SNIPER_COSTE_TRANSPORTE + SNIPER_COSTE_COC_GESTION
+    + SNIPER_COSTE_HOMOLOG_ITV + SNIPER_COSTE_TASAS_DGT
+)
+
 # ─── TRAMOS IEDMT ────────────────────────────────────────────────────────────
+# Tipos vigentes 2026 según emisiones CO₂ (g/km). La base imponible en usados
+# es el VALOR DE MERCADO del vehículo (proxy: mediana de comparables ES),
+# NUNCA el precio de compra en Alemania.
 IEDMT_TRAMOS = [
     (120,          0.0000),
     (159,          0.0475),
     (199,          0.0975),
     (float("inf"), 0.1475),
 ]
+
+# ─── HEURÍSTICA CO₂ DETERMINISTA (sin IA) ────────────────────────────────────
+# g/km típicos por combustible cuando el anuncio no expone CO₂. Se ajusta por
+# antigüedad en calculator.estimar_co2_deterministico. Valores conservadores
+# (tiran a alza) para no infra-estimar el IEDMT.
+CO2_TIPICO_POR_COMBUSTIBLE = {
+    "diesel":     150,
+    "gasolina":   165,
+    "hibrido":    110,
+    "phev":        45,
+    "electrico":    0,
+    "glp":        155,
+    "gnc":        140,
+}
+CO2_TIPICO_DEFAULT = 160  # combustible desconocido → tramo medio-alto
+
+# ─── NUEVO FISCAL (IVA) ──────────────────────────────────────────────────────
+# Un vehículo es "nuevo fiscal" (IVA español aplicable) si < 6 meses O < 6.000 km.
+NUEVO_FISCAL_KM_MAX     = int(os.getenv("NUEVO_FISCAL_KM_MAX", "6000"))
+NUEVO_FISCAL_MESES_MAX  = int(os.getenv("NUEVO_FISCAL_MESES_MAX", "6"))
+IVA_ES_PCT              = 0.21
 
 # ─── LÓGICA DE NEGOCIO ───────────────────────────────────────────────────────
 MIN_BENEFICIO = 3_000
