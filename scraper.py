@@ -121,12 +121,15 @@ def _resolver_extras_aex(extras_usuario: list[str]) -> tuple[list[str], list[str
 
 def _detectar_combustible_titulo(titulo: str) -> str:
     t = titulo.lower()
-    if any(x in t for x in ["tdi", "diesel", "cdi", "hdi", "dci", "jtd"]):
+    if any(x in t for x in ["tdi", "diesel", "diésel", "cdi", "hdi", "dci", "jtd", "cdti", "bluetec"]):
         return "diesel"
-    if any(x in t for x in ["electric", "ev", "e-tron", "ioniq", "id.", "model 3"]):
-        return "electrico"
-    if any(x in t for x in ["hybrid", "phev", "tfsi e", "plug-in"]):
+    # Híbrido ANTES que eléctrico: "e-hybrid"/"phev" son híbridos, no BEV.
+    if any(x in t for x in ["phev", "plug-in", "plugin", "e-hybrid", "tfsi e", "hybrid", "híbrido", "hibrido"]):
         return "hibrido"
+    if any(x in t for x in ["elektr", "electric", "e-golf", "e-up", "e-tron", "e-niro", "e-soul",
+                             "id.3", "id.4", "id.5", "id.", "ioniq", "model 3", "model y",
+                             "zoe", "leaf", "bev", "kwh", " ev "]):
+        return "electrico"
     return "gasolina"
 
 
@@ -847,9 +850,20 @@ class ScraperAutoScout24(ScraperDE):
                 if datos:
                     coche["caja"]        = _normalizar_caja_de(datos.get("caja", "")) or coche.get("caja", "")
                     coche["combustible"] = _normalizar_combustible_de(datos.get("combustible", "")) or coche.get("combustible", "")
-                    pot = _parse_numero(datos.get("potencia", "") or "0")
-                    if pot > 0:
-                        coche["cv"] = int(pot)
+                    # Potencia: AS24 muestra "85 kW (116 PS)". Preferimos los PS;
+                    # si solo hay kW, convertimos (1 kW ≈ 1,36 CV).
+                    pot_txt = datos.get("potencia", "") or ""
+                    m_ps = re.search(r"(\d{2,4})\s*PS", pot_txt)
+                    if m_ps:
+                        coche["cv"] = int(m_ps.group(1))
+                    elif "kw" in pot_txt.lower():
+                        kw = _parse_numero(pot_txt)
+                        if kw > 0:
+                            coche["cv"] = round(kw * 1.35962)
+                    else:
+                        n = _parse_numero(pot_txt)
+                        if n > 0:
+                            coche["cv"] = int(n)
                     prop = _parse_numero(datos.get("propietarios", "") or "0")
                     if prop > 0:
                         coche["propietarios"] = int(prop)
@@ -859,6 +873,10 @@ class ScraperAutoScout24(ScraperDE):
                 logger.debug(f"[AS24] Detalle candidato falló {link}: {e}")
             finally:
                 await browser.close()
+        # Fallback de combustible por título (clave para el IEDMT si falta CO₂:
+        # un eléctrico paga 0%, no el tramo por defecto).
+        if not coche.get("combustible"):
+            coche["combustible"] = _detectar_combustible_titulo(coche.get("titulo", ""))
         return coche
 
 
