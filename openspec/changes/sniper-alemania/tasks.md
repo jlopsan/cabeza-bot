@@ -33,7 +33,7 @@ Si no cabe todo, cerrar en este orden. El vídeo NO sale hasta que 1-3 estén pr
 - [x] 2.4 Tabla `valoraciones_mercado(marca, modelo, año, km_banda, mediana, n_comparables, precios_json, actualizado_at)` con `UNIQUE(marca, modelo, año, km_banda)`.
 - [x] 2.5 Tabla `eventos(id, user_id, evento, meta, ts)` + índice por `evento`.
 - [x] 2.6 Tabla `estado_fuentes(fuente, fallos_seguidos, pausada_hasta, scrapes_hora_json)`.
-- [~] 2.7 Migración de datos: `expirar_misiones_legacy()` escrita; se INVOCA en el arranque del worker v2 (grupo 6), no en `init_db` (para que la migración sea 100% aditiva).
+- [x] 2.7 Migración de datos: `expirar_misiones_legacy()` invocada en el arranque del worker v2 (`ciclo_worker`), no en `init_db` (migración 100% aditiva).
 - [x] 2.8 Funciones DB misiones v2: `crear_mision_sniper`, `obtener_mision`, `obtener_misiones_sniper_activas`, `contar_misiones_activas`, `renovar_mision`, `editar_umbral_mision`, `set_mision_run`, `marcar_snapshot_sembrado`, `incr_alertas_mision`, `expirar_misiones_vencidas` (reusa `pausar/activar/eliminar/obtener_misiones_usuario`).
 - [x] 2.9 Funciones DB dedup/snapshot: `huella_anuncio`, `anuncio_ya_visto`, `huella_vista_reciente`, `registrar_visto` (snapshot y alerta), `sembrar_snapshot`.
 - [x] 2.10 Funciones DB valoración: `get_valoracion`, `upsert_valoracion`, `valoracion_caducada`.
@@ -70,14 +70,14 @@ Si no cabe todo, cerrar en este orden. El vídeo NO sale hasta que 1-3 estén pr
 
 ## 6. Worker (worker.py)
 
-- [ ] 6.1 Reescribir `_ciclo_sniper`: respeta `ENABLE_SNIPER`, circuit breaker (pausa si `pausada_hasta`), cap scrapes/hora, presupuesto `SNIPER_BUDGET_S`, orden por `last_run_at` ASC.
-- [ ] 6.2 Agrupar misiones activas por `clave_scrapeo`; un scrapeo por clave por pasada.
-- [ ] 6.3 Por clave: detección (fase 1) → por misión del grupo: snapshot inicial si no sembrado, si no detectar nuevos → pre-filtro margen → fase 2 solo candidatos → evaluar → alertar (máx `SNIPER_ALERTAS_PASADA`).
-- [ ] 6.4 Refresco de valoración: máx 1 caducada por pasada; candidatos sin valoración fresca no se marcan vistos.
-- [ ] 6.5 Actualizar `last_run_at`, `alertas_total`, `ultimo_error`; `expirar_vencidas` al inicio de pasada.
-- [ ] 6.6 Circuit breaker: `fallo` → `incr_fallo_fuente`; a `SNIPER_CB_FALLOS` → `pausada_hasta`; `ok` → `reset_fuente`; `vacio` no cuenta.
-- [ ] 6.7 Registrar evento `alerta_enviada` por alerta.
-- [ ] 6.8 Eliminar `_ciclo_normal`, `procesar_mision` legacy, `_get_beneficio_coche`; `_ciclo_health` intacto; `gather` = sniper + health.
+- [x] 6.1 `_ciclo_sniper` + `_pasada_sniper`: respeta `ENABLE_SNIPER` (dormido si false), circuit breaker (`fuente_pausada`), cap scrapes/hora, presupuesto `SNIPER_BUDGET_S`, orden por `last_run_at` ASC.
+- [x] 6.2 Agrupa misiones activas por `sp.clave_scrapeo`; un `buscar_deteccion` por clave por pasada.
+- [x] 6.3 Por clave: detección → por misión: siembra si no sembrado, si no `filtrar_nuevos` → pre-filtro margen → `obtener_detalle_candidato` solo candidatos → re-evaluar → alertar (máx `SNIPER_ALERTAS_PASADA`, resto visto).
+- [x] 6.4 Refresco de valoración máx 1 por pasada (`refrescos`); candidatos sin valoración fresca NO se marcan vistos (se reevalúan la próxima pasada).
+- [x] 6.5 `set_mision_run` (last_run_at/ultimo_error), `incr_alertas_mision`; `expirar_misiones_vencidas` al inicio de pasada.
+- [x] 6.6 Circuit breaker: `fallo` → `incr_fallo_fuente`; a `SNIPER_CB_FALLOS` → pausa y corta pasada; `ok`/`vacio` → `reset_fuente`.
+- [x] 6.7 `registrar_evento_embudo(user, 'alerta_enviada', ...)` por alerta.
+- [x] 6.8 Eliminados `_ciclo_normal`, `procesar_mision` legacy, `_get_beneficio_coche`; `_ciclo_health` intacto; `gather` = sniper + health. `expirar_misiones_legacy()` al arranque (tarea 2.7).
 
 ## 7. Bot — flujo /sniper (main.py)
 

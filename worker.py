@@ -1,31 +1,34 @@
-# worker.py - Proceso en segundo plano para monitoreo de misiones activas (v3)
+# worker.py - Daemon en segundo plano (v4 — sniper Alemania)
 #
-# Cambios v3:
-#   - Dos ciclos: normal (15 min) + sniper (3 min)
-#   - Sniper Score en alertas
-#   - Usa buscar_y_cruzar() multi-fuente
+# Ciclos:
+#   - sniper (cada SNIPER_INTERVAL_MINUTES): misiones v2 de vigilancia DE→ES.
+#     Agrupa misiones por clave de scrapeo, respeta presupuesto por pasada,
+#     circuit breaker por fuente y cap de scrapes/hora. CERO IA, CERO scraping ES
+#     en el ciclo (usa valoraciones cacheadas; refresca máx 1 por pasada).
+#   - health (diario): sonda de fuentes ES + purga de histórico.
+#
+# Todo el estado vive en SQLite: reinicio del worker no re-alerta ni pierde snapshot.
 #
 import asyncio
-import json
 import logging
+import time
 
 import httpx
 
 from config import (
-    TELEGRAM_TOKEN, WORKER_INTERVAL_MINUTES, SNIPER_INTERVAL_MINUTES,
-    TOP_RESULTS, MIN_BENEFICIO,
+    TELEGRAM_TOKEN, ENABLE_SNIPER,
+    SNIPER_INTERVAL_MINUTES, SNIPER_BUDGET_S, SNIPER_MAX_SCRAPES_HORA,
+    SNIPER_CB_FALLOS, SNIPER_CB_PAUSA_MIN, SNIPER_ALERTAS_PASADA,
 )
 from database import (
-    init_db, obtener_misiones_activas,
-    ya_enviada, marcar_enviada,
-    purgar_historico_antiguo,
+    init_db, purgar_historico_antiguo,
+    expirar_misiones_legacy, expirar_misiones_vencidas,
+    obtener_misiones_sniper_activas, set_mision_run, incr_alertas_mision,
+    fuente_pausada, incr_fallo_fuente, reset_fuente,
+    incr_scrape_hora, scrapes_ultima_hora, registrar_evento_embudo,
 )
-from scraper import buscar_y_cruzar, buscar_coches_alemania, buscar_comparables_todas
-from calculator import (
-    calcular_landing_price, calcular_beneficio, formato_tarjeta,
-    calcular_sniper_score, formato_sniper_score,
-)
-from ai import parsear_modelo_nl
+from scraper import buscar_comparables_todas, ScraperAutoScout24
+import sniper_pipeline as sp
 
 logging.basicConfig(
     format="%(asctime)s [WORKER] %(levelname)s - %(message)s",
@@ -34,143 +37,183 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+FUENTE_DE = "autoscout24"
 
 
-async def _send(chat_id: int, texto: str, foto_url: str | None = None):
+async def _send(chat_id: int, texto: str, reply_markup: dict | None = None):
+    payload = {
+        "chat_id": chat_id, "text": texto,
+        "parse_mode": "HTML", "disable_web_page_preview": True,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
     async with httpx.AsyncClient(timeout=15) as client:
-        if foto_url:
-            r = await client.post(f"{TELEGRAM_API}/sendPhoto", json={
-                "chat_id": chat_id, "photo": foto_url,
-                "caption": texto, "parse_mode": "HTML",
-            })
-        else:
-            r = await client.post(f"{TELEGRAM_API}/sendMessage", json={
-                "chat_id": chat_id, "text": texto,
-                "parse_mode": "HTML", "disable_web_page_preview": False,
-            })
+        r = await client.post(f"{TELEGRAM_API}/sendMessage", json=payload)
         if not r.is_success:
             logger.error(f"Telegram error {r.status_code}: {r.text[:200]}")
 
 
-def _parse_filtros(mision: dict) -> dict:
-    try:
-        return json.loads(mision.get("filtros", "{}") or "{}")
-    except (json.JSONDecodeError, TypeError):
-        return {}
+# ════════════════════════════════════════════════════════════════════════════
+# CICLO SNIPER
+# ════════════════════════════════════════════════════════════════════════════
 
+async def _procesar_mision(mision: dict, anuncios: list[dict], refrescos: int) -> int:
+    """
+    Evalúa los anuncios de la clave contra una misión. Devuelve el nº de refrescos
+    de valoración acumulados en la pasada (para respetar el máx 1 por pasada).
+    """
+    mid    = mision["id"]
+    marca  = mision["marca"]
+    modelo = mision["modelo"]
+    umbral_eur = mision.get("umbral_margen_eur") or 0
+    umbral_pct = mision.get("umbral_margen_pct") or 0
 
-def _get_precio_objetivo(mision: dict) -> float | None:
-    v = mision.get("precio_objetivo_es")
-    if v is None:
-        return None
-    try:
-        return float(v)
-    except (ValueError, TypeError):
-        return None
+    # Primera pasada: sembrar snapshot SIN alertar.
+    if sp.necesita_siembra(mision):
+        n = sp.sembrar(mision, anuncios)
+        set_mision_run(mid)
+        logger.info(f"[SNIPER] Misión #{mid} sembrada ({n} anuncios), sin alertas")
+        return refrescos
 
+    nuevos = sp.filtrar_nuevos(mision, anuncios)
+    if not nuevos:
+        set_mision_run(mid)
+        return refrescos
 
-def _get_beneficio_coche(coche: dict, precio_objetivo: float | None) -> float:
-    calc = calcular_landing_price(coche["precio"], coche.get("co2", 0))
-    precio_es = precio_objetivo if precio_objetivo is not None else coche.get("precio_medio_es", 0)
-    return calcular_beneficio(calc["landing_price"], precio_es)["beneficio"]
+    alertas = 0
+    for anuncio in nuevos:
+        año = anuncio.get("año", 0)
+        km  = anuncio.get("km", 0)
 
+        # Valoración: fresca de caché, o refresco (máx 1 por pasada global).
+        v = sp.valoracion_fresca(marca, modelo, año, km)
+        if v is None:
+            if refrescos >= 1:
+                continue  # sin marcar visto: se evalúa en la próxima pasada
+            v = await sp.refrescar_valoracion(marca, modelo, año, km)
+            refrescos += 1
+            if v is None:
+                sp.marcar_visto(mid, anuncio, tipo="snapshot")  # sin comparables: no reintentar
+                continue
 
-async def procesar_mision(mision: dict, es_sniper: bool = False):
-    mision_id       = mision["id"]
-    user_id         = mision["user_id"]
-    query           = mision["query_modelo"]
-    precio_objetivo = _get_precio_objetivo(mision)
-    ids_rechazados  = json.loads(mision.get("ids_rechazados", "[]") or "[]")
-    filtros         = _parse_filtros(mision)
-    modo            = "manual" if precio_objetivo is not None else "auto"
+        # Pre-filtro con datos del listado (CO₂ estimado) para no bajar a detalle en balde.
+        pre = sp.evaluar_candidato(anuncio, v, umbral_eur, umbral_pct)
+        if not pre["alerta"]:
+            sp.marcar_visto(mid, anuncio, tipo="snapshot", cuenta=pre["cuenta"])
+            continue
 
-    label = "🎯 SNIPER" if es_sniper else "📋 NORMAL"
-    logger.info(f"[{label}] Misión #{mision_id} ({query}) — modo: {modo}")
+        # Fase 2: detalle real (CO₂, Netto, propietarios…) y re-evaluación.
+        anuncio = await ScraperAutoScout24().obtener_detalle_candidato(anuncio)
+        final = sp.evaluar_candidato(anuncio, v, umbral_eur, umbral_pct)
+        if not final["alerta"]:
+            sp.marcar_visto(mid, anuncio, tipo="snapshot", cuenta=final["cuenta"])
+            continue
 
-    # Parsear marca/modelo con IA
-    parsed = await parsear_modelo_nl(query)
-    marca  = parsed.get("marca") or query.split()[0]
-    modelo = parsed.get("modelo") or (query.split(maxsplit=1)[1] if len(query.split()) > 1 else query)
+        # Tope de alertas por misión/pasada: el resto se registra visto sin alertar.
+        if alertas >= SNIPER_ALERTAS_PASADA:
+            sp.marcar_visto(mid, anuncio, tipo="snapshot", cuenta=final["cuenta"])
+            continue
 
-    # Scraping multi-fuente
-    if modo == "auto":
-        coches = await buscar_y_cruzar(marca, modelo, filtros)
-    else:
-        coches = await buscar_coches_alemania(marca, modelo, filtros)
-
-    if not coches:
-        logger.info(f"Misión #{mision_id}: sin resultados.")
-        return
-
-    # Filtrar rechazados y ya notificados
-    coches_nuevos = [
-        c for c in coches
-        if c["id"] not in ids_rechazados and not ya_enviada(mision_id, c["id"])
-    ]
-
-    if not coches_nuevos:
-        logger.info(f"Misión #{mision_id}: no hay coches nuevos.")
-        return
-
-    # Seleccionar oportunidades
-    oportunidades = [
-        c for c in coches_nuevos
-        if _get_beneficio_coche(c, precio_objetivo) >= MIN_BENEFICIO
-    ]
-
-    if not oportunidades:
-        mejor = max(coches_nuevos, key=lambda c: _get_beneficio_coche(c, precio_objetivo))
-        mejor_b = _get_beneficio_coche(mejor, precio_objetivo)
-        logger.info(f"Misión #{mision_id}: mejor={mejor_b:,.0f}€ (umbral: {MIN_BENEFICIO:,}€)")
-        return
-
-    oportunidades.sort(key=lambda c: _get_beneficio_coche(c, precio_objetivo), reverse=True)
-    oportunidades = oportunidades[:TOP_RESULTS]
-
-    # Enviar alertas
-    fuentes = set(c.get("fuente", "?") for c in oportunidades)
-    urgencia = "🚨🚨 <b>¡ALERTA SNIPER!</b>" if es_sniper else "🚨 <b>¡OPORTUNIDAD DETECTADA!</b>"
-    cabecera = (
-        f"{urgencia}\n"
-        f"📋 Misión #{mision_id} — {query}\n"
-        f"📡 Fuentes: {' + '.join(fuentes)}\n"
-        f"{'─' * 32}"
-    )
-    await _send(user_id, cabecera)
-
-    for coche in oportunidades:
-        tarjeta = formato_tarjeta(coche, precio_objetivo)
-        score = calcular_sniper_score(coche, precio_objetivo)
-        score_txt = formato_sniper_score(score)
-        texto = f"{tarjeta}\n\n{score_txt}"
-
-        await _send(user_id, texto, foto_url=coche.get("foto"))
-        marcar_enviada(mision_id, coche["id"])
-        logger.info(f"Misión #{mision_id}: notificado {coche['id']} (Score: {score['sniper_score']})")
+        texto = sp.render_tarjeta_alerta(anuncio, v, final["cuenta"], mid)
+        await _send(mision["user_id"], texto, reply_markup=sp.boton_ver_anuncio(anuncio.get("link", "")))
+        sp.marcar_visto(mid, anuncio, tipo="alerta", cuenta=final["cuenta"])
+        incr_alertas_mision(mid, 1)
+        registrar_evento_embudo(
+            mision["user_id"], "alerta_enviada",
+            f"mision={mid};margen={final['cuenta']['margen_eur']:.0f}",
+        )
+        alertas += 1
+        logger.info(f"[SNIPER] Misión #{mid}: alerta {anuncio.get('id')} margen {final['cuenta']['margen_eur']:.0f}€")
         await asyncio.sleep(1.0)
 
+    set_mision_run(mid)
+    return refrescos
 
-async def _ciclo_normal():
-    """Revisa misiones normales cada WORKER_INTERVAL_MINUTES."""
-    while True:
-        misiones = obtener_misiones_activas(prioridad="normal")
-        logger.info(f"[NORMAL] Misiones activas: {len(misiones)}")
-        for mision in misiones:
+
+async def _pasada_sniper():
+    """Una pasada del ciclo sniper. Agrupa por clave, respeta presupuesto y breaker."""
+    expiradas = expirar_misiones_vencidas()
+    if expiradas:
+        logger.info(f"[SNIPER] {expiradas} misiones expiradas")
+
+    misiones = obtener_misiones_sniper_activas()
+    if not misiones:
+        return
+
+    if fuente_pausada(FUENTE_DE):
+        logger.warning("[SNIPER] AutoScout24 pausada (circuit breaker); salto pasada")
+        return
+
+    # Agrupar misiones por clave de scrapeo (filtros equivalentes → un scrapeo).
+    grupos: dict[str, list[dict]] = {}
+    for m in misiones:
+        grupos.setdefault(sp.clave_scrapeo(m), []).append(m)
+
+    # Orden por la misión más olvidada del grupo (round-robin justo).
+    claves = sorted(grupos, key=lambda k: min((mm.get("last_run_at") or "") for mm in grupos[k]))
+    logger.info(f"[SNIPER] {len(misiones)} misiones en {len(claves)} claves de scrapeo")
+
+    inicio = time.monotonic()
+    refrescos = 0
+    for clave in claves:
+        if time.monotonic() - inicio > SNIPER_BUDGET_S:
+            logger.info("[SNIPER] Presupuesto de pasada agotado; resto en la próxima")
+            break
+        if scrapes_ultima_hora(FUENTE_DE) >= SNIPER_MAX_SCRAPES_HORA:
+            logger.warning("[SNIPER] Cap de scrapes/hora alcanzado; salto resto de pasada")
+            break
+        if fuente_pausada(FUENTE_DE):
+            break
+
+        grupo   = grupos[clave]
+        marca   = grupo[0]["marca"]
+        modelo  = grupo[0]["modelo"]
+        filtros = sp.filtros_mision(grupo[0])
+
+        incr_scrape_hora(FUENTE_DE)
+        anuncios, señal = await ScraperAutoScout24().buscar_deteccion(marca, modelo, filtros)
+
+        if señal == "fallo":
+            fallos, pausada = incr_fallo_fuente(FUENTE_DE, SNIPER_CB_FALLOS, SNIPER_CB_PAUSA_MIN)
+            logger.warning(f"[SNIPER] Fallo AS24 ({fallos}/{SNIPER_CB_FALLOS}) clave={clave}")
+            for m in grupo:
+                set_mision_run(m["id"], error="scrape_fallo")
+            if pausada:
+                logger.error(f"[SNIPER] Circuit breaker ABIERTO — pausa {SNIPER_CB_PAUSA_MIN} min")
+                break
+            continue
+
+        # 'ok' o 'vacio': la fuente respondió bien → sana.
+        reset_fuente(FUENTE_DE)
+        for m in grupo:
             try:
-                await procesar_mision(mision, es_sniper=False)
+                refrescos = await _procesar_mision(m, anuncios, refrescos)
             except Exception as e:
-                logger.error(f"Error misión #{mision['id']}: {e}", exc_info=True)
-        await asyncio.sleep(WORKER_INTERVAL_MINUTES * 60)
+                logger.error(f"[SNIPER] Misión #{m['id']} error: {e}", exc_info=True)
+                set_mision_run(m["id"], error=str(e)[:200])
 
+
+async def _ciclo_sniper():
+    if not ENABLE_SNIPER:
+        logger.info("[SNIPER] ENABLE_SNIPER=false — ciclo sniper dormido")
+        return
+    logger.info(f"[SNIPER] Ciclo activo cada {SNIPER_INTERVAL_MINUTES} min")
+    while True:
+        try:
+            await _pasada_sniper()
+        except Exception as e:
+            logger.error(f"[SNIPER] Pasada falló: {e}", exc_info=True)
+        await asyncio.sleep(SNIPER_INTERVAL_MINUTES * 60)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# CICLO HEALTH (diario) — sonda de fuentes ES + purga
+# ════════════════════════════════════════════════════════════════════════════
 
 _HEALTH_FUENTES_REF = {"wallapop": 0, "coches.net": 0}
 
 
 async def _ciclo_health():
-    """
-    Health check diario de fuentes ES. Lanza una búsqueda fija (Seat Ibiza 2018,
-    60.000 km) y loguea WARNING si alguna fuente devuelve <3 items.
-    """
     while True:
         try:
             items = await buscar_comparables_todas("Seat", "Ibiza", 2018, 60_000, n=20)
@@ -193,32 +236,19 @@ async def _ciclo_health():
         await asyncio.sleep(24 * 60 * 60)
 
 
-async def _ciclo_sniper():
-    """Revisa misiones sniper cada SNIPER_INTERVAL_MINUTES."""
-    while True:
-        misiones = obtener_misiones_activas(prioridad="sniper")
-        if misiones:
-            logger.info(f"[SNIPER] Misiones activas: {len(misiones)}")
-            for mision in misiones:
-                try:
-                    await procesar_mision(mision, es_sniper=True)
-                except Exception as e:
-                    logger.error(f"Error misión sniper #{mision['id']}: {e}", exc_info=True)
-        await asyncio.sleep(SNIPER_INTERVAL_MINUTES * 60)
-
-
 async def ciclo_worker():
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_TOKEN no configurado. Revisa tu archivo .env")
         return
     init_db()
-    logger.info(f"Worker v3 arrancado.")
-    logger.info(f"  Normal: cada {WORKER_INTERVAL_MINUTES} min | Sniper: cada {SNIPER_INTERVAL_MINUTES} min")
-    logger.info(f"  Fuentes DE: AutoScout24 + mobile.de | Fuentes ES: Wallapop + coches.net")
+    # Misiones legacy (pre-v2, sin marca parseada) no las procesa el ciclo v2.
+    n_legacy = expirar_misiones_legacy()
+    if n_legacy:
+        logger.info(f"[WORKER] {n_legacy} misiones legacy marcadas EXPIRADA")
+    logger.info("Worker v4 arrancado.")
+    logger.info(f"  Sniper: {'ON' if ENABLE_SNIPER else 'OFF'} (cada {SNIPER_INTERVAL_MINUTES} min) | Health: diario")
 
-    # Ejecutar ciclos en paralelo (normal + sniper + health diario)
     await asyncio.gather(
-        _ciclo_normal(),
         _ciclo_sniper(),
         _ciclo_health(),
     )
