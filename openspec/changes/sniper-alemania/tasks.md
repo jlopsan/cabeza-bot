@@ -61,12 +61,12 @@ Si no cabe todo, cerrar en este orden. El vídeo NO sale hasta que 1-3 estén pr
 
 ## 5. Pipeline sniper (sniper_pipeline.py — compartido bot+worker)
 
-- [ ] 5.1 `clave_scrapeo(mision)` → URL normalizada (delega en scraper 4.2).
-- [ ] 5.2 `valorar_mercado_es(marca, modelo, año, km)` → usa `buscar_comparables_todas` + `_calcular_stats_precios` de `/analizar`; upsert en `valoraciones_mercado`; persiste comparables en histórico.
-- [ ] 5.3 `evaluar_candidato(anuncio, valoracion)` → filtros → cuenta importación (calculator) → `{alerta: bool, margen, confianza}` con umbral doble €/%.
-- [ ] 5.4 `render_tarjeta_alerta(anuncio, valoracion, cuenta)` → formato del vídeo, `html.escape`, confianza 🟢/🟡/🔴, avisos IVA/Netto, botón "Ver anuncio", sin desglose si CO₂ estimado.
-- [ ] 5.5 `sembrar_snapshot(mision, anuncios)` y `detectar_nuevos(mision, anuncios)` (ID + huella).
-- [ ] 5.6 `confianza(n_comparables)` → ≥8 🟢, 4-7 🟡, <4 🔴 + texto de advertencia.
+- [x] 5.1 `clave_scrapeo(mision)` → URL normalizada (delega en `ScraperAutoScout24.url_deteccion_normalizada`).
+- [x] 5.2 `valoracion_fresca(...)` + `refrescar_valoracion(...)` → `buscar_comparables_todas` + mediana (statistics, sin importar main); upsert en `valoraciones_mercado`; persiste comparables en histórico. (Split get/refresh para el presupuesto del worker.)
+- [x] 5.3 `evaluar_candidato(anuncio, valoracion)` → cuenta importación (calculator) → `{alerta, cuenta, n_comparables}` con umbral doble €/%.
+- [x] 5.4 `render_tarjeta_alerta(...)` → formato del vídeo, `html.escape`, confianza 🟢/🟡/🔴, avisos IVA/Netto, `co2_estimado`, `boton_ver_anuncio`.
+- [x] 5.5 `sembrar` + `filtrar_nuevos` (ID + huella, re-publicación descartada) + `marcar_visto`.
+- [x] 5.6 `confianza(n)` → ≥8 🟢, 4-7 🟡, <4 🔴 + advertencia en tarjeta.
 
 ## 6. Worker (worker.py)
 
