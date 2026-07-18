@@ -49,8 +49,16 @@ from database import (
     get_o_crear_usuario, puede_analizar, registrar_analisis,
     registrar_evento, resumen_stats,
     puede_usar, registrar_uso,
+    crear_mision_sniper, obtener_mision, contar_misiones_activas,
+    contar_eventos, registrar_evento_embudo, set_fuente_captacion,
+    stats_sniper, renovar_mision,
 )
 from config import FREE_CREDITOS, PAID_CREDITOS_PACK_10, PAID_CREDITOS_PACK_100
+from config import (
+    ENABLE_SNIPER, COSTE_SNIPER_FREE, COSTE_SNIPER_PAID, MISIONES_MAX,
+    SNIPER_UMBRAL_EUR, SNIPER_UMBRAL_PCT, SNIPER_MISION_DIAS,
+)
+import sniper_pipeline as sp
 from scraper import (
     buscar_y_cruzar, buscar_coches_alemania,
     obtener_anuncio_por_url, buscar_comparables_todas,
@@ -122,6 +130,27 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     get_o_crear_usuario(user.id, user.username or "", user.first_name or "")
+
+    # Deep link: t.me/bot?start=<payload>. First-touch: guarda la fuente y
+    # registra el evento del embudo. Onboarding contextual si viene del sniper.
+    payload = (ctx.args[0] if ctx.args else "").strip()
+    if payload:
+        set_fuente_captacion(user.id, payload)
+        registrar_evento_embudo(user.id, "start", payload)
+
+    if payload.startswith("v_sniper"):
+        await update.message.reply_text(
+            "Hola 👋\n\n"
+            "Soy el bot de <b>Juan Lopera — Coches con cabeza</b>.\n\n"
+            "Vienes por el <b>sniper de coches alemanes</b> 🎯. Vigilo AutoScout24 "
+            "y te aviso cuando salga uno con margen para importar a España — "
+            "con la cuenta hecha (transporte, IEDMT, todo).\n\n"
+            "/sniper — Crea tu primera vigilancia\n"
+            "/analizar &lt;url&gt; — Analiza cualquier anuncio\n"
+            "/plan — Ver tu uso y plan",
+            parse_mode="HTML",
+        )
+        return
 
     await update.message.reply_text(
         "Hola 👋\n\n"
@@ -2910,6 +2939,338 @@ async def _pipeline_tasacion(marca, modelo, año, km, con_km, cv_obj, comb_obj, 
         registrar_uso(user_id, 1)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# /sniper — Vigilancia del mercado alemán (importadores)
+# ════════════════════════════════════════════════════════════════════════════
+
+_PROMPT_SNIPER = (
+    "🎯 <b>Nuevo sniper</b>\n\n"
+    "Dime qué vigilar en Alemania. <b>Marca y modelo</b>, y si quieres años, "
+    "km máx y precio máx.\n\n"
+    "Ej: <code>BMW 320d 2019-2021 hasta 25.000€ menos de 100.000 km</code>\n"
+    "Ej: <code>Audi A4 diésel automático del 2020</code>"
+)
+
+
+def _misiones_sniper_usuario(user_id: int) -> list[dict]:
+    return [m for m in obtener_misiones_usuario(user_id) if m.get("prioridad") == "sniper"]
+
+
+def _puede_crear_sniper(user_id: int) -> tuple[bool, str, int]:
+    """
+    Reglas de creación por tier. Devuelve (puede, motivo, coste).
+    motivo ∈ {'', 'free_usado', 'limite', 'creditos'}.
+    """
+    if user_id in ADMIN_USER_IDS:
+        return True, "", 0
+    u = obtener_usuario(user_id) or {}
+    tier     = u.get("tier", "free")
+    creditos = u.get("creditos_disponibles", 0) or 0
+    activas  = contar_misiones_activas(user_id)
+    limite   = MISIONES_MAX.get(tier, 1)
+
+    if tier == "pro":
+        return (activas < limite), ("" if activas < limite else "limite"), 0
+
+    if tier == "free":
+        if contar_eventos(user_id, "mision_creada") >= 1:
+            return False, "free_usado", COSTE_SNIPER_FREE
+        coste = COSTE_SNIPER_FREE
+    else:  # paid
+        coste = COSTE_SNIPER_PAID
+
+    if activas >= limite:
+        return False, "limite", coste
+    if creditos < coste:
+        return False, "creditos", coste
+    return True, "", coste
+
+
+_SNIPER_PACK_BOTONES = InlineKeyboardMarkup([
+    [InlineKeyboardButton(f"⭐ {PAID_CREDITOS_PACK_100} acciones — 9,99€", callback_data="pagar_pack_100")],
+    [InlineKeyboardButton(f"🔍 {PAID_CREDITOS_PACK_10} acciones — 2,99€", callback_data="pagar_pack_10")],
+])
+
+
+async def _paywall_sniper(dest, user_id: int, motivo: str):
+    """Paywall propio del sniper. `dest` es un message al que hacer reply."""
+    registrar_evento_embudo(user_id, "paywall_visto", "sniper")
+    if motivo == "limite":
+        texto = (
+            "🎯 <b>Límite de sniper activos alcanzado.</b>\n\n"
+            "Pausa o borra uno para crear otro, o amplía con un pack."
+        )
+    elif motivo == "free_usado":
+        texto = (
+            "🎯 <b>Ya usaste tu sniper gratuito.</b>\n\n"
+            "El sniper es una herramienta de trabajo. Un solo coche bien comprado "
+            "paga el pack 100 veces.\n\n"
+            "Sigue vigilando el mercado alemán:"
+        )
+    else:  # creditos
+        texto = (
+            "🎯 <b>Te faltan créditos para el sniper.</b>\n\n"
+            "Cada misión vigila Alemania y te avisa con la cuenta hecha.\n"
+            "Un solo coche bien comprado paga el pack 100 veces."
+        )
+    await dest.reply_text(texto, parse_mode="HTML", reply_markup=_SNIPER_PACK_BOTONES)
+
+
+def _resumen_slots_sniper(marca: str, modelo: str, filtros: dict) -> str:
+    partes = [f"<b>{html.escape(marca.title())} {html.escape(modelo.upper())}</b>"]
+    if filtros.get("year_min") or filtros.get("year_max"):
+        ymin = filtros.get("year_min", "") or "?"
+        ymax = filtros.get("year_max", "") or "?"
+        partes.append(f"📅 {ymin}-{ymax}")
+    if filtros.get("km_max"):
+        partes.append(f"📍 hasta {int(filtros['km_max']):,} km".replace(",", "."))
+    if filtros.get("price_max"):
+        partes.append(f"💶 hasta {int(filtros['price_max']):,}€".replace(",", "."))
+    for k, etiq in (("combustible", ""), ("caja", ""), ("power_min", "≥{} CV")):
+        if filtros.get(k):
+            partes.append(etiq.format(filtros[k]) if "{}" in etiq else str(filtros[k]))
+    return " · ".join(partes)
+
+
+async def _sniper_procesar_texto(update: Update, ctx: ContextTypes.DEFAULT_TYPE, texto: str):
+    """Parsea la descripción de la misión y pide confirmación de slots."""
+    parsed = await parsear_modelo_nl(texto)
+    partes = texto.split(maxsplit=1)
+    marca  = (parsed.get("marca") or (partes[0] if partes else "")).lower().strip()
+    modelo = (parsed.get("modelo") or (partes[1] if len(partes) > 1 else "")).lower().strip()
+
+    if not marca or not modelo:
+        ctx.user_data["esperando_sniper"] = True
+        await update.effective_message.reply_text(
+            "⚠️ Dime al menos <b>marca y modelo</b>. Ej: <code>BMW 320d</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    filtros = await parsear_filtros_nl(texto) or {}
+    # Limpiamos claves internas del parser (empiezan por _).
+    filtros = {k: v for k, v in filtros.items() if not k.startswith("_")}
+
+    ctx.user_data.pop("esperando_sniper", None)
+    ctx.user_data["sniper_pendiente"] = {"marca": marca, "modelo": modelo,
+                                          "filtros": filtros, "query": texto}
+
+    resumen = _resumen_slots_sniper(marca, modelo, filtros)
+    teclado = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Activar sniper", callback_data="sniper_crear")],
+        [InlineKeyboardButton("❌ Cancelar", callback_data="sniper_cancel")],
+    ])
+    await update.effective_message.reply_text(
+        f"🎯 <b>Voy a vigilar esto:</b>\n\n{resumen}\n\n"
+        f"Te aviso cuando salte uno con margen (≥ {SNIPER_UMBRAL_EUR:,}€ y ≥ {SNIPER_UMBRAL_PCT:.0f}%).".replace(",", "."),
+        parse_mode="HTML", reply_markup=teclado,
+    )
+
+
+async def cmd_sniper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    allowed, _tier = _check_access(user.id, user.username or "")
+    if not allowed:
+        await update.message.reply_text("⛔ No tienes acceso a este bot.")
+        return
+    get_o_crear_usuario(user.id, user.username or "", user.first_name or "")
+
+    if not ENABLE_SNIPER:
+        await update.message.reply_text(
+            "🎯 Sniper en construcción. Pronto lo activo.", parse_mode="HTML"
+        )
+        return
+
+    # Limpieza de estados cruzados de otros flujos.
+    ctx.user_data.pop("esperando_datos_tasar", None)
+    ctx.user_data.pop("esperando_datos_manuales", None)
+
+    args_text = " ".join(ctx.args).strip() if ctx.args else ""
+    if args_text:
+        await _sniper_procesar_texto(update, ctx, args_text)
+        return
+
+    misiones = _misiones_sniper_usuario(user.id)
+    if misiones:
+        await _mostrar_misiones_sniper(update.effective_message, misiones)
+        return
+
+    ctx.user_data["esperando_sniper"] = True
+    await update.message.reply_text(_PROMPT_SNIPER, parse_mode="HTML")
+
+
+async def _mostrar_misiones_sniper(dest, misiones: list[dict]):
+    filas = []
+    lineas = ["🎯 <b>Tus sniper</b>\n"]
+    for m in misiones:
+        estado = m.get("estado", "ACTIVA")
+        icono = {"ACTIVA": "🟢", "PAUSADA": "⏸", "EXPIRADA": "⌛"}.get(estado, "•")
+        titulo = f"{m.get('marca','').title()} {m.get('modelo','').upper()}".strip()
+        lineas.append(
+            f"{icono} <b>{html.escape(titulo)}</b> — {m.get('alertas_total',0)} alertas · "
+            f"margen ≥ {int(m.get('umbral_margen_eur') or 0):,}€".replace(",", ".")
+        )
+        mid = m["id"]
+        fila = []
+        if estado == "ACTIVA":
+            fila.append(InlineKeyboardButton("⏸ Pausar", callback_data=f"sniper_pausar:{mid}"))
+        elif estado == "PAUSADA":
+            fila.append(InlineKeyboardButton("▶️ Reanudar", callback_data=f"sniper_reanudar:{mid}"))
+        elif estado == "EXPIRADA":
+            fila.append(InlineKeyboardButton("🔄 Renovar", callback_data=f"sniper_renovar:{mid}"))
+        fila.append(InlineKeyboardButton("🗑 Borrar", callback_data=f"sniper_borrar:{mid}"))
+        filas.append(fila)
+    await dest.reply_text(
+        "\n".join(lineas), parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(filas) if filas else None,
+    )
+
+
+async def callback_sniper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data or ""
+    user_id = query.from_user.id
+
+    if data == "sniper_cancel":
+        ctx.user_data.pop("sniper_pendiente", None)
+        await query.answer("Cancelado")
+        await query.edit_message_text("👍 Cancelado.")
+        return
+
+    if data == "sniper_crear":
+        await query.answer()
+        await _crear_sniper_confirmado(query, ctx)
+        return
+
+    # Gestión: sniper_<accion>:<id>
+    try:
+        accion, sid = data.split(":", 1)
+        mid = int(sid)
+    except (ValueError, IndexError):
+        await query.answer()
+        return
+
+    m = obtener_mision(mid)
+    if not m or m.get("user_id") != user_id:
+        await query.answer("No es tuya", show_alert=True)
+        return
+
+    if accion == "sniper_pausar":
+        pausar_mision(mid)
+        await query.answer("Pausado")
+    elif accion == "sniper_reanudar":
+        activar_mision(mid)
+        await query.answer("Reactivado")
+    elif accion == "sniper_renovar":
+        renovar_mision(mid, SNIPER_MISION_DIAS)
+        await query.answer("Renovado 30 días")
+    elif accion == "sniper_borrar":
+        teclado = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🗑 Sí, borrar", callback_data=f"sniper_borrarok:{mid}"),
+            InlineKeyboardButton("↩️ No", callback_data="sniper_cancel"),
+        ]])
+        await query.answer()
+        await query.edit_message_text("¿Borrar este sniper?", reply_markup=teclado)
+        return
+    elif accion == "sniper_borrarok":
+        eliminar_mision(mid, user_id)
+        await query.answer("Borrado")
+        await query.edit_message_text("🗑 Sniper borrado.")
+        return
+    else:
+        await query.answer()
+        return
+
+    # Refrescar la lista tras pausar/reanudar/renovar.
+    misiones = _misiones_sniper_usuario(user_id)
+    if misiones:
+        await _mostrar_misiones_sniper(query.message, misiones)
+
+
+async def _crear_sniper_confirmado(query, ctx: ContextTypes.DEFAULT_TYPE):
+    user_id = query.from_user.id
+    pend = ctx.user_data.get("sniper_pendiente")
+    if not pend:
+        await query.edit_message_text("⚠️ Se perdió la misión. Repite /sniper.")
+        return
+
+    puede, motivo, coste = _puede_crear_sniper(user_id)
+    if not puede:
+        await _paywall_sniper(query.message, user_id, motivo)
+        return
+
+    marca, modelo, filtros = pend["marca"], pend["modelo"], pend["filtros"]
+    await query.edit_message_text("⏳ Midiendo el mercado español…")
+
+    # Valoración representativa (calienta caché y valida que hay datos ES).
+    año_ref = filtros.get("year_max") or filtros.get("year_min") or 0
+    km_ref  = int(filtros.get("km_max") or 0) // 2 or 80_000
+    try:
+        v = await sp.refrescar_valoracion(marca, modelo, int(año_ref or 0), km_ref)
+    except Exception as e:
+        logger.warning(f"[SNIPER] valoración inicial falló: {e}")
+        v = None
+
+    mid = crear_mision_sniper(
+        user_id, marca, modelo, pend.get("query", ""),
+        filtros, SNIPER_UMBRAL_EUR, SNIPER_UMBRAL_PCT, SNIPER_MISION_DIAS,
+    )
+    if coste and user_id not in ADMIN_USER_IDS:
+        registrar_uso(user_id, coste)
+    registrar_evento_embudo(user_id, "mision_creada", f"mision={mid}")
+    ctx.user_data.pop("sniper_pendiente", None)
+
+    nota_mercado = ""
+    if v and v.get("n_comparables"):
+        nota_mercado = f"\nMercado ES de referencia: {int(v['mediana']):,}€ ({v['n_comparables']} comparables).".replace(",", ".")
+    elif v is None:
+        nota_mercado = "\n<i>Aún sin comparables ES claros; los busco en cada pasada.</i>"
+
+    await query.message.reply_text(
+        f"🎯 <b>Sniper activo.</b>\n"
+        f"Vigilando el mercado alemán. Te aviso en minutos cuando salte uno con margen."
+        f"{nota_mercado}",
+        parse_mode="HTML",
+    )
+
+
+async def _capturar_datos_sniper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Captura el texto de creación del sniper (estado esperando_sniper)."""
+    if not ctx.user_data.get("esperando_sniper"):
+        return
+    texto = (update.message.text or "").strip()
+    if not texto:
+        return
+    await _sniper_procesar_texto(update, ctx, texto)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# /stats_sniper — métricas del sniper (admin)
+# ════════════════════════════════════════════════════════════════════════════
+
+async def cmd_stats_sniper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in ADMIN_USER_IDS:
+        return
+    s = stats_sniper()
+    estados = s["misiones_por_estado"]
+    est_txt = " · ".join(f"{k}: {v}" for k, v in estados.items()) or "sin misiones"
+    fuentes = s["conversion_por_fuente"]
+    fuentes_txt = "\n".join(
+        f"  • {html.escape(f['fuente'])}: {f['usuarios']}" for f in fuentes
+    ) or "  (sin datos)"
+    from database import fuente_pausada as _fp
+    breaker = "🔴 PAUSADA" if _fp("autoscout24") else "🟢 OK"
+    await update.message.reply_text(
+        f"🎯 <b>Stats sniper</b>\n\n"
+        f"Misiones: {est_txt}\n"
+        f"Alertas 24h: {s['alertas_24h']} · 7d: {s['alertas_7d']}\n"
+        f"AutoScout24: {breaker}\n\n"
+        f"<b>Captación:</b>\n{fuentes_txt}",
+        parse_mode="HTML",
+    )
+
+
 def main():
     if not TELEGRAM_TOKEN:
         logger.error("TELEGRAM_TOKEN no configurado. Revisa tu archivo .env")
@@ -2988,6 +3349,11 @@ def main():
     app.add_handler(CommandHandler("analizar", cmd_analizar))
     app.add_handler(CommandHandler("tasar", cmd_tasar))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    # Sniper Alemania (alias /buscar → mismo flujo v2 de misiones)
+    app.add_handler(CommandHandler("sniper", cmd_sniper))
+    app.add_handler(CommandHandler("buscar", cmd_sniper))
+    app.add_handler(CommandHandler("stats_sniper", cmd_stats_sniper))
+    app.add_handler(CallbackQueryHandler(callback_sniper, pattern=r"^sniper_"))
     app.add_handler(conv_ideal)
     app.add_handler(conv_comparar)
     app.add_handler(CallbackQueryHandler(callback_ideal_analizar, pattern=r"^ideal_analizar:\d+$"))
@@ -3008,6 +3374,8 @@ def main():
     # Captura de datos de tasación (grupo 2 — independiente del manual; cada uno
     # actúa solo si su clave de estado está activa)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _capturar_datos_tasar), group=2)
+    # Captura del texto de creación del sniper (grupo 3 — actúa solo con esperando_sniper)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _capturar_datos_sniper), group=3)
 
     # Manejador global de errores
     app.add_error_handler(error_handler)

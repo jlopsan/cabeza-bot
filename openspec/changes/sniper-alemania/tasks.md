@@ -81,19 +81,19 @@ Si no cabe todo, cerrar en este orden. El vídeo NO sale hasta que 1-3 estén pr
 
 ## 7. Bot — flujo /sniper (main.py)
 
-- [ ] 7.1 `cmd_sniper`: sin args → listado de misiones con botones; con args → flujo de creación NL.
-- [ ] 7.2 Creación: `@requiere_acceso("/sniper", registrar=False)`; parseo NL (1 llamada IA), slot-filling multi-turn de marca/modelo, confirmación de slots.
-- [ ] 7.3 Chequeo pre-creación (paywall específico si falla): free = un solo uso histórico (contar `mision_creada`); límite de misiones activas por tier; créditos suficientes para el coste del tier (paid necesita 5).
-- [ ] 7.4 Al confirmar: valorar mercado ES en caliente, `crear_mision_sniper`, `registrar_uso(user_id, coste_por_tier)` (free 1 / paid 5), `registrar_evento_embudo(mision_creada)`, mensaje de vigilancia activa.
-- [ ] 7.5 Callbacks de gestión: pausar/reanudar/borrar/editar-umbral/renovar (gratis); confirmación en borrar y renovar.
-- [ ] 7.6 Registrar `CommandHandler("sniper")` + alias `CommandHandler("buscar")` (mismo entry) + `CallbackQueryHandler` de gestión.
-- [ ] 7.7 Paywall específico del sniper en `permisos.py`/main con evento `paywall_visto` meta=sniper.
+- [x] 7.1 `cmd_sniper`: sin args → listado de misiones con botones (o prompt si no tiene); con args → flujo de creación NL.
+- [x] 7.2 Creación: chequeo de acceso manual (listar/gestionar es gratis; el gate va en la creación); parseo NL (`parsear_modelo_nl` + `parsear_filtros_nl`), pide marca/modelo si faltan, confirmación de slots con botones.
+- [x] 7.3 `_puede_crear_sniper` (paywall específico si falla): free = un solo uso histórico (`contar_eventos('mision_creada')`); límite de activas por tier (`MISIONES_MAX`); créditos suficientes por tier (paid 5). Probado con 5 casos.
+- [x] 7.4 `_crear_sniper_confirmado`: `refrescar_valoracion` en caliente, `crear_mision_sniper`, `registrar_uso(coste_por_tier)` (free 1 / paid 5, admin 0), `registrar_evento_embudo('mision_creada')`, mensaje "Sniper activo".
+- [x] 7.5 `callback_sniper`: pausar/reanudar/borrar (con confirmación)/renovar, gratis. (Editar-umbral diferido — no bloquea el mínimo publicable; umbral por defecto configurable.)
+- [x] 7.6 `CommandHandler("sniper")` + alias `CommandHandler("buscar")` (mismo `cmd_sniper`) + `CallbackQueryHandler(callback_sniper, ^sniper_)` + captura `_capturar_datos_sniper` group=3.
+- [x] 7.7 Paywall propio del sniper (`_paywall_sniper`) con `registrar_evento_embudo('paywall_visto','sniper')`.
 
 ## 8. Deep links y embudo (main.py)
 
-- [ ] 8.1 `start`: leer `ctx.args`; `set_fuente_captacion` first-touch; `registrar_evento_embudo(start, payload)`.
-- [ ] 8.2 Bienvenida contextual si payload `v_sniper*`.
-- [ ] 8.3 `cmd_stats_sniper` (solo admin): misiones por estado, alertas 24h/7d, estado breaker, conversión por `fuente_captacion`.
+- [x] 8.1 `start`: lee `ctx.args[0]`; `set_fuente_captacion` first-touch; `registrar_evento_embudo('start', payload)`.
+- [x] 8.2 Bienvenida contextual si payload `v_sniper*` (menciona el sniper y ofrece `/sniper`).
+- [x] 8.3 `cmd_stats_sniper` (solo admin): misiones por estado, alertas 24h/7d, estado breaker, conversión por `fuente_captacion`.
 
 ## 9. Limpieza del legacy (solo tras regresión verde)
 
