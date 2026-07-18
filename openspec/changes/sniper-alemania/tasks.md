@@ -17,29 +17,29 @@ Si no cabe todo, cerrar en este orden. El vídeo NO sale hasta que 1-3 estén pr
 
 ## 1. Config y feature flag
 
-- [ ] 1.1 `config.py`: `ENABLE_SNIPER` (env, default false en prod).
-- [ ] 1.2 `config.py`: costes fijos por env — `COSTE_TRANSPORTE=1000`, `COSTE_COC_GESTION=400`, `COSTE_HOMOLOGACION_ITV=300`, `COSTE_TASAS_DGT=100` (sustituyen a 1200/350 hardcoded).
-- [ ] 1.3 `config.py`: umbrales `SNIPER_UMBRAL_EUR=1500`, `SNIPER_UMBRAL_PCT=10`, `SNIPER_ALERTAS_PASADA=3`.
-- [ ] 1.4 `config.py`: ciclo — `SNIPER_INTERVAL_MINUTES` (existe), `SNIPER_BUDGET_S=150`, `SNIPER_MAX_SCRAPES_HORA=60`, `SNIPER_CB_FALLOS=3`, `SNIPER_CB_PAUSA_MIN=30`, `SNIPER_MISION_DIAS=30`.
-- [ ] 1.5 `config.py`: valoración — `VALORACION_TTL_H=12`, banda km = 20000.
-- [ ] 1.6 `config.py`: heurística CO₂ determinista por combustible × año (tabla de g/km típicos) para cuando el anuncio no trae CO₂.
-- [ ] 1.7 `config.py`/`permisos.py`: `COSTE_COMANDO["/sniper"] = 1` (gate mínimo), `COSTE_SNIPER_FREE=1`, `COSTE_SNIPER_PAID=5`, `MISIONES_MAX = {"free":1, "paid":3, "pro":999}` (env-configurable). Free = un solo uso de por vida (contar eventos `mision_creada`).
+- [x] 1.1 `config.py`: `ENABLE_SNIPER` (env, default false en prod).
+- [x] 1.2 `config.py`: costes fijos por env — AISLADOS del legacy: `SNIPER_COSTE_TRANSPORTE=1000`, `SNIPER_COSTE_COC_GESTION=400`, `SNIPER_COSTE_HOMOLOG_ITV=300`, `SNIPER_COSTE_TASAS_DGT=100`. `COSTE_TRANSPORTE`/`COSTE_GESTORIA_ITV` legacy intactos (los usa scanner.py).
+- [x] 1.3 `config.py`: umbrales `SNIPER_UMBRAL_EUR=1500`, `SNIPER_UMBRAL_PCT=10`, `SNIPER_ALERTAS_PASADA=3`.
+- [x] 1.4 `config.py`: ciclo — `SNIPER_INTERVAL_MINUTES`, `SNIPER_BUDGET_S=150`, `SNIPER_MAX_SCRAPES_HORA=60`, `SNIPER_CB_FALLOS=3`, `SNIPER_CB_PAUSA_MIN=30`, `SNIPER_MISION_DIAS=30`, `SNIPER_DETECCION_PAGINAS=2`.
+- [x] 1.5 `config.py`: valoración — `VALORACION_TTL_H=12`, `VALORACION_KM_BANDA=20000`.
+- [x] 1.6 `config.py`: heurística CO₂ determinista `CO2_TIPICO_POR_COMBUSTIBLE` + `CO2_TIPICO_DEFAULT` + nuevo-fiscal (`NUEVO_FISCAL_KM_MAX`/`_MESES_MAX`, `IVA_ES_PCT`).
+- [x] 1.7 `config.py`/`permisos.py`: `COSTE_COMANDO["/sniper"] = 1` (gate mínimo), `COSTE_SNIPER_FREE=1`, `COSTE_SNIPER_PAID=5`, `MISIONES_MAX = {"free":1, "paid":3, "pro":999}` (env-configurable). Free = un solo uso de por vida (contar eventos `mision_creada`).
 
 ## 2. Migraciones BD (aditivas, sin romper prod)
 
-- [ ] 2.1 `misiones`: `ALTER ADD` `marca`, `modelo`, `umbral_margen_eur`, `umbral_margen_pct`, `expira_at`, `snapshot_sembrado`, `last_run_at`, `alertas_total`, `ultimo_error` (try/except por columna, patrón existente).
-- [ ] 2.2 `usuarios`: `ALTER ADD` `fuente_captacion`, `fuente_captacion_at`.
-- [ ] 2.3 Tabla `alertas_enviadas(id, mision_id, anuncio_id, huella, tipo, precio, margen_eur, margen_pct, url, ts)` con `UNIQUE(mision_id, anuncio_id)` + índices por `mision_id` y `huella`.
-- [ ] 2.4 Tabla `valoraciones_mercado(marca, modelo, año, km_banda, mediana, n_comparables, precios_json, actualizado_at)` con `UNIQUE(marca, modelo, año, km_banda)`.
-- [ ] 2.5 Tabla `eventos(id, user_id, evento, meta, ts)` + índice por `evento`.
-- [ ] 2.6 Tabla `estado_fuentes(fuente, fallos_seguidos, pausada_hasta, scrapes_hora_json)`.
-- [ ] 2.7 Migración de datos: marcar misiones pre-v2 (sin `marca`/`modelo`) como `EXPIRADA`.
-- [ ] 2.8 Funciones DB misiones v2: `crear_mision_sniper`, `obtener_misiones_sniper_activas`, `obtener_misiones_usuario`, `pausar/reanudar/borrar/renovar_mision`, `editar_umbral`, `set_last_run/ultimo_error`, `expirar_vencidas`.
-- [ ] 2.9 Funciones DB dedup/snapshot: `sembrar_snapshot`, `anuncio_ya_visto(mision_id, anuncio_id)`, `huella_reciente(huella, dias)`, `registrar_visto`, `registrar_alerta`.
-- [ ] 2.10 Funciones DB valoración: `get_valoracion(marca, modelo, año, km_banda)`, `upsert_valoracion`, `valoracion_caducada`.
-- [ ] 2.11 Funciones DB eventos/fuentes: `registrar_evento_embudo`, `get_estado_fuente`, `incr_fallo_fuente`, `reset_fuente`, `incr_scrape_hora`, `scrapes_ultima_hora`.
-- [ ] 2.12 Funciones DB captación: `set_fuente_captacion` (first-touch, no sobrescribe).
-- [ ] 2.13 Incluir `alertas_enviadas` y `eventos` en `purgar_historico_antiguo` (180 días).
+- [x] 2.1 `misiones`: `ALTER ADD` `marca`, `modelo`, `umbral_margen_eur`, `umbral_margen_pct`, `expira_at`, `snapshot_sembrado`, `last_run_at`, `alertas_total`, `ultimo_error` (try/except por columna, patrón existente).
+- [x] 2.2 `usuarios`: `ALTER ADD` `fuente_captacion`, `fuente_captacion_at`.
+- [x] 2.3 Tabla `alertas_enviadas(id, mision_id, anuncio_id, huella, tipo, precio, margen_eur, margen_pct, url, ts)` con `UNIQUE(mision_id, anuncio_id)` + índices por `mision_id` y `huella`.
+- [x] 2.4 Tabla `valoraciones_mercado(marca, modelo, año, km_banda, mediana, n_comparables, precios_json, actualizado_at)` con `UNIQUE(marca, modelo, año, km_banda)`.
+- [x] 2.5 Tabla `eventos(id, user_id, evento, meta, ts)` + índice por `evento`.
+- [x] 2.6 Tabla `estado_fuentes(fuente, fallos_seguidos, pausada_hasta, scrapes_hora_json)`.
+- [~] 2.7 Migración de datos: `expirar_misiones_legacy()` escrita; se INVOCA en el arranque del worker v2 (grupo 6), no en `init_db` (para que la migración sea 100% aditiva).
+- [x] 2.8 Funciones DB misiones v2: `crear_mision_sniper`, `obtener_mision`, `obtener_misiones_sniper_activas`, `contar_misiones_activas`, `renovar_mision`, `editar_umbral_mision`, `set_mision_run`, `marcar_snapshot_sembrado`, `incr_alertas_mision`, `expirar_misiones_vencidas` (reusa `pausar/activar/eliminar/obtener_misiones_usuario`).
+- [x] 2.9 Funciones DB dedup/snapshot: `huella_anuncio`, `anuncio_ya_visto`, `huella_vista_reciente`, `registrar_visto` (snapshot y alerta), `sembrar_snapshot`.
+- [x] 2.10 Funciones DB valoración: `get_valoracion`, `upsert_valoracion`, `valoracion_caducada`.
+- [x] 2.11 Funciones DB eventos/fuentes: `registrar_evento_embudo`, `contar_eventos`, `get_estado_fuente`, `fuente_pausada`, `incr_fallo_fuente`, `reset_fuente`, `incr_scrape_hora`, `scrapes_ultima_hora`, `stats_sniper`.
+- [x] 2.12 Funciones DB captación: `set_fuente_captacion` (first-touch, no sobrescribe).
+- [x] 2.13 Incluir `alertas_enviadas` y `eventos` en `purgar_historico_antiguo` (180 días).
 
 ## 3. Cálculo de importación (calculator.py)
 

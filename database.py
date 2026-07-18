@@ -771,3 +771,432 @@ def guardar_historico_batch(anuncios: list) -> int:
         logger.error(f"[HIST] Error en guardar_historico_batch: {e}")
     logger.info(f"[HIST] {insertados}/{len(anuncios)} anuncios guardados en histórico")
     return insertados
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SNIPER ALEMANIA — misiones v2, dedup/snapshot, valoración, embudo, breaker
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _ahora() -> str:
+    return datetime.utcnow().isoformat()
+
+
+# ─── MISIONES V2 ─────────────────────────────────────────────────────────────
+
+def crear_mision_sniper(user_id: int, marca: str, modelo: str, query_modelo: str,
+                        filtros: dict, umbral_eur: int, umbral_pct: float,
+                        dias_vida: int) -> int:
+    """
+    Crea una misión sniper v2. marca/modelo se persisten parseados (el worker
+    NUNCA vuelve a llamar IA). Devuelve el id de la misión.
+    """
+    now = _ahora()
+    expira = (datetime.utcnow() + timedelta(days=dias_vida)).isoformat()
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO misiones
+               (user_id, query_modelo, filtros, precio_objetivo_es, estado, prioridad,
+                marca, modelo, umbral_margen_eur, umbral_margen_pct, expira_at,
+                snapshot_sembrado, created_at, updated_at)
+               VALUES (?, ?, ?, NULL, 'ACTIVA', 'sniper',
+                       ?, ?, ?, ?, ?, 0, ?, ?)""",
+            (user_id, query_modelo, json.dumps(filtros),
+             marca, modelo, umbral_eur, umbral_pct, expira, now, now),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def obtener_mision(mision_id: int) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM misiones WHERE id = ?", (mision_id,)).fetchone()
+    return dict(row) if row else None
+
+
+def obtener_misiones_sniper_activas() -> list[dict]:
+    """Misiones ACTIVAS v2 (con marca parseada). El worker las agrupa por clave."""
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM misiones "
+            "WHERE estado = 'ACTIVA' AND prioridad = 'sniper' "
+            "AND marca IS NOT NULL AND marca != '' "
+            "ORDER BY last_run_at ASC"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def contar_misiones_activas(user_id: int) -> int:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM misiones "
+            "WHERE user_id = ? AND estado = 'ACTIVA' AND prioridad = 'sniper'",
+            (user_id,),
+        ).fetchone()
+    return row["n"] if row else 0
+
+
+def renovar_mision(mision_id: int, dias_vida: int) -> bool:
+    """Reactiva una misión y reinicia su vida y snapshot (re-siembra en la próxima pasada)."""
+    now = _ahora()
+    expira = (datetime.utcnow() + timedelta(days=dias_vida)).isoformat()
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE misiones SET estado='ACTIVA', expira_at=?, snapshot_sembrado=0, "
+            "ultimo_error='', updated_at=? WHERE id=?",
+            (expira, now, mision_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def editar_umbral_mision(mision_id: int, umbral_eur: int, umbral_pct: float) -> bool:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE misiones SET umbral_margen_eur=?, umbral_margen_pct=?, updated_at=? WHERE id=?",
+            (umbral_eur, umbral_pct, _ahora(), mision_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def set_mision_run(mision_id: int, error: str = ""):
+    """Marca la última pasada de la misión y su último error (vacío si OK)."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE misiones SET last_run_at=?, ultimo_error=? WHERE id=?",
+            (_ahora(), error, mision_id),
+        )
+        conn.commit()
+
+
+def marcar_snapshot_sembrado(mision_id: int):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE misiones SET snapshot_sembrado=1, updated_at=? WHERE id=?",
+            (_ahora(), mision_id),
+        )
+        conn.commit()
+
+
+def incr_alertas_mision(mision_id: int, n: int = 1):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE misiones SET alertas_total = COALESCE(alertas_total,0) + ? WHERE id=?",
+            (n, mision_id),
+        )
+        conn.commit()
+
+
+def expirar_misiones_vencidas() -> int:
+    """Marca EXPIRADA las misiones sniper vencidas. Devuelve cuántas."""
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE misiones SET estado='EXPIRADA', updated_at=? "
+            "WHERE estado='ACTIVA' AND prioridad='sniper' "
+            "AND expira_at != '' AND expira_at < ?",
+            (_ahora(), _ahora()),
+        )
+        conn.commit()
+        return cur.rowcount
+
+
+def expirar_misiones_legacy() -> int:
+    """
+    Marca EXPIRADA las misiones pre-v2 (sin marca parseada). Se llama al activar
+    el worker v2 para que no intente procesarlas (necesitan marca/modelo).
+    """
+    with get_conn() as conn:
+        cur = conn.execute(
+            "UPDATE misiones SET estado='EXPIRADA', updated_at=? "
+            "WHERE estado='ACTIVA' AND (marca IS NULL OR marca='')",
+            (_ahora(),),
+        )
+        conn.commit()
+        return cur.rowcount
+
+
+# ─── DEDUP / SNAPSHOT (alertas_enviadas) ─────────────────────────────────────
+
+def huella_anuncio(marca: str, modelo: str, año: int, km: int, precio: float) -> str:
+    """
+    Huella para detectar re-publicaciones (mismo coche, ID nuevo).
+    Agrupa km en tramos de 500 y precio en tramos de 100 para tolerar cambios menores.
+    """
+    base = f"{(marca or '').lower()}|{(modelo or '').lower()}|{int(año or 0)}|" \
+           f"{int((km or 0) // 500)}|{int((precio or 0) // 100)}"
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
+
+
+def anuncio_ya_visto(mision_id: int, anuncio_id: str) -> bool:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM alertas_enviadas WHERE mision_id=? AND anuncio_id=?",
+            (mision_id, anuncio_id),
+        ).fetchone()
+    return row is not None
+
+
+def huella_vista_reciente(mision_id: int, huella: str, dias: int = 30) -> bool:
+    """True si esa huella ya se registró para la misión en los últimos N días (re-publicación)."""
+    if not huella:
+        return False
+    limite = (datetime.utcnow() - timedelta(days=dias)).isoformat()
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM alertas_enviadas WHERE mision_id=? AND huella=? AND ts >= ? LIMIT 1",
+            (mision_id, huella, limite),
+        ).fetchone()
+    return row is not None
+
+
+def registrar_visto(mision_id: int, anuncio_id: str, huella: str = "",
+                    tipo: str = "snapshot", precio: float = 0,
+                    margen_eur: float = 0, margen_pct: float = 0, url: str = "") -> bool:
+    """
+    Registra un anuncio como visto (snapshot) o alertado (alerta). Idempotente
+    por UNIQUE(mision_id, anuncio_id): un segundo intento no duplica.
+    Devuelve True si insertó (no estaba), False si ya existía.
+    """
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO alertas_enviadas "
+            "(mision_id, anuncio_id, huella, tipo, precio, margen_eur, margen_pct, url, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (mision_id, anuncio_id, huella, tipo, precio, margen_eur, margen_pct, url, _ahora()),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def sembrar_snapshot(mision_id: int, anuncios: list[dict], marca: str, modelo: str) -> int:
+    """
+    Registra todos los anuncios como snapshot (sin alertar) y marca la misión
+    como sembrada. Devuelve cuántos registró.
+    """
+    n = 0
+    with get_conn() as conn:
+        for a in anuncios:
+            h = huella_anuncio(marca, modelo, a.get("año", 0), a.get("km", 0), a.get("precio", 0))
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO alertas_enviadas "
+                "(mision_id, anuncio_id, huella, tipo, precio, url, ts) "
+                "VALUES (?, ?, ?, 'snapshot', ?, ?, ?)",
+                (mision_id, str(a.get("id", "")), h, a.get("precio", 0), a.get("link", ""), _ahora()),
+            )
+            n += cur.rowcount
+        conn.execute(
+            "UPDATE misiones SET snapshot_sembrado=1, updated_at=? WHERE id=?",
+            (_ahora(), mision_id),
+        )
+        conn.commit()
+    return n
+
+
+# ─── VALORACIÓN DE MERCADO ES (cacheada) ─────────────────────────────────────
+
+def get_valoracion(marca: str, modelo: str, año: int, km_banda: int) -> dict | None:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM valoraciones_mercado "
+            "WHERE marca=? AND modelo=? AND año=? AND km_banda=?",
+            ((marca or "").lower(), (modelo or "").lower(), int(año or 0), int(km_banda)),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def upsert_valoracion(marca: str, modelo: str, año: int, km_banda: int,
+                      mediana: float, n_comparables: int, precios: list[float]):
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO valoraciones_mercado "
+            "(marca, modelo, año, km_banda, mediana, n_comparables, precios_json, actualizado_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(marca, modelo, año, km_banda) DO UPDATE SET "
+            "mediana=excluded.mediana, n_comparables=excluded.n_comparables, "
+            "precios_json=excluded.precios_json, actualizado_at=excluded.actualizado_at",
+            ((marca or "").lower(), (modelo or "").lower(), int(año or 0), int(km_banda),
+             mediana, n_comparables, json.dumps(precios), _ahora()),
+        )
+        conn.commit()
+
+
+def valoracion_caducada(actualizado_at: str, ttl_h: int) -> bool:
+    """True si la valoración es más vieja que ttl_h horas (o no tiene fecha)."""
+    if not actualizado_at:
+        return True
+    try:
+        ts = datetime.fromisoformat(actualizado_at)
+    except (ValueError, TypeError):
+        return True
+    return (datetime.utcnow() - ts) > timedelta(hours=ttl_h)
+
+
+# ─── EMBUDO DE CONVERSIÓN (eventos) ──────────────────────────────────────────
+
+def registrar_evento_embudo(user_id: int, evento: str, meta: str = ""):
+    """Registra un evento del embudo (start, mision_creada, alerta_enviada, paywall_visto, pago_ok)."""
+    try:
+        with get_conn() as conn:
+            conn.execute(
+                "INSERT INTO eventos (user_id, evento, meta, ts) VALUES (?, ?, ?, ?)",
+                (user_id, evento, meta, _ahora()),
+            )
+            conn.commit()
+    except Exception as e:
+        logger.warning(f"[EMBUDO] No se pudo registrar {evento}: {e}")
+
+
+def contar_eventos(user_id: int, evento: str) -> int:
+    """Cuántas veces ocurrió un evento para el usuario (ej: mision_creada → free un solo uso)."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM eventos WHERE user_id=? AND evento=?",
+            (user_id, evento),
+        ).fetchone()
+    return row["n"] if row else 0
+
+
+def set_fuente_captacion(user_id: int, fuente: str):
+    """First-touch: solo guarda la fuente si el usuario aún no tiene una."""
+    if not fuente:
+        return
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE usuarios SET fuente_captacion=?, fuente_captacion_at=? "
+            "WHERE user_id=? AND (fuente_captacion IS NULL OR fuente_captacion='')",
+            (fuente, _ahora(), user_id),
+        )
+        conn.commit()
+
+
+# ─── CIRCUIT BREAKER / ESTADO DE FUENTES DE ─────────────────────────────────
+
+def get_estado_fuente(fuente: str) -> dict:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM estado_fuentes WHERE fuente=?", (fuente,)
+        ).fetchone()
+    if row:
+        return dict(row)
+    return {"fuente": fuente, "fallos_seguidos": 0, "pausada_hasta": "", "scrapes_hora_json": "[]"}
+
+
+def fuente_pausada(fuente: str) -> bool:
+    """True si el circuit breaker tiene la fuente pausada ahora mismo."""
+    est = get_estado_fuente(fuente)
+    ph = est.get("pausada_hasta") or ""
+    if not ph:
+        return False
+    try:
+        return datetime.fromisoformat(ph) > datetime.utcnow()
+    except (ValueError, TypeError):
+        return False
+
+
+def incr_fallo_fuente(fuente: str, umbral: int, pausa_min: int) -> tuple[int, bool]:
+    """
+    Suma un fallo consecutivo. Al alcanzar `umbral`, pausa la fuente `pausa_min`.
+    Devuelve (fallos_seguidos, pausada_ahora).
+    """
+    now = _ahora()
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO estado_fuentes (fuente) VALUES (?)", (fuente,)
+        )
+        row = conn.execute(
+            "SELECT fallos_seguidos FROM estado_fuentes WHERE fuente=?", (fuente,)
+        ).fetchone()
+        fallos = (row["fallos_seguidos"] or 0) + 1
+        pausada = fallos >= umbral
+        pausada_hasta = (datetime.utcnow() + timedelta(minutes=pausa_min)).isoformat() if pausada else ""
+        conn.execute(
+            "UPDATE estado_fuentes SET fallos_seguidos=?, pausada_hasta=? WHERE fuente=?",
+            (fallos, pausada_hasta, fuente),
+        )
+        conn.commit()
+    return fallos, pausada
+
+
+def reset_fuente(fuente: str):
+    """Un scrapeo exitoso limpia el contador de fallos y la pausa."""
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO estado_fuentes (fuente) VALUES (?)", (fuente,)
+        )
+        conn.execute(
+            "UPDATE estado_fuentes SET fallos_seguidos=0, pausada_hasta='' WHERE fuente=?",
+            (fuente,),
+        )
+        conn.commit()
+
+
+def incr_scrape_hora(fuente: str):
+    """Registra un scrapeo en la ventana de 1h (para el cap global)."""
+    now = datetime.utcnow()
+    limite = now - timedelta(hours=1)
+    with get_conn() as conn:
+        conn.execute("INSERT OR IGNORE INTO estado_fuentes (fuente) VALUES (?)", (fuente,))
+        row = conn.execute(
+            "SELECT scrapes_hora_json FROM estado_fuentes WHERE fuente=?", (fuente,)
+        ).fetchone()
+        try:
+            marcas = json.loads(row["scrapes_hora_json"] or "[]")
+        except (json.JSONDecodeError, TypeError):
+            marcas = []
+        marcas = [t for t in marcas if _dentro_de(t, limite)]
+        marcas.append(now.isoformat())
+        conn.execute(
+            "UPDATE estado_fuentes SET scrapes_hora_json=? WHERE fuente=?",
+            (json.dumps(marcas), fuente),
+        )
+        conn.commit()
+
+
+def scrapes_ultima_hora(fuente: str) -> int:
+    limite = datetime.utcnow() - timedelta(hours=1)
+    est = get_estado_fuente(fuente)
+    try:
+        marcas = json.loads(est.get("scrapes_hora_json") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        marcas = []
+    return sum(1 for t in marcas if _dentro_de(t, limite))
+
+
+def _dentro_de(ts_iso: str, limite: datetime) -> bool:
+    try:
+        return datetime.fromisoformat(ts_iso) >= limite
+    except (ValueError, TypeError):
+        return False
+
+
+# ─── STATS SNIPER (admin) ────────────────────────────────────────────────────
+
+def stats_sniper() -> dict:
+    """Resumen para /stats_sniper: misiones por estado, alertas 24h/7d, conversión por fuente."""
+    with get_conn() as conn:
+        estados = {
+            r["estado"]: r["n"] for r in conn.execute(
+                "SELECT estado, COUNT(*) AS n FROM misiones WHERE prioridad='sniper' GROUP BY estado"
+            ).fetchall()
+        }
+        a24 = conn.execute(
+            "SELECT COUNT(*) AS n FROM alertas_enviadas "
+            "WHERE tipo='alerta' AND ts >= datetime('now','-1 day')"
+        ).fetchone()["n"]
+        a7d = conn.execute(
+            "SELECT COUNT(*) AS n FROM alertas_enviadas "
+            "WHERE tipo='alerta' AND ts >= datetime('now','-7 day')"
+        ).fetchone()["n"]
+        fuentes = [
+            dict(r) for r in conn.execute(
+                "SELECT fuente_captacion AS fuente, COUNT(*) AS usuarios "
+                "FROM usuarios WHERE fuente_captacion != '' "
+                "GROUP BY fuente_captacion ORDER BY usuarios DESC"
+            ).fetchall()
+        ]
+    return {
+        "misiones_por_estado": estados,
+        "alertas_24h": a24,
+        "alertas_7d": a7d,
+        "conversion_por_fuente": fuentes,
+    }
