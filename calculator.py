@@ -9,7 +9,15 @@
 # Ambos modos usan la misma función calcular_beneficio().
 # La tarjeta se genera con formato_tarjeta(), que detecta el modo automáticamente.
 #
+from datetime import datetime
+
 from config import COSTE_TRANSPORTE, COSTE_GESTORIA_ITV, IEDMT_TRAMOS, MIN_BENEFICIO
+from config import (
+    SNIPER_COSTES_FIJOS, SNIPER_COSTE_TRANSPORTE, SNIPER_COSTE_COC_GESTION,
+    SNIPER_COSTE_HOMOLOG_ITV, SNIPER_COSTE_TASAS_DGT,
+    CO2_TIPICO_POR_COMBUSTIBLE, CO2_TIPICO_DEFAULT,
+    NUEVO_FISCAL_KM_MAX, NUEVO_FISCAL_MESES_MAX,
+)
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -23,6 +31,121 @@ def calcular_tipo_iedmt(co2: float) -> float:
         if co2 <= limite:
             return tipo
     return IEDMT_TRAMOS[-1][1]
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# SNIPER — cuenta de importación v2 (base IEDMT = valor de mercado ES)
+# ────────────────────────────────────────────────────────────────────────────
+# Aislada del cálculo legacy: base imponible = mediana de comparables ES,
+# NO el precio de compra alemán. IEDMT siempre etiquetado "estimado".
+
+def _normalizar_comb(combustible: str) -> str:
+    """Mapea variantes de combustible a las claves de CO2_TIPICO_POR_COMBUSTIBLE."""
+    c = (combustible or "").strip().lower()
+    if not c:
+        return ""
+    if "phev" in c or "enchuf" in c:
+        return "phev"
+    if "híbr" in c or "hibr" in c or "hybrid" in c:
+        return "hibrido"
+    if "dies" in c or "gasoil" in c or c in ("d", "tdi", "cdi"):
+        return "diesel"
+    if "eléctr" in c or "electr" in c or c in ("e", "ev", "bev"):
+        return "electrico"
+    if "glp" in c or "lpg" in c:
+        return "glp"
+    if "gnc" in c or "cng" in c:
+        return "gnc"
+    if "gasolina" in c or "benz" in c or "petrol" in c or "nafta" in c or c in ("b", "g"):
+        return "gasolina"
+    return ""
+
+
+def estimar_co2_deterministico(combustible: str, año: int) -> float:
+    """
+    Estima CO₂ (g/km) SIN IA cuando el anuncio no lo trae. Base por combustible
+    ajustada levemente por antigüedad (coches nuevos emiten algo menos).
+    Conservador: tira a alza para no infra-estimar el IEDMT.
+    """
+    comb = _normalizar_comb(combustible)
+    base = CO2_TIPICO_POR_COMBUSTIBLE.get(comb, CO2_TIPICO_DEFAULT)
+    try:
+        ajuste = max(-15, min(15, 2015 - int(año))) if año else 0
+    except (ValueError, TypeError):
+        ajuste = 0
+    return float(max(0, base + ajuste))
+
+
+def calcular_cuenta_importacion(precio_de: float, mediana_es: float, co2: float = 0,
+                                combustible: str = "", año: int = 0) -> dict:
+    """
+    Cuenta de importación del sniper. La base del IEDMT es el VALOR DE MERCADO ES
+    (mediana de comparables), NO el precio de compra alemán.
+    co2<=0 → estimación determinista (sin IA); marca co2_estimado=True.
+    """
+    co2_estimado = False
+    co2_val = float(co2 or 0)
+    if co2_val <= 0:
+        co2_val = estimar_co2_deterministico(combustible, año)
+        co2_estimado = True
+
+    tipo  = calcular_tipo_iedmt(co2_val)
+    iedmt = round(mediana_es * tipo, 2)
+    importacion = round(SNIPER_COSTES_FIJOS + iedmt, 2)
+
+    return {
+        "precio_de":      precio_de,
+        "mediana_es":     mediana_es,
+        "co2":            co2_val,
+        "co2_estimado":   co2_estimado,
+        "tipo_iedmt_pct": round(tipo * 100, 2),
+        "iedmt":          iedmt,
+        "costes_fijos":   SNIPER_COSTES_FIJOS,
+        "importacion":    importacion,
+        "desglose": {
+            "transporte":       SNIPER_COSTE_TRANSPORTE,
+            "coc_gestion":      SNIPER_COSTE_COC_GESTION,
+            "homologacion_itv": SNIPER_COSTE_HOMOLOG_ITV,
+            "tasas_dgt":        SNIPER_COSTE_TASAS_DGT,
+            "iedmt":            iedmt,
+        },
+    }
+
+
+def calcular_margen_sniper(precio_de: float, mediana_es: float, co2: float = 0,
+                           combustible: str = "", año: int = 0) -> dict:
+    """
+    Margen neto de importación: mediana_es − precio_de − importación.
+    Devuelve la cuenta completa + margen_eur, margen_pct (sobre inversión) e inversión.
+    """
+    cuenta = calcular_cuenta_importacion(precio_de, mediana_es, co2, combustible, año)
+    inversion  = precio_de + cuenta["importacion"]
+    margen_eur = round(mediana_es - inversion, 2)
+    margen_pct = round((margen_eur / inversion) * 100, 1) if inversion > 0 else 0.0
+    cuenta.update({
+        "margen_eur": margen_eur,
+        "margen_pct": margen_pct,
+        "inversion":  round(inversion, 2),
+    })
+    return cuenta
+
+
+def es_nuevo_fiscal(km: float = 0, año: int = 0, antiguedad_meses: int | None = None) -> bool:
+    """
+    Nuevo fiscal (IVA español aplicable) si <NUEVO_FISCAL_KM_MAX km O <NUEVO_FISCAL_MESES_MAX meses.
+    Sin dato de meses, usa el año de matriculación como señal (matriculado este año natural).
+    """
+    try:
+        if km and int(km) < NUEVO_FISCAL_KM_MAX:
+            return True
+    except (ValueError, TypeError):
+        pass
+    if antiguedad_meses is not None:
+        return antiguedad_meses < NUEVO_FISCAL_MESES_MAX
+    try:
+        return bool(año) and int(año) >= datetime.now().year
+    except (ValueError, TypeError):
+        return False
 
 
 def calcular_landing_price(precio_de: float, co2: float) -> dict:

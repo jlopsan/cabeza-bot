@@ -43,11 +43,11 @@ Si no cabe todo, cerrar en este orden. El vídeo NO sale hasta que 1-3 estén pr
 
 ## 3. Cálculo de importación (calculator.py)
 
-- [ ] 3.1 Reescribir `calcular_landing_price(precio_de, mediana_es, co2)` → base IEDMT = `mediana_es` (NO precio DE); desglose transporte + COC/gestión + homologación/ITV + tasas DGT + IEDMT.
-- [ ] 3.2 `calcular_margen(precio_de, mediana_es, co2)` → `{margen_eur, margen_pct, importacion, iedmt, tipo_iedmt}`.
-- [ ] 3.3 `estimar_co2_deterministico(combustible, año)` en calculator/config (sin IA).
-- [ ] 3.4 Detección nuevo fiscal (`<6 meses` o `<6.000 km`) y flag Netto → banderas para la tarjeta.
-- [ ] 3.5 Verificar `calcular_tipo_iedmt` usa los cortes correctos; tests unitarios de los 4 tramos + caso CO₂=0.
+- [x] 3.1 `calcular_cuenta_importacion(precio_de, mediana_es, co2, combustible, año)` NUEVA (aislada, NO reescribe la legacy que usa scanner.py) → base IEDMT = `mediana_es`; desglose transporte + COC/gestión + homologación/ITV + tasas DGT + IEDMT.
+- [x] 3.2 `calcular_margen_sniper(...)` → `{margen_eur, margen_pct, importacion, inversion, iedmt, tipo_iedmt_pct, co2_estimado, desglose}`.
+- [x] 3.3 `estimar_co2_deterministico(combustible, año)` en calculator (sin IA) + `_normalizar_comb`.
+- [x] 3.4 `es_nuevo_fiscal(km, año, meses)` + flag `co2_estimado` para la tarjeta. (Flag Netto lo aporta el scraper, grupo 4.)
+- [x] 3.5 Verificado `calcular_tipo_iedmt`: tests de los 4 tramos (0/4,75/9,75/14,75) + caso CO₂=0 → estimación. Regresión legacy OK.
 
 ## 4. Scraper AutoScout24 (robustez + extracción)
 
