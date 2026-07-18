@@ -124,6 +124,11 @@ VALORACION_KM_BANDA = int(os.getenv("VALORACION_KM_BANDA", "20000"))  # ancho de
 # Páginas de la fase de detección (listado AS24 ordenado por reciente).
 SNIPER_DETECCION_PAGINAS = int(os.getenv("SNIPER_DETECCION_PAGINAS", "2"))
 
+# A partir de esta antigüedad (años) la tabla de Hacienda suele valorar por
+# encima del mercado usado → el IEDMT real puede superar la estimación.
+# La tarjeta avisa. Ver memoria iedmt-metodologia-oficial (fase 2 = tablas BOE).
+SNIPER_AVISO_IEDMT_ANOS = int(os.getenv("SNIPER_AVISO_IEDMT_ANOS", "8"))
+
 # ─── FREEMIUM SNIPER ─────────────────────────────────────────────────────────
 # Coste por tier al crear misión. free = 1 crédito UNA sola vez de por vida;
 # paid = 5 por misión; pro no descuenta (dormido).

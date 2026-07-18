@@ -9,10 +9,12 @@ import html
 import json
 import logging
 import statistics
+from datetime import datetime
 
 from config import (
     VALORACION_TTL_H, VALORACION_KM_BANDA,
     SNIPER_UMBRAL_EUR, SNIPER_UMBRAL_PCT,
+    SNIPER_AVISO_IEDMT_ANOS,
 )
 from calculator import calcular_margen_sniper, es_nuevo_fiscal
 from scraper import ScraperAutoScout24, buscar_comparables_todas
@@ -217,6 +219,15 @@ def render_tarjeta_alerta(anuncio: dict, valoracion: dict, cuenta: dict,
         lineas.append("⚠️ <i>Nuevo fiscal: sumaría IVA español 21%.</i>")
     if anuncio.get("es_netto"):
         lineas.append("ℹ️ <i>Precio Netto (MwSt. ausweisbar). Con NIF-IVA el margen sube.</i>")
+
+    # Coche antiguo: la tabla de Hacienda suele valorar por encima del mercado
+    # → el IEDMT real puede superar la estimación (margen algo menor del mostrado).
+    try:
+        anio_int = int(anuncio.get("año", 0) or 0)
+    except (ValueError, TypeError):
+        anio_int = 0
+    if anio_int and (datetime.now().year - anio_int) >= SNIPER_AVISO_IEDMT_ANOS:
+        lineas.append("⚠️ <i>Coche antiguo: Hacienda puede valorar más alto. Verifica el IEDMT oficial.</i>")
 
     if cuenta.get("co2_estimado"):
         lineas.append("<i>CO₂ no publicado → IEDMT estimado.</i>")
