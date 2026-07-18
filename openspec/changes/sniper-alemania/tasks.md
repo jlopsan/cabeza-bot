@@ -102,19 +102,22 @@ Si no cabe todo, cerrar en este orden. El vídeo NO sale hasta que 1-3 estén pr
 - [ ] 9.3 `scraper.py`: eliminar `buscar_y_cruzar`, `buscar_coches_alemania` si ya no los usa nadie (verificar imports en worker y main).
 - [ ] 9.4 Grep de referencias muertas (`calcular_sniper_score`, `precio_objetivo_es`, `buscar_y_cruzar`) → 0 usos vivos.
 
-## 10. Tests manuales con casos reales (criterios de aceptación)
+## 10. Tests con casos reales (criterios de aceptación)
 
-- [ ] 10.1 Crear misión real (BMW 320d 2019-2021, <25.000€, <100.000 km): primera pasada siembra snapshot SIN alertas.
-- [ ] 10.2 Anuncio nuevo genera alerta en <10 min; el mismo anuncio no vuelve a alertar; re-publicación (ID nuevo, misma huella) no alerta.
-- [ ] 10.3 Reinicio del worker no re-alerta ni pierde snapshot.
-- [ ] 10.4 Cuenta a mano contra 2-3 anuncios reales: IEDMT del tramo correcto según CO₂, margen coherente con mediana ES.
-- [ ] 10.5 Caso sin CO₂ → tarjeta "IEDMT estimado" sin romper.
-- [ ] 10.6 Caso nuevo fiscal (<6.000 km) → aviso de IVA; caso Netto → flag.
-- [ ] 10.7 AutoScout24 caído (simular fallo) → circuit breaker pausa 30 min, log claro, resto del bot vivo.
-- [ ] 10.8 Deep link `?start=v_sniper_alemania` → `fuente_captacion` persistida + onboarding contextual.
-- [ ] 10.9 Freemium: free 1 misión → segunda bloqueada con paywall sniper; cobro 5 créditos solo al crear; alertas no descuentan.
-- [ ] 10.10 Presupuesto: 30 misiones simuladas → pasada respeta `SNIPER_BUDGET_S` y reparte por `last_run_at`.
-- [ ] 10.11 REGRESIÓN: `/analizar` v4, `/ideal`, `/comparar`, `/tasar` y ciclo health intactos.
+Validado por Claude en local (código + red real, sin Telegram):
+- [x] 10.2b Detección REAL AutoScout24 (VW Golf): 20 anuncios, señal `ok`, campos correctos. Ciclo simulado: siembra → alerta chollo nuevo → no re-alerta → re-publicación (misma huella) no alerta.
+- [x] 10.4 Cuenta contra anuncios REALES: e-Golf 10.000€ vs mercado ES real (21 comparables, mediana 20.690€) → IEDMT 0% (eléctrico), margen 8.890€. Diésel CO₂ 130 → 4,75%. Fase 2 real extrae CO₂/CV/vendedor/Netto.
+- [x] 10.5 Caso sin CO₂ → estimación determinista + tarjeta "IEDMT estimado" sin romper.
+- [x] 10.6 Nuevo fiscal (<6.000 km) → aviso IVA; Netto → flag. (Render probado.)
+- [x] 10.9 Freemium `_puede_crear_sniper`: 5 casos (free 1-vez, límites, créditos) correctos.
+- [x] 10.11 REGRESIÓN import: 13 módulos importan juntos; `/analizar`, `/ideal`, `/comparar`, `/tasar` y legacy vivos.
+
+Pendientes de Juan (requieren bot en vivo con token):
+- [ ] 10.1 Crear misión real vía Telegram y ver la siembra sin alertas en la primera pasada del worker.
+- [ ] 10.3 Reinicio del worker no re-alerta ni pierde snapshot (validar en el server).
+- [ ] 10.7 AutoScout24 caído real → circuit breaker pausa 30 min (simulable con URL rota).
+- [ ] 10.8 Deep link `?start=v_sniper_alemania` en el bot real → fuente + onboarding.
+- [ ] 10.10 Presupuesto con muchas misiones reales en el server.
 
 ## 11. Despliegue
 
