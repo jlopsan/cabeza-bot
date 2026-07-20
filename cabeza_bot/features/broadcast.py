@@ -6,7 +6,7 @@ import asyncio
 import sqlite3
 import time
 import httpx
-from config import TELEGRAM_TOKEN, DB_PATH
+from cabeza_bot.config import TELEGRAM_TOKEN, DB_PATH
 
 MENSAJE = """\
 Mis disculpas.

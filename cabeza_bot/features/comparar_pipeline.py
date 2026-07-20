@@ -28,16 +28,16 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from ai import (
+from cabeza_bot.analisis.ai import (
     parsear_comparar_input,
     enriquecer_modelo,
     generar_veredicto_comparar,
     resolver_generacion_años,
 )
-from config import COMPARAR_KM_AÑO_REF, COMPARAR_PRECIO_LITRO_EUR
-from database import guardar_historico_batch
-from dgt import calcular_etiqueta_dgt, info_zbe
-from scraper import buscar_comparables_todas, obtener_anuncio_por_url
+from cabeza_bot.config import COMPARAR_KM_AÑO_REF, COMPARAR_PRECIO_LITRO_EUR
+from cabeza_bot.data.database import guardar_historico_batch
+from cabeza_bot.analisis.dgt import calcular_etiqueta_dgt, info_zbe
+from cabeza_bot.scraping.scraper import buscar_comparables_todas, obtener_anuncio_por_url
 
 logger = logging.getLogger(__name__)
 

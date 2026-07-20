@@ -11,14 +11,14 @@ import logging
 import statistics
 from datetime import datetime
 
-from config import (
+from cabeza_bot.config import (
     VALORACION_TTL_H, VALORACION_KM_BANDA,
     SNIPER_UMBRAL_EUR, SNIPER_UMBRAL_PCT,
     SNIPER_AVISO_IEDMT_ANOS,
 )
-from calculator import calcular_margen_sniper, es_nuevo_fiscal
-from scraper import ScraperAutoScout24, buscar_comparables_todas
-import database as db
+from cabeza_bot.fiscal.calculator import calcular_margen_sniper, es_nuevo_fiscal
+from cabeza_bot.scraping.scraper import ScraperAutoScout24, buscar_comparables_todas
+import cabeza_bot.data.database as db
 
 logger = logging.getLogger(__name__)
 

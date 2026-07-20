@@ -5,7 +5,7 @@ Key en: https://cloud.sambanova.ai → API Keys
 """
 import os, re, json, logging, asyncio, time, html as _html
 from openai import AsyncOpenAI
-from config import (
+from cabeza_bot.config import (
     TAVILY_CACHE_TTL_HOURS,
     TAVILY_DOMINIOS_FOROS,
     TAVILY_DOMINIOS_FIABILIDAD,
@@ -269,7 +269,7 @@ async def obtener_contexto_perfil(perfil: dict) -> tuple[str, list[tuple[str, st
     if not snippets:
         return "", []
     try:
-        from config import MARCAS_MOBILE_ID
+        from cabeza_bot.config import MARCAS_MOBILE_ID
         marcas = list(MARCAS_MOBILE_ID.keys())
         modelos = _extraer_modelos_de_snippets(snippets, marcas)
         logger.info(f"[IDEAL_CTX] Tavily extrajo {len(modelos)} pares (marca,modelo)")
@@ -1339,7 +1339,7 @@ async def generar_veredicto_analizar(
     caja = version_info.get("caja") or "?"
 
     # DGT
-    from dgt import calcular_etiqueta_dgt, info_zbe
+    from cabeza_bot.analisis.dgt import calcular_etiqueta_dgt, info_zbe
     etiqueta = calcular_etiqueta_dgt(combustible, anuncio.año)
     zbe_txt = info_zbe(etiqueta)
 
@@ -1426,7 +1426,7 @@ async def generar_veredicto_analizar(
         )
 
     # Señales de alerta (lógica determinista)
-    from red_flags import detectar_red_flags
+    from cabeza_bot.analisis.red_flags import detectar_red_flags
     flags = detectar_red_flags(anuncio, stats)
     if vision and vision.get("alerta_km"):
         flags.append(vision["alerta_km"])

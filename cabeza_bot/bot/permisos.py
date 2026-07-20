@@ -11,8 +11,8 @@ from functools import wraps
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 
-from config import FREE_CREDITOS, PAID_CREDITOS_PACK_10, PAID_CREDITOS_PACK_100, ADMIN_USER_IDS
-from database import get_o_crear_usuario, puede_usar, registrar_uso
+from cabeza_bot.config import FREE_CREDITOS, PAID_CREDITOS_PACK_10, PAID_CREDITOS_PACK_100, ADMIN_USER_IDS
+from cabeza_bot.data.database import get_o_crear_usuario, puede_usar, registrar_uso
 
 # Coste en créditos de cada comando.
 # Hoy todo cuesta 1 — bucket unificado igual que "3 acciones/día".
@@ -88,7 +88,7 @@ def requiere_acceso(comando: str, registrar: bool = True):
 
 
 def _construir_info(user_id: int, puede: bool, restantes: int) -> dict:
-    from database import obtener_usuario
+    from cabeza_bot.data.database import obtener_usuario
     u = obtener_usuario(user_id) or {}
     plan = u.get("tier", "free")
 

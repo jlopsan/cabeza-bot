@@ -17,17 +17,17 @@ import time
 from datetime import datetime
 from typing import Any
 
-from ai import (
+from cabeza_bot.analisis.ai import (
     parsear_query_a_slots,
     generar_candidatos_modelos,
     enriquecer_candidato,
     generar_veredicto_ideal_v2,
 )
-from ideal_schema import (
+from cabeza_bot.features.ideal_schema import (
     SlotsIdeal, DEFAULTS_SLOTS, es_skip, parsear_respuesta_corta,
 )
-from red_flags import detectar_red_flags
-from scraper import buscar_comparables_wallapop
+from cabeza_bot.analisis.red_flags import detectar_red_flags
+from cabeza_bot.scraping.scraper import buscar_comparables_wallapop
 
 logger = logging.getLogger(__name__)
 

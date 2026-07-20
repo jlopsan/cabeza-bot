@@ -21,11 +21,11 @@ from telegram.ext import (
     ConversationHandler, filters, ContextTypes,
 )
 
-from config import TELEGRAM_TOKEN, TOP_RESULTS, MIN_BENEFICIO, ALLOWED_USER_IDS, ADMIN_USER_IDS
-from config import IDEAL_TOP_N, IDEAL_KM_AÑO_MAX
-from config import STRIPE_API_KEY, STRIPE_PRICE_PACK_10, STRIPE_PRICE_PACK_100
-from permisos import requiere_acceso
-from ai import (
+from cabeza_bot.config import TELEGRAM_TOKEN, TOP_RESULTS, MIN_BENEFICIO, ALLOWED_USER_IDS, ADMIN_USER_IDS
+from cabeza_bot.config import IDEAL_TOP_N, IDEAL_KM_AÑO_MAX
+from cabeza_bot.config import STRIPE_API_KEY, STRIPE_PRICE_PACK_10, STRIPE_PRICE_PACK_100
+from cabeza_bot.bot.permisos import requiere_acceso
+from cabeza_bot.analisis.ai import (
     parsear_filtros_nl, parsear_modelo_nl, enriquecer_coches,
     texto_analisis, validar_precio_mercado, filtrar_por_extras,
     generar_veredicto_analizar, preguntas_y_checklist, formatear_qa,
@@ -35,13 +35,13 @@ from ai import (
     brainstorm_candidatos_ideal, seleccionar_top3_con_investigacion,
     parsear_datos_anuncio_manual, generar_texto_tasacion,
 )
-from ideal_pipeline import (
+from cabeza_bot.features.ideal_pipeline import (
     nueva_sesion, get_sesion, reset_sesion, set_sesion,
     alimentar_slots, ejecutar_pipeline, fase_segunda_ronda,
 )
-import comparar_pipeline
-from ideal_schema import generar_preguntas_clarificacion
-from database import (
+import cabeza_bot.features.comparar_pipeline as comparar_pipeline
+from cabeza_bot.features.ideal_schema import generar_preguntas_clarificacion
+from cabeza_bot.data.database import (
     init_db, crear_mision, eliminar_mision,
     obtener_misiones_usuario, pausar_mision, activar_mision,
     registrar_usuario, obtener_tier, obtener_usuario,
@@ -53,18 +53,18 @@ from database import (
     contar_eventos, registrar_evento_embudo, set_fuente_captacion,
     stats_sniper, renovar_mision,
 )
-from config import FREE_CREDITOS, PAID_CREDITOS_PACK_10, PAID_CREDITOS_PACK_100
-from config import (
+from cabeza_bot.config import FREE_CREDITOS, PAID_CREDITOS_PACK_10, PAID_CREDITOS_PACK_100
+from cabeza_bot.config import (
     ENABLE_SNIPER, COSTE_SNIPER_FREE, COSTE_SNIPER_PAID, MISIONES_MAX,
     SNIPER_UMBRAL_EUR, SNIPER_UMBRAL_PCT, SNIPER_MISION_DIAS,
 )
-import sniper_pipeline as sp
-from scraper import (
+import cabeza_bot.sniper.sniper_pipeline as sp
+from cabeza_bot.scraping.scraper import (
     buscar_y_cruzar, buscar_coches_alemania,
     obtener_anuncio_por_url, buscar_comparables_todas,
 )
 from collections import Counter
-from calculator import (
+from cabeza_bot.fiscal.calculator import (
     formato_tarjeta,
     calcular_sniper_score, formato_sniper_score,
     calcular_precio_maximo_de, formato_calculadora_inversa,
@@ -925,7 +925,7 @@ async def _pipeline_analisis(anuncio, msg, source_msg, ctx, url: str | None = No
     msg: Message de progreso (se edita). source_msg: Message original del usuario.
     url: None en modo manual (omite caché y enlace "Ver anuncio").
     """
-    from models import EstadisticaMercado
+    from cabeza_bot.models import EstadisticaMercado
 
     marca  = anuncio.marca  or "desconocida"
     modelo = anuncio.modelo or "desconocido"
@@ -1314,7 +1314,7 @@ async def _ideal_avanzar(source_msg, ctx) -> int:
 
 async def _ideal_guardar_y_continuar(campo: str, valor, source_msg, ctx) -> int:
     """Guarda valor en el perfil, elimina el hueco y avanza."""
-    from ai import DURACION_USO_A_KM_MAX
+    from cabeza_bot.analisis.ai import DURACION_USO_A_KM_MAX
 
     perfil = ctx.user_data.get("ideal_perfil", {})
 
@@ -1445,7 +1445,7 @@ async def _sondear_modelos_viables(
     ordenada ASC por precio mínimo encontrado.
     Cacheado 24h por (marca, modelo, presupuesto_max // 2000).
     """
-    from scraper import sondear_precio_modelo
+    from cabeza_bot.scraping.scraper import sondear_precio_modelo
 
     semilla = TAMANO_A_MODELOS.get(tamaño, [])
     universo = list(semilla)
@@ -1521,8 +1521,8 @@ async def _ideal_buscar(source_msg, ctx) -> int:
     """
     from datetime import datetime
     from statistics import median
-    from scraper import ScraperWallapop
-    from red_flags import detectar_red_flags
+    from cabeza_bot.scraping.scraper import ScraperWallapop
+    from cabeza_bot.analisis.red_flags import detectar_red_flags
 
     perfil   = ctx.user_data.get("ideal_perfil", {})
     user_id  = ctx.user_data.get("ideal_user_id")
@@ -2142,7 +2142,7 @@ async def _ideal_v2_procesar_texto(update, ctx, texto: str, sesion: dict) -> int
 
     # Registrar evento métrica
     try:
-        from database import registrar_evento_ideal
+        from cabeza_bot.data.database import registrar_evento_ideal
         duracion = int(time.time() - sesion.get("duracion_inicio", time.time()))
         registrar_evento_ideal(
             user_id=user.id,
@@ -2252,7 +2252,7 @@ async def callback_ideal_v2_aceptar(update: Update, ctx: ContextTypes.DEFAULT_TY
     )
 
     try:
-        from database import registrar_evento_ideal
+        from cabeza_bot.data.database import registrar_evento_ideal
         registrar_evento_ideal(
             user_id=user.id,
             slots=sesion["slots"].to_dict(),
@@ -2335,7 +2335,7 @@ async def callback_ideal_v2_ninguno(update: Update, ctx: ContextTypes.DEFAULT_TY
         return
 
     # Cobrar un crédito por la segunda ronda
-    from permisos import _construir_info, _enviar_paywall
+    from cabeza_bot.bot.permisos import _construir_info, _enviar_paywall
     puede, restantes = puede_usar(user.id, 1)
     if not puede:
         info = _construir_info(user.id, puede, restantes)
@@ -2361,7 +2361,7 @@ async def callback_ideal_v2_ninguno(update: Update, ctx: ContextTypes.DEFAULT_TY
         return
 
     try:
-        from ai import generar_veredicto_ideal_v2
+        from cabeza_bot.analisis.ai import generar_veredicto_ideal_v2
         html_veredicto = await generar_veredicto_ideal_v2(top3, sesion["slots"].to_dict())
     except Exception as e:
         logger.warning(f"[IDEAL_V2] veredicto segunda ronda: {e}")
@@ -2523,7 +2523,7 @@ async def callback_ideal_analizar(update: Update, ctx: ContextTypes.DEFAULT_TYPE
     if es_admin:
         puede = True
     if not puede:
-        from permisos import _construir_info, _enviar_paywall
+        from cabeza_bot.bot.permisos import _construir_info, _enviar_paywall
         info = _construir_info(user.id, puede, restantes)
         await _enviar_paywall(update, info, "/analizar")
         return
@@ -2727,7 +2727,7 @@ async def _capturar_datos_manuales(update: Update, ctx: ContextTypes.DEFAULT_TYP
 
     ctx.user_data.pop("esperando_datos_manuales", None)
 
-    from models import Anuncio
+    from cabeza_bot.models import Anuncio
     import uuid
 
     anuncio = Anuncio(
@@ -3324,7 +3324,7 @@ async def cmd_stats_sniper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     fuentes_txt = "\n".join(
         f"  • {html.escape(f['fuente'])}: {f['usuarios']}" for f in fuentes
     ) or "  (sin datos)"
-    from database import fuente_pausada as _fp
+    from cabeza_bot.data.database import fuente_pausada as _fp
     breaker = "🔴 PAUSADA" if _fp("autoscout24") else "🟢 OK"
     await update.message.reply_text(
         f"🎯 <b>Stats sniper</b>\n\n"

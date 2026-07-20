@@ -30,7 +30,7 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 # terceros esperan aquí (no se pierden).
 _PLAYWRIGHT_SEM = asyncio.Semaphore(2)
 
-from config import (
+from cabeza_bot.config import (
     USER_AGENTS, PROXIES, TOP_RESULTS, MAX_PAGES_DE, MAX_COCHES_RAW,
     ENABLE_AUTOSCOUT24, ENABLE_MOBILE_DE, ENABLE_WALLAPOP, ENABLE_COCHES_NET,
     WALLAPOP_LATITUDE, WALLAPOP_LONGITUDE, WALLAPOP_DISTANCE, WALLAPOP_RESULTS,
@@ -575,7 +575,7 @@ class ScraperAutoScout24(ScraperDE):
             # Estimar CO₂ si no se encontró
             if coche["co2"] == 0.0:
                 try:
-                    from ai import estimar_co2
+                    from cabeza_bot.analisis.ai import estimar_co2
                     comb = coche.get("combustible") or _detectar_combustible_titulo(coche["titulo"])
                     coche["co2"] = await estimar_co2(marca, modelo, coche["año"], comb)
                 except Exception:
@@ -683,7 +683,7 @@ class ScraperAutoScout24(ScraperDE):
           - 'vacio' : HTML válido, 0 anuncios (mercado sin stock — NO es fallo).
           - 'fallo' : excepción/timeout/estructura rota (el breaker puede actuar).
         """
-        from config import SNIPER_DETECCION_PAGINAS
+        from cabeza_bot.config import SNIPER_DETECCION_PAGINAS
         filtros = filtros or {}
         paginas = paginas or SNIPER_DETECCION_PAGINAS
         user_agent = random.choice(USER_AGENTS)
@@ -1102,7 +1102,7 @@ class ScraperMobileDe(ScraperDE):
                 co2 = v if 50 <= v <= 400 else 0.0
             if co2 == 0.0:
                 try:
-                    from ai import estimar_co2
+                    from cabeza_bot.analisis.ai import estimar_co2
                     comb = _normalizar_combustible_de(datos.get("combustible", "")) or _detectar_combustible_titulo(titulo)
                     co2 = await estimar_co2(marca, modelo, año, comb)
                 except Exception:
@@ -1181,7 +1181,7 @@ class ScraperWallapop:
 
     async def buscar_precios(self, marca: str, modelo: str, año: int, km: int) -> dict:
         try:
-            from ai import normalizar_modelo_wallapop
+            from cabeza_bot.analisis.ai import normalizar_modelo_wallapop
             modelo_base = await normalizar_modelo_wallapop(marca, modelo)
             keywords = f"{marca.strip().title()} {modelo_base}"
         except Exception:
@@ -1468,7 +1468,7 @@ class ScraperWallapop:
         Soporta la estructura actual (2025): type_attributes para datos de coche,
         price.amount o price.cash.amount para precio, images[].urls.medium para fotos.
         """
-        from models import Anuncio
+        from cabeza_bot.models import Anuncio
         from datetime import datetime as _dt, timezone as _tz
 
         item_id = str(content.get("id") or fallback_id)
@@ -1670,7 +1670,7 @@ class ScraperCochesNet:
     def _parsear_cards_html(self, html: str, marca: str, modelo: str, n: int) -> list:
         """Parsea el HTML de listado coches.net (SSR). Título incluye motor exacto."""
         import html as _html
-        from models import Anuncio
+        from cabeza_bot.models import Anuncio
         from datetime import datetime
 
         anuncios: list = []
@@ -1790,7 +1790,7 @@ class ScraperCochesNet:
                                        ld_precio: float, ld_titulo: str,
                                        ua: str = ""):
         """Construye un Anuncio desde HTML estático (ruta httpx S1)."""
-        from models import Anuncio
+        from cabeza_bot.models import Anuncio
         from datetime import datetime as _dt, timezone as _tz
 
         titulo = ld_titulo or ""
@@ -1865,7 +1865,7 @@ class ScraperCochesNet:
         S1: httpx con cookies precalentadas (evita Playwright si no hay bloqueo).
         S2: Playwright headed con stealth mejorado + pre-warm + retry.
         """
-        from models import Anuncio
+        from cabeza_bot.models import Anuncio
         from datetime import datetime as _dt, timezone as _tz
 
         ua_chrome = next(
@@ -2107,7 +2107,7 @@ class ScraperCochesNet:
                 # Fallback: extraer marca/modelo del título con IA
                 if (not marca or not modelo) and titulo:
                     try:
-                        from ai import parsear_modelo_nl
+                        from cabeza_bot.analisis.ai import parsear_modelo_nl
                         parsed = await parsear_modelo_nl(titulo)
                         marca = marca or parsed.get("marca", "")
                         modelo = modelo or parsed.get("modelo", "")
@@ -2277,7 +2277,7 @@ class ScraperCochesNet:
         return anuncios
 
     async def _extraer_card(self, card, marca: str, modelo: str):
-        from models import Anuncio
+        from cabeza_bot.models import Anuncio
         from datetime import datetime as _dt, timezone as _tz
 
         # Texto crudo del card → fallback para año/km
@@ -2473,8 +2473,8 @@ def _persistir_de_historico(anuncios: list[dict], marca: str, modelo: str) -> in
     fuente='autoscout24'. Mismos filtros de calidad que ES: precio>0, año>1990.
     El dataset DE vs ES es un activo del producto.
     """
-    from models import Anuncio
-    from database import guardar_historico_batch
+    from cabeza_bot.models import Anuncio
+    from cabeza_bot.data.database import guardar_historico_batch
     lote = []
     for a in anuncios:
         try:
@@ -2630,7 +2630,7 @@ async def buscar_comparables_wallapop(
     Parámetros de tolerancia: año ±1, km ±20k.
     """
     try:
-        from ai import normalizar_modelo_wallapop
+        from cabeza_bot.analisis.ai import normalizar_modelo_wallapop
         modelo_base = await normalizar_modelo_wallapop(marca, modelo)
         keywords = f"{marca.strip().title()} {modelo_base}"
     except Exception:

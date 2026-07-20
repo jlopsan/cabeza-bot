@@ -13,11 +13,11 @@ import stripe
 
 from fastapi import FastAPI, Request, HTTPException
 
-from config import (
+from cabeza_bot.config import (
     STRIPE_API_KEY, STRIPE_WEBHOOK_SEC, TELEGRAM_TOKEN,
     PAID_CREDITOS_PACK_10, PAID_CREDITOS_PACK_100, FREE_CREDITOS,
 )
-from database import activar_plan, desactivar_pro, pago_ya_procesado
+from cabeza_bot.data.database import activar_plan, desactivar_pro, pago_ya_procesado
 
 stripe.api_key = STRIPE_API_KEY
 app    = FastAPI()

@@ -8,7 +8,7 @@ from pathlib import Path
 # Añadir el directorio actual al path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from ai import buscar_problemas_foros, _formato_problemas_foros
+from cabeza_bot.analisis.ai import buscar_problemas_foros, _formato_problemas_foros
 
 async def test_buscar_problemas():
     """Prueba la búsqueda de problemas en foros para diferentes coches."""

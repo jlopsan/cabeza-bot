@@ -15,20 +15,20 @@ import time
 
 import httpx
 
-from config import (
+from cabeza_bot.config import (
     TELEGRAM_TOKEN, ENABLE_SNIPER,
     SNIPER_INTERVAL_MINUTES, SNIPER_BUDGET_S, SNIPER_MAX_SCRAPES_HORA,
     SNIPER_CB_FALLOS, SNIPER_CB_PAUSA_MIN, SNIPER_ALERTAS_PASADA,
 )
-from database import (
+from cabeza_bot.data.database import (
     init_db, purgar_historico_antiguo,
     expirar_misiones_legacy, expirar_misiones_vencidas,
     obtener_misiones_sniper_activas, set_mision_run, incr_alertas_mision,
     fuente_pausada, incr_fallo_fuente, reset_fuente,
     incr_scrape_hora, scrapes_ultima_hora, registrar_evento_embudo,
 )
-from scraper import buscar_comparables_todas, ScraperAutoScout24
-import sniper_pipeline as sp
+from cabeza_bot.scraping.scraper import buscar_comparables_todas, ScraperAutoScout24
+import cabeza_bot.sniper.sniper_pipeline as sp
 
 logging.basicConfig(
     format="%(asctime)s [WORKER] %(levelname)s - %(message)s",

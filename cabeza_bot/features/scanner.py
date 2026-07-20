@@ -12,15 +12,15 @@ import random
 
 import httpx
 
-from config import (
+from cabeza_bot.config import (
     TELEGRAM_TOKEN, SCANNER_CHANNEL_ID, SCANNER_INTERVAL_MINUTES,
     SCANNER_TOP_DEALS, SCANNER_MODELS, MIN_BENEFICIO,
 )
-from database import (
+from cabeza_bot.data.database import (
     init_db, scanner_ya_enviado, scanner_marcar_enviado,
 )
-from scraper import buscar_y_cruzar
-from calculator import (
+from cabeza_bot.scraping.scraper import buscar_y_cruzar
+from cabeza_bot.fiscal.calculator import (
     calcular_landing_price, calcular_beneficio,
     calcular_sniper_score, formato_sniper_score, formato_tarjeta,
 )

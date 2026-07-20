@@ -4,7 +4,7 @@ import json
 import hashlib
 import logging
 from datetime import datetime, timedelta
-from config import DB_PATH, ALLOWED_USER_IDS, FREE_CREDITOS, PAID_CREDITOS_PACK_10, PAID_CREDITOS_PACK_100
+from cabeza_bot.config import DB_PATH, ALLOWED_USER_IDS, FREE_CREDITOS, PAID_CREDITOS_PACK_10, PAID_CREDITOS_PACK_100
 
 logger = logging.getLogger(__name__)
 
