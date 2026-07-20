@@ -2946,9 +2946,10 @@ async def _pipeline_tasacion(marca, modelo, año, km, con_km, cv_obj, comb_obj, 
 _PROMPT_SNIPER = (
     "🎯 <b>Nuevo sniper</b>\n\n"
     "Dime qué vigilar en Alemania. <b>Marca y modelo</b>, y si quieres años, "
-    "km máx y precio máx.\n\n"
-    "Ej: <code>BMW 320d 2019-2021 hasta 25.000€ menos de 100.000 km</code>\n"
-    "Ej: <code>Audi A4 diésel automático del 2020</code>"
+    "km máx, precio máx y el <b>margen</b> que buscas.\n\n"
+    "Ej: <code>BMW 320d 2019-2021 hasta 25.000€ con 15% de margen</code>\n"
+    "Ej: <code>Audi A4 diésel del 2020 que deje 3.000€</code>\n"
+    "Ej: <code>Golf GTI menos de 100.000 km</code>"
 )
 
 
@@ -3016,6 +3017,65 @@ async def _paywall_sniper(dest, user_id: int, motivo: str):
     await dest.reply_text(texto, parse_mode="HTML", reply_markup=_SNIPER_PACK_BOTONES)
 
 
+def _num_es(s: str) -> float:
+    """'3.000' → 3000 ; '2500' → 2500. Puntos = miles."""
+    try:
+        return float(str(s).replace(".", "").replace(" ", "").replace(",", "."))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _extraer_umbral_sniper(texto: str) -> tuple[float | None, float | None]:
+    """
+    Extrae umbral de margen del texto (determinista, sin IA).
+    Devuelve (umbral_eur, umbral_pct); None si no se menciona.
+    - '%' o 'por ciento' → pct (nunca es un precio).
+    - euros SOLO con contexto de margen (margen/beneficio/deje/gane/saque) para
+      no confundir con el precio máximo. Se acepta el número si es >= 100.
+    """
+    t = (texto or "").lower()
+    pct = None
+    m = _re.search(r"(\d{1,3})\s*(?:%|por\s*ciento)", t)
+    if m:
+        pct = float(m.group(1))
+
+    eur = None
+    patrones = [
+        r"margen\s+(?:neto\s+)?(?:de\s+|del\s+|m[íi]nimo\s+|min\.?\s+|de al menos\s+|superior a\s+)?(\d[\d.]*)",
+        r"beneficio\s+(?:de\s+|del\s+|m[íi]nimo\s+)?(\d[\d.]*)",
+        r"(\d[\d.]*)\s*(?:€|eur|euros?)?\s*de\s+margen",
+        r"(?:deje|deja|dejar|gane|gana|ganar|saque|saca|sacar)\s+(?:al menos\s+|m[áa]s de\s+)?(\d[\d.]*)",
+    ]
+    for pat in patrones:
+        mm = _re.search(pat, t)
+        if mm:
+            val = _num_es(mm.group(1))
+            if val >= 100:
+                eur = val
+                break
+    return eur, pct
+
+
+def _resolver_umbral(texto: str) -> tuple[int, float]:
+    """
+    Resuelve el umbral efectivo. Si el usuario especifica uno (€ o %), ese manda
+    y el otro se relaja a 0. Si no dice nada, defaults de config (ambos).
+    """
+    eur, pct = _extraer_umbral_sniper(texto)
+    if eur is None and pct is None:
+        return SNIPER_UMBRAL_EUR, SNIPER_UMBRAL_PCT
+    return int(eur or 0), float(pct or 0)
+
+
+def _texto_umbral(eur: int, pct: float) -> str:
+    partes = []
+    if eur:
+        partes.append(f"≥ {int(eur):,}€".replace(",", "."))
+    if pct:
+        partes.append(f"≥ {pct:.0f}%")
+    return " y ".join(partes) if partes else "cualquier margen"
+
+
 def _resumen_slots_sniper(marca: str, modelo: str, filtros: dict) -> str:
     partes = [f"<b>{html.escape(marca.title())} {html.escape(modelo.upper())}</b>"]
     if filtros.get("year_min") or filtros.get("year_max"):
@@ -3051,9 +3111,12 @@ async def _sniper_procesar_texto(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     # Limpiamos claves internas del parser (empiezan por _).
     filtros = {k: v for k, v in filtros.items() if not k.startswith("_")}
 
+    umbral_eur, umbral_pct = _resolver_umbral(texto)
+
     ctx.user_data.pop("esperando_sniper", None)
     ctx.user_data["sniper_pendiente"] = {"marca": marca, "modelo": modelo,
-                                          "filtros": filtros, "query": texto}
+                                          "filtros": filtros, "query": texto,
+                                          "umbral_eur": umbral_eur, "umbral_pct": umbral_pct}
 
     resumen = _resumen_slots_sniper(marca, modelo, filtros)
     teclado = InlineKeyboardMarkup([
@@ -3062,7 +3125,7 @@ async def _sniper_procesar_texto(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     ])
     await update.effective_message.reply_text(
         f"🎯 <b>Voy a vigilar esto:</b>\n\n{resumen}\n\n"
-        f"Te aviso cuando salte uno con margen (≥ {SNIPER_UMBRAL_EUR:,}€ y ≥ {SNIPER_UMBRAL_PCT:.0f}%).".replace(",", "."),
+        f"Te aviso cuando salte uno con margen <b>{_texto_umbral(umbral_eur, umbral_pct)}</b>.",
         parse_mode="HTML", reply_markup=teclado,
     )
 
@@ -3211,9 +3274,11 @@ async def _crear_sniper_confirmado(query, ctx: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"[SNIPER] valoración inicial falló: {e}")
         v = None
 
+    umbral_eur = pend.get("umbral_eur", SNIPER_UMBRAL_EUR)
+    umbral_pct = pend.get("umbral_pct", SNIPER_UMBRAL_PCT)
     mid = crear_mision_sniper(
         user_id, marca, modelo, pend.get("query", ""),
-        filtros, SNIPER_UMBRAL_EUR, SNIPER_UMBRAL_PCT, SNIPER_MISION_DIAS,
+        filtros, umbral_eur, umbral_pct, SNIPER_MISION_DIAS,
     )
     if coste and user_id not in ADMIN_USER_IDS:
         registrar_uso(user_id, coste)
