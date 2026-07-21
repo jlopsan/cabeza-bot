@@ -139,3 +139,31 @@ Resueltas por Juan (2026-07-18):
 - **Prioridad en la hoja de ruta** — CONFIRMADO: el sniper adelanta a `/alertas` (S6).
 - **`/importar_alemania` (S7)** — CONFIRMADO: este cambio la sustituye; S7 queda cubierta por `/sniper`.
 - **Tablas BOE IEDMT** — CONFIRMADO fase 2: v1 estimación con disclaimer.
+
+### Mejora a futuro (no ahora — coste, 2026-07-21)
+
+**Fuente DE de pago (Carapis / agregador similar) — DIFERIDO por presupuesto.**
+Investigado como alternativa al scraping propio para eliminar de raíz el cap de
+`SNIPER_MAX_SCRAPES_HORA` y el bloqueo WAF de mobile.de:
+- **Carapis** (carapis.com): API unificada, cubre AS24 + mobile.de en una sola
+  integración, incluye estado TÜV/HU (útil para el semáforo de riesgo). Tarifa
+  plana ($99/mes ≈ 10k llamadas, $299/mes ilimitado) — el modelo de precio que
+  SÍ encaja con vigilancia continua 24/7. Trial 14 días sin tarjeta.
+- **Apify** (scrapers por actor): pago por resultado ($4/1000 AS24, $0.75/1000
+  mobile.de). Descartado para el ciclo del sniper: con solo 20 modelos vigilados
+  cada 15 min, AS24 vía Apify saldría ≈200-230€/día — la economía de pago-por-
+  resultado NO encaja con polling continuo. Podría valer para lookups puntuales
+  (ej. un futuro `/importar_alemania` bajo demanda), no para el worker.
+- **auto-api.com**: tiene endpoint `/changes` pensado justo para polling
+  periódico (encaja conceptualmente mejor que los otros dos), pero precio
+  oculto y requiere contacto comercial — descartado por ahora (Juan no quiere
+  gestión de contacto con proveedores todavía).
+
+**Decisión**: no se activa nada de pago hasta que haya suficientes usuarios de
+pago del sniper para justificar el coste fijo. Cuando llegue ese momento:
+empezar por el trial gratuito de Carapis (sin tarjeta, cero riesgo) para
+validar calidad de datos antes de comprometer presupuesto. El scraping propio
+(AS24 vivo y validado; mobile.de bloqueado por WAF) sigue siendo la única
+fuente en producción — las optimizaciones de agrupación por marca+modelo y
+presupuesto separado worker/escaneo (ver D8 actualizado) son las que mitigan
+el cap mientras tanto, sin coste adicional.
