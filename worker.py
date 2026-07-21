@@ -68,12 +68,11 @@ async def _procesar_mision(mision: dict, anuncios: list[dict], refrescos: int) -
     umbral_eur = mision.get("umbral_margen_eur") or 0
     umbral_pct = mision.get("umbral_margen_pct") or 0
 
-    # Primera pasada: sembrar snapshot SIN alertar.
+    # Primera pasada: marcar como sembrado para no repetir, pero dejar que evalúe y alerte.
     if sp.necesita_siembra(mision):
-        n = sp.sembrar(mision, anuncios)
-        set_mision_run(mid)
-        logger.info(f"[SNIPER] Misión #{mid} sembrada ({n} anuncios), sin alertas")
-        return refrescos
+        from cabeza_bot.data.database import marcar_snapshot_sembrado
+        marcar_snapshot_sembrado(mid)
+        logger.info(f"[SNIPER] Misión #{mid}: Primera pasada (se evaluarán {len(anuncios)} anuncios)")
 
     nuevos = sp.filtrar_nuevos(mision, anuncios)
     if not nuevos:

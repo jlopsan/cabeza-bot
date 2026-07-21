@@ -594,13 +594,20 @@ async def parsear_filtros_nl(texto_usuario: str) -> dict:
         raw = json.loads(_limpiar_json(respuesta))
         result = {}
         # Campos numéricos
-        for k in ("km_min", "km_max", "year_min", "year_max",
+        for k in ("km_min", "km_max", "year_min", "year_max", "year",
                    "price_min", "price_max", "power_min", "power_max", "doors"):
             if raw.get(k) is not None:
                 try:
                     result[k] = int(raw[k])
                 except (ValueError, TypeError):
                     pass
+        
+        # Si la IA devolvió "year" exacto, pon ambos.
+        if "year" in result:
+            result.setdefault("year_min", result["year"])
+            result.setdefault("year_max", result["year"])
+            del result["year"]
+
         # Campos de texto
         for k in ("color", "carroceria", "combustible", "caja"):
             if raw.get(k):
@@ -638,7 +645,13 @@ def _regex_fallback(texto: str) -> dict:
     years = re.findall(r"(20\d{2})", t)
     if len(years) == 1:
         y = int(years[0])
-        filtros["year_min" if "arriba" in t or "partir" in t else "year_max"] = y
+        if "arriba" in t or "partir" in t or "desde" in t:
+            filtros["year_min"] = y
+        elif "hasta" in t or "max" in t:
+            filtros["year_max"] = y
+        else:
+            filtros["year_min"] = y
+            filtros["year_max"] = y
     elif len(years) >= 2:
         filtros["year_min"] = min(int(y) for y in years[:2])
         filtros["year_max"] = max(int(y) for y in years[:2])

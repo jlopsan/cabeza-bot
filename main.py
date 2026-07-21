@@ -3035,7 +3035,7 @@ def _extraer_umbral_sniper(texto: str) -> tuple[float | None, float | None]:
     """
     t = (texto or "").lower()
     pct = None
-    m = _re.search(r"(\d{1,3})\s*(?:%|por\s*ciento)", t)
+    m = _re.search(r"(-?\d{1,3})\s*(?:%|por\s*ciento)", t)
     if m:
         pct = float(m.group(1))
 
@@ -3064,7 +3064,15 @@ def _resolver_umbral(texto: str) -> tuple[int, float]:
     eur, pct = _extraer_umbral_sniper(texto)
     if eur is None and pct is None:
         return SNIPER_UMBRAL_EUR, SNIPER_UMBRAL_PCT
-    return int(eur or 0), float(pct or 0)
+    
+    eur_val = int(eur) if eur is not None else 0
+    pct_val = float(pct) if pct is not None else 0.0
+
+    # Si se pide un porcentaje negativo pero no se especifican euros, relajar los euros a infinito negativo para que no bloqueen.
+    if pct is not None and pct_val < 0 and eur is None:
+        eur_val = -999999
+
+    return eur_val, pct_val
 
 
 def _texto_umbral(eur: int, pct: float) -> str:
@@ -3098,6 +3106,9 @@ async def _sniper_procesar_texto(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     partes = texto.split(maxsplit=1)
     marca  = (parsed.get("marca") or (partes[0] if partes else "")).lower().strip()
     modelo = (parsed.get("modelo") or (partes[1] if len(partes) > 1 else "")).lower().strip()
+    import re
+    modelo = re.sub(r"\b20\d{2}\b", "", modelo).strip()
+    modelo = re.sub(r"\s+", " ", modelo).strip()
 
     if not marca or not modelo:
         ctx.user_data["esperando_sniper"] = True
@@ -3427,10 +3438,10 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_ideal_v2_mas, pattern=r"^ideal_mas$"))
     app.add_handler(CallbackQueryHandler(callback_ideal_v2_ninguno, pattern=r"^ideal_ninguno$"))
     # Ocultos en beta — código intacto, solo sin handler en Telegram:
-    # app.add_handler(CommandHandler("misiones", mis_misiones))
+    app.add_handler(CommandHandler("misiones", mis_misiones))
     # app.add_handler(conv_buscar)
     # app.add_handler(conv_calcular)
-    # app.add_handler(CallbackQueryHandler(callback_misiones, pattern=r"^(pausar|activar|eliminar)_\d+$"))
+    app.add_handler(CallbackQueryHandler(callback_misiones, pattern=r"^(pausar|activar|eliminar)_\d+$"))
     app.add_handler(CallbackQueryHandler(callback_qa, pattern=r"^qa:(si|no)$"))
     app.add_handler(CallbackQueryHandler(callback_pago, pattern=r"^pagar_pack_(10|100)$"))
     app.add_handler(CallbackQueryHandler(callback_manual, pattern=r"^manual:si$"))
