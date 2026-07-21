@@ -416,17 +416,21 @@ def marcar_visto(mision_id: int, anuncio: dict, tipo: str = "snapshot",
 
 # ─── RENDER DE LA TARJETA DE ALERTA ──────────────────────────────────────────
 
-def boton_ver_anuncio(url: str, anuncio_id: str = "", mision_id: int | None = None) -> dict:
+def boton_ver_anuncio(url: str, anuncio_id: str = "", mision_id: int | None = None,
+                      año: int | None = None) -> dict:
     """
     reply_markup para la API HTTP de Telegram (worker) o InlineKeyboard (bot).
     Fila 2: hueco para el informe VIN (afiliación/upsell futuro). Fila 3:
-    desglose completo de la cuenta (ya persistido, cero coste — lee de BD).
+    desglose completo de la cuenta (ya persistido, cero coste). Fila 4: dossier
+    del MODELO bajo demanda (Tavily+IA, cacheado 24h — cero coste si nadie pulsa).
     """
     filas = [[{"text": "🔗 Ver anuncio", "url": url or "#"}]]
     if anuncio_id:
         filas.append([{"text": "🪪 Informe VIN (próximamente)", "callback_data": f"sniper_vin:{anuncio_id}"}])
     if anuncio_id and mision_id is not None:
         filas.append([{"text": "🧾 Cuenta completa", "callback_data": f"sniper_cuenta:{mision_id}:{anuncio_id}"}])
+    if mision_id is not None and año:
+        filas.append([{"text": "📖 Dossier del modelo", "callback_data": f"sniper_dossier:{mision_id}:{int(año)}"}])
     return {"inline_keyboard": filas}
 
 

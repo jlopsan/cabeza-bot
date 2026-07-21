@@ -34,6 +34,7 @@ from cabeza_bot.analisis.ai import (
     investigar_coche, generar_veredicto_ideal,
     brainstorm_candidatos_ideal, seleccionar_top3_con_investigacion,
     parsear_datos_anuncio_manual, generar_texto_tasacion,
+    generar_dossier_modelo,
 )
 from cabeza_bot.features.ideal_pipeline import (
     nueva_sesion, get_sesion, reset_sesion, set_sesion,
@@ -3197,6 +3198,34 @@ async def callback_sniper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text(sp.render_cuenta_completa(registro), parse_mode="HTML")
         return
 
+    if data.startswith("sniper_dossier:"):
+        # Dossier del MODELO bajo demanda: Tavily + 1 llamada IA, cacheado 24h
+        # (cero coste si nadie pulsa; compartido entre todos los que pregunten
+        # por ese mismo modelo el mismo día).
+        await query.answer("Consultando fuentes externas…")
+        try:
+            _, mid_s, año_s = data.split(":", 2)
+            mision = obtener_mision(int(mid_s))
+        except (ValueError, IndexError):
+            mision = None
+        if not mision:
+            await query.message.reply_text("📖 No encontré la misión para este dossier.")
+            return
+        msg = await query.message.reply_text(
+            f"📖 Buscando fiabilidad de {mision['marca'].title()} {mision['modelo'].upper()}…"
+        )
+        try:
+            texto = await generar_dossier_modelo(mision["marca"], mision["modelo"], int(año_s))
+        except Exception as e:
+            logger.warning(f"[SNIPER] dossier falló: {e}")
+            texto = "📖 No se pudo generar el dossier ahora mismo. Reintenta en unos minutos."
+        await msg.edit_text(
+            f"📖 <b>Dossier — {html.escape(mision['marca'].title())} {html.escape(mision['modelo'].upper())}</b>\n\n"
+            f"{html.escape(texto)}",
+            parse_mode="HTML",
+        )
+        return
+
     if data == "sniper_cancelar_scan":
         tarea = _TAREAS_ESCANEO_SNIPER.get(user_id)
         if tarea and not tarea.done():
@@ -3347,6 +3376,9 @@ async def _crear_sniper_confirmado(query, ctx: ContextTypes.DEFAULT_TYPE):
                                                   callback_data=f"sniper_vin:{anuncio['id']}")])
             botones.append([InlineKeyboardButton("🧾 Cuenta completa",
                                                   callback_data=f"sniper_cuenta:{mid}:{anuncio['id']}")])
+        if anuncio.get("año"):
+            botones.append([InlineKeyboardButton("📖 Dossier del modelo",
+                                                  callback_data=f"sniper_dossier:{mid}:{int(anuncio['año'])}")])
         await query.message.reply_text(tarjeta, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(botones))
         # Registrar como visto: el usuario YA lo vio aquí — si no, el worker lo
         # trataría como "nuevo" en su próxima pasada (a veces en minutos) y

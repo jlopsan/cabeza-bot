@@ -22,6 +22,10 @@ VEREDICTOS = ("OK", "SOSPECHOSO", "DESCARTADO")
 # cache: (ts_epoch, dict) por (marca, modelo, año)
 _INVESTIGACION_CACHE: dict[str, tuple[float, dict]] = {}
 
+# cache: (ts_epoch, texto) del dossier YA sintetizado (1 llamada IA amortizada
+# entre TODOS los importadores que pidan el mismo modelo en 24h — sniper).
+_DOSSIER_CACHE: dict[str, tuple[float, str]] = {}
+
 # cache de análisis completos por URL: (ts_epoch, html_str, contexto_qa)
 _ANALISIS_CACHE: dict[str, tuple[float, str, dict]] = {}
 
@@ -204,6 +208,62 @@ async def investigar_coche(version_info: dict, marca: str, modelo: str, anno: in
     except Exception as e:
         logger.warning(f"[INVESTIGAR] Error global Tavily: {e}")
         return vacio
+
+
+async def generar_dossier_modelo(marca: str, modelo: str, año: int) -> str:
+    """
+    Dossier del MODELO (no de un anuncio concreto) para el sniper: fiabilidad,
+    averías típicas y alternativas — lo que un importador quiere saber ANTES de
+    pujar por una unidad, no después. Bajo demanda (botón), NUNCA automático en
+    el ciclo del worker. Cacheado 24h por (marca, modelo, año): el coste (1
+    llamada Tavily x4 + 1 llamada IA) se paga UNA vez y lo comparten todos los
+    importadores que pregunten por ese modelo ese día — no por candidato.
+    Devuelve texto plano en español, listo para reply_text (sin HTML).
+    """
+    cache_key = f"{marca.lower()}_{modelo.lower()}_{int(año or 0)}"
+    ahora = time.time()
+    ttl = TAVILY_CACHE_TTL_HOURS * 3600
+    if cache_key in _DOSSIER_CACHE:
+        ts, cached = _DOSSIER_CACHE[cache_key]
+        if ahora - ts < ttl:
+            logger.info(f"[DOSSIER] Cache hit para {marca} {modelo} {año}")
+            return cached
+
+    investigacion = await investigar_coche({"version": modelo}, marca, modelo, año)
+    if not any(investigacion.values()):
+        # Sin Tavily configurado o sin resultados: no rellenar con IA a ciegas.
+        return (
+            f"📖 Sin datos externos disponibles para {marca.title()} {modelo.upper()} ahora mismo.\n"
+            "Revisa foros especializados (forocoches, km77) antes de pujar."
+        )
+
+    system = (
+        "Eres un asesor técnico para importadores profesionales de coches usados "
+        "de Alemania a España. Con la información de foros/fiabilidad/artículos "
+        "que se te da, escribe un dossier MUY breve y accionable del modelo "
+        "(NO de un anuncio concreto). Español, sin rodeos, sin relleno. "
+        "Estructura EXACTA (usa estos encabezados literales):\n"
+        "AVERÍAS TÍPICAS: (2-4 líneas, lo más citado en foros/estadísticas; "
+        "si no hay datos claros, dilo)\n"
+        "FIABILIDAD: (1-2 líneas, veredicto directo: alta/media/baja y por qué)\n"
+        "ALTERNATIVAS: (1-2 modelos comparables si hay datos; si no, omite la línea)\n"
+        "No inventes datos que no estén en el material. Si el material es pobre, "
+        "dilo explícitamente en vez de rellenar con generalidades."
+    )
+    user = (
+        f"Modelo: {marca} {modelo} {año or ''}\n\n"
+        f"FOROS/AVERÍAS:\n{investigacion.get('foros','')[:1500]}\n\n"
+        f"FIABILIDAD (TÜV/ADAC/Dekra):\n{investigacion.get('fiabilidad','')[:1500]}\n\n"
+        f"ARTÍCULOS:\n{investigacion.get('articulos','')[:1000]}\n\n"
+        f"ALTERNATIVAS:\n{investigacion.get('alternativas','')[:1000]}"
+    )
+    texto = await _llamar_ia(system, user, max_tokens=500)
+    if not texto:
+        texto = "📖 No se pudo generar el dossier ahora mismo. Reintenta en unos minutos."
+
+    _DOSSIER_CACHE[cache_key] = (ahora, texto)
+    logger.info(f"[DOSSIER] Generado y cacheado 24h: {marca} {modelo} {año}")
+    return texto
 
 
 # Cache: (tamaño, tramo_presupuesto) → (ts, snippets_str)
