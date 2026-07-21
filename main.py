@@ -51,7 +51,7 @@ from cabeza_bot.data.database import (
     puede_usar, registrar_uso,
     crear_mision_sniper, obtener_mision, contar_misiones_activas,
     contar_eventos, registrar_evento_embudo, set_fuente_captacion,
-    stats_sniper, renovar_mision,
+    stats_sniper, renovar_mision, huella_anuncio,
 )
 from cabeza_bot.config import FREE_CREDITOS, PAID_CREDITOS_PACK_10, PAID_CREDITOS_PACK_100
 from cabeza_bot.config import (
@@ -3332,6 +3332,15 @@ async def _crear_sniper_confirmado(query, ctx: ContextTypes.DEFAULT_TYPE):
             botones.append([InlineKeyboardButton("🪪 Informe VIN (próximamente)",
                                                   callback_data=f"sniper_vin:{anuncio['id']}")])
         await query.message.reply_text(tarjeta, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(botones))
+        # Registrar como visto: el usuario YA lo vio aquí — si no, el worker lo
+        # trataría como "nuevo" en su próxima pasada (a veces en minutos) y
+        # reenviaría la MISMA alerta por duplicado. Huella calculada a mano
+        # (mejores_del_mercado no la anota) para que la detección de
+        # re-publicación (mismo coche, ID nuevo) también cubra estos.
+        anuncio["_huella"] = huella_anuncio(
+            marca, modelo, anuncio.get("año", 0), anuncio.get("km", 0), anuncio.get("precio", 0),
+        )
+        sp.marcar_visto(mid, anuncio, tipo="snapshot", cuenta=item["cuenta"], riesgo=item.get("riesgo"))
 
 
 async def _capturar_datos_sniper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
