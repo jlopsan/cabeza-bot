@@ -61,15 +61,9 @@ from cabeza_bot.config import (
 )
 import cabeza_bot.sniper.sniper_pipeline as sp
 from cabeza_bot.scraping.scraper import (
-    buscar_y_cruzar, buscar_coches_alemania,
     obtener_anuncio_por_url, buscar_comparables_todas,
 )
 from collections import Counter
-from cabeza_bot.fiscal.calculator import (
-    formato_tarjeta,
-    calcular_sniper_score, formato_sniper_score,
-    calcular_precio_maximo_de, formato_calculadora_inversa,
-)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -83,19 +77,7 @@ logger = logging.getLogger(__name__)
 _TAREAS_ESCANEO_SNIPER: dict[int, asyncio.Task] = {}
 
 # ─── ESTADOS ─────────────────────────────────────────────────────────────────
-ASK_MODELO, ASK_PRECIO_OBJETIVO, ASK_FILTROS, SHOW_RESULTS = range(4)
-CALC_PRECIO, CALC_BENEFICIO, CALC_CO2 = range(10, 13)
 IDEAL_COLLECT = 20
-
-SKIP_KEYWORDS = {"auto", "no", "skip", "-", "automático", "automatico", "buscar"}
-
-# ─── TIERS: límites por nivel ────────────────────────────────────────────────
-TIER_LIMITS = {
-    "free":   {"busquedas_dia": 3,  "misiones": 1,  "sniper": False},
-    "pro":    {"busquedas_dia": 50, "misiones": 5,  "sniper": False},
-    "sniper": {"busquedas_dia": -1, "misiones": 20, "sniper": True},
-    "admin":  {"busquedas_dia": -1, "misiones": -1, "sniper": True},
-}
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -114,14 +96,6 @@ def _check_access(user_id: int, username: str = "") -> tuple[bool, str]:
     registrar_usuario(user_id, username)
     tier = obtener_tier(user_id)
     return True, tier
-
-
-def _tier_puede(tier: str, feature: str) -> bool:
-    """Comprueba si un tier tiene acceso a una feature."""
-    limits = TIER_LIMITS.get(tier, TIER_LIMITS["free"])
-    if feature == "sniper":
-        return limits["sniper"]
-    return True
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -224,366 +198,6 @@ async def cmd_plan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
     )
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# /buscar — flujo de búsqueda
-# ════════════════════════════════════════════════════════════════════════════
-
-async def buscar_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    allowed, tier = _check_access(user.id, user.username or "")
-    if not allowed:
-        await update.message.reply_text("⛔ No tienes acceso a este bot.")
-        return ConversationHandler.END
-
-    ctx.user_data.clear()
-    ctx.user_data["tier"] = tier
-
-    await update.message.reply_text(
-        "🔍 <b>Nueva búsqueda</b>\n\n"
-        "¿Qué coche buscas? Escribe <b>marca y modelo</b>.\n"
-        "Ej: <code>BMW M3</code>  ·  <code>Audi RS3</code>  ·  <code>VW Golf GTI</code>",
-        parse_mode="HTML",
-    )
-    return ASK_MODELO
-
-
-async def recibir_modelo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query_raw = update.message.text.strip()
-    if not query_raw:
-        await update.message.reply_text(
-            "⚠️ Escribe marca y modelo. Ej: <code>BMW M3</code>",
-            parse_mode="HTML",
-        )
-        return ASK_MODELO
-    ctx.user_data["query_raw"] = query_raw
-
-    parsed = await parsear_modelo_nl(query_raw)
-    partes = query_raw.split(maxsplit=1)
-    ctx.user_data["marca"]  = parsed["marca"] or partes[0].lower()
-    ctx.user_data["modelo"] = parsed["modelo"] or (
-        partes[1].lower() if len(partes) > 1 else partes[0].lower()
-    )
-    logger.info(f"[BOT] Modelo parseado: marca={ctx.user_data['marca']} modelo={ctx.user_data['modelo']}")
-
-    await update.message.reply_text(
-        "💶 <b>¿A qué precio vendes este coche en España?</b>\n\n"
-        "• Escribe el precio en €  →  Ej: <code>32000</code>\n"
-        "• Escribe <code>auto</code>  →  Busco el precio medio en Wallapop + coches.net",
-        parse_mode="HTML",
-    )
-    return ASK_PRECIO_OBJETIVO
-
-
-async def recibir_precio_objetivo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    texto = update.message.text.strip().lower()
-
-    if texto in SKIP_KEYWORDS:
-        ctx.user_data["precio_objetivo_es"] = None
-        ctx.user_data["modo_precio"] = "auto"
-    else:
-        try:
-            precio = float(texto.replace(".", "").replace(",", "."))
-            ctx.user_data["precio_objetivo_es"] = precio
-            ctx.user_data["modo_precio"] = "manual"
-        except ValueError:
-            await update.message.reply_text(
-                "⚠️ No entendí el precio. Escribe un número (ej: <code>32000</code>) "
-                "o <code>auto</code> para búsqueda automática.",
-                parse_mode="HTML",
-            )
-            return ASK_PRECIO_OBJETIVO
-
-    await update.message.reply_text(
-        "🔧 <b>Filtros opcionales</b> — o escribe <code>no</code> para omitir\n\n"
-        "Escríbelo como quieras, la IA lo entiende. Combina lo que quieras:\n\n"
-        "<b>Básicos:</b> km, año, precio, potencia, puertas\n"
-        "<i>ej: menos de 80k km, del 2019, máximo 25000€, más de 150cv</i>\n\n"
-        "<b>Tipo:</b> color, carrocería, combustible, caja\n"
-        "<i>ej: gris, descapotable, gasolina, manual</i>\n\n"
-        "<b>Equipamiento:</b> navegación, cuero, techo panorámico, head-up, "
-        "cámara 360, apple carplay, tracción integral…\n\n"
-        "💡 <b>Ejemplo completo:</b>\n"
-        "<code>descapotable gris, manual, menos de 60k km, del 2020, "
-        "navegacion, cuero, apple carplay</code>",
-        parse_mode="HTML",
-    )
-    return ASK_FILTROS
-
-
-async def ejecutar_busqueda(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    texto_filtros = update.message.text.strip()
-
-    # Parsear filtros con IA
-    msg = await update.message.reply_text("🤖 Interpretando filtros…")
-    filtros = await parsear_filtros_nl(texto_filtros)
-    await msg.delete()
-
-    if filtros:
-        filtros_txt = ", ".join(f"{k}={v}" for k, v in filtros.items() if not k.startswith("_"))
-        await update.message.reply_text(
-            f"✅ Filtros detectados: <code>{filtros_txt}</code>",
-            parse_mode="HTML",
-        )
-
-    ctx.user_data["filtros"] = filtros
-
-    marca           = ctx.user_data["marca"]
-    modelo          = ctx.user_data["modelo"]
-    precio_objetivo = ctx.user_data["precio_objetivo_es"]
-    modo            = ctx.user_data["modo_precio"]
-
-    # ── Progreso ──────────────────────────────────────────────────────────────
-    msg = await update.message.reply_text(
-        "⏳ <b>Buscando en AutoScout24 + mobile.de…</b>\n"
-        + ("🤖 Y cruzando precios con Wallapop + coches.net\n" if modo == "auto" else "")
-        + "Esto puede tardar 90-120 segundos.",
-        parse_mode="HTML",
-    )
-
-    # ── Scraping ──────────────────────────────────────────────────────────────
-    if modo == "auto":
-        coches = await buscar_y_cruzar(marca, modelo, filtros)
-    else:
-        coches = await buscar_coches_alemania(marca, modelo, filtros)
-
-    if not coches:
-        await msg.edit_text(
-            "😔 No encontré resultados. Prueba con:\n"
-            "• Filtros menos restrictivos\n"
-            "• Otro nombre de modelo (ej: <code>serie 3</code> en vez de <code>320d</code>)",
-            parse_mode="HTML",
-        )
-        return ConversationHandler.END
-
-    # ── Validar precios ES con IA (modo auto) ────────────────────────────────
-    if modo == "auto":
-        for coche in coches:
-            if coche.get("precio_medio_es") and coche.get("precios_usados_es"):
-                val = await validar_precio_mercado(
-                    marca, modelo,
-                    coche.get("año", 0), coche.get("km", 0),
-                    coche["precio_medio_es"], coche["precios_usados_es"],
-                )
-                coche["validacion_precio"] = val
-                if not val.get("valido", True):
-                    logger.warning(f"[BOT] Precio medio invalidado: {val}")
-                    coche["precio_medio_es"] = 0.0
-                    coche["error_es"] = f"Precio descartado por IA: {val.get('comentario', '')}"
-
-    # ── Post-filtrado extras IA (CAPA 2) ─────────────────────────────────────
-    extras_sin_codigo = filtros.get("_extras_sin_codigo", [])
-    if extras_sin_codigo and coches:
-        await msg.edit_text(f"🔍 Verificando equipamiento con IA: {', '.join(extras_sin_codigo)}…")
-        coches = await filtrar_por_extras(coches, extras_sin_codigo)
-        if not coches:
-            await msg.edit_text("😔 Ningún anuncio con ese equipamiento. Prueba con menos filtros.")
-            return ConversationHandler.END
-
-    # ── Análisis IA ───────────────────────────────────────────────────────────
-    await msg.edit_text("🤖 Analizando anuncios con IA…")
-    coches = await enriquecer_coches(coches)
-
-    # ── Calcular Sniper Score y ordenar ──────────────────────────────────────
-    for c in coches:
-        c["_score"] = calcular_sniper_score(c, precio_objetivo)
-
-    coches_ordenados = sorted(coches, key=lambda c: c["_score"]["sniper_score"], reverse=True)[:TOP_RESULTS]
-    ctx.user_data["coches_mostrados"] = coches_ordenados
-
-    # ── Resumen de fuentes ────────────────────────────────────────────────────
-    fuentes_de = set(c.get("fuente", "?") for c in coches)
-    fuentes_txt = " + ".join(fuentes_de)
-    modo_label = "precio medio Wallapop+coches.net" if modo == "auto" else "tu precio objetivo"
-
-    await msg.edit_text(
-        f"✅ <b>TOP {len(coches_ordenados)} oportunidades</b> "
-        f"({fuentes_txt})\n"
-        f"Ordenadas por Sniper Score ({modo_label}):",
-        parse_mode="HTML",
-    )
-
-    # ── Mostrar tarjetas ──────────────────────────────────────────────────────
-    for idx, coche in enumerate(coches_ordenados, 1):
-        score = coche["_score"]
-        texto_tarjeta = f"<b>#{idx}</b> 📍<i>{coche.get('fuente', '?')}</i>\n"
-        texto_tarjeta += formato_tarjeta(coche, precio_objetivo)
-        texto_tarjeta += "\n\n" + formato_sniper_score(score)
-
-        analisis = coche.get("analisis_ia", {})
-        ia_txt = texto_analisis(analisis)
-        if ia_txt:
-            texto_tarjeta += "\n\n" + ia_txt
-
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Me sirve",  callback_data=f"ok_{coche['id']}"),
-            InlineKeyboardButton("❌ Descartar", callback_data=f"skip_{coche['id']}"),
-        ]])
-
-        if coche.get("foto"):
-            try:
-                await update.message.reply_photo(
-                    photo=coche["foto"],
-                    caption=f"{score['emoji']} {texto_tarjeta}",
-                    parse_mode="HTML",
-                    reply_markup=keyboard,
-                )
-                continue
-            except Exception:
-                pass
-        await update.message.reply_text(
-            f"{score['emoji']} {texto_tarjeta}",
-            parse_mode="HTML",
-            reply_markup=keyboard,
-        )
-
-    # ── Botón guardar misión ──────────────────────────────────────────────────
-    tier = ctx.user_data.get("tier", "free")
-    puede_sniper = _tier_puede(tier, "sniper")
-
-    botones = [
-        [InlineKeyboardButton("📡 Guardar misión (cada 15 min)", callback_data="guardar_mision_normal")],
-    ]
-    if puede_sniper:
-        botones.append(
-            [InlineKeyboardButton("🎯 Guardar misión SNIPER (cada 3 min)", callback_data="guardar_mision_sniper")]
-        )
-    botones.append(
-        [InlineKeyboardButton("🛑 Terminar", callback_data="terminar")]
-    )
-
-    await update.message.reply_text(
-        f"¿Quieres que monitoree y te avise cuando haya beneficio ≥ {MIN_BENEFICIO:,}€?"
-        + ("\n🎯 <i>Como usuario Sniper puedes activar alertas cada 3 min.</i>" if puede_sniper else ""),
-        reply_markup=InlineKeyboardMarkup(botones),
-        parse_mode="HTML",
-    )
-    return SHOW_RESULTS
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# CALLBACKS de resultados
-# ════════════════════════════════════════════════════════════════════════════
-
-async def callback_resultados(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data in ("guardar_mision_normal", "guardar_mision_sniper"):
-        prioridad = "sniper" if data == "guardar_mision_sniper" else "normal"
-        intervalo = "3 min 🎯" if prioridad == "sniper" else "15 min"
-
-        mision_id = crear_mision(
-            user_id=query.from_user.id,
-            query_modelo=ctx.user_data.get("query_raw", ""),
-            filtros=ctx.user_data.get("filtros", {}),
-            precio_objetivo_es=ctx.user_data.get("precio_objetivo_es"),
-            prioridad=prioridad,
-        )
-        await query.edit_message_text(
-            f"✅ <b>Misión #{mision_id} activada ({prioridad.upper()}).</b>\n"
-            f"Monitorizando AutoScout24 + mobile.de cada {intervalo}.\n"
-            f"Te aviso cuando el beneficio supere {MIN_BENEFICIO:,}€",
-            parse_mode="HTML",
-        )
-        return ConversationHandler.END
-
-    elif data == "terminar":
-        await query.edit_message_text("👍 Búsqueda finalizada. Usa /buscar cuando quieras.")
-        return ConversationHandler.END
-
-    elif data.startswith("ok_"):
-        await query.answer("✅ ¡Genial! Espero que cierres buen negocio.", show_alert=True)
-
-    elif data.startswith("skip_"):
-        await query.answer("❌ Descartado.")
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# /calcular — calculadora inversa
-# ════════════════════════════════════════════════════════════════════════════
-
-async def calcular_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    allowed, tier = _check_access(user.id, user.username or "")
-    if not allowed:
-        await update.message.reply_text("⛔ No tienes acceso a este bot.")
-        return ConversationHandler.END
-
-    ctx.user_data["calc"] = {}
-    await update.message.reply_text(
-        "🎯 <b>CALCULADORA INVERSA</b>\n\n"
-        "Calculo el precio máximo que puedes pagar en Alemania\n"
-        "para obtener el beneficio que quieres.\n\n"
-        "💶 <b>¿A cuánto vendes el coche en España?</b>\n"
-        "Ej: <code>35000</code>",
-        parse_mode="HTML",
-    )
-    return CALC_PRECIO
-
-
-async def calc_recibir_precio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        precio = float(update.message.text.strip().replace(".", "").replace(",", "."))
-        ctx.user_data["calc"]["precio_es"] = precio
-    except ValueError:
-        await update.message.reply_text("⚠️ Escribe un número. Ej: <code>35000</code>", parse_mode="HTML")
-        return CALC_PRECIO
-
-    await update.message.reply_text(
-        "💰 <b>¿Cuánto beneficio mínimo quieres?</b>\n"
-        "Ej: <code>4000</code>",
-        parse_mode="HTML",
-    )
-    return CALC_BENEFICIO
-
-
-async def calc_recibir_beneficio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try:
-        beneficio = float(update.message.text.strip().replace(".", "").replace(",", "."))
-        ctx.user_data["calc"]["beneficio"] = beneficio
-    except ValueError:
-        await update.message.reply_text("⚠️ Escribe un número. Ej: <code>4000</code>", parse_mode="HTML")
-        return CALC_BENEFICIO
-
-    await update.message.reply_text(
-        "💨 <b>¿Emisiones CO₂ del coche?</b> (g/km)\n\n"
-        "• Escribe el valor → Ej: <code>140</code>\n"
-        "• Escribe <code>no</code> → Asumo ≤120 g/km (IEDMT 0%)\n\n"
-        "<i>Tramos IEDMT:\n"
-        "  ≤120 g/km → 0%\n"
-        "  121-159 → 4.75%\n"
-        "  160-199 → 9.75%\n"
-        "  ≥200 → 14.75%</i>",
-        parse_mode="HTML",
-    )
-    return CALC_CO2
-
-
-async def calc_recibir_co2(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    texto = update.message.text.strip().lower()
-    if texto in ("no", "skip", "-", "0"):
-        co2 = 0.0
-    else:
-        try:
-            co2 = float(texto.replace(",", "."))
-        except ValueError:
-            await update.message.reply_text("⚠️ Escribe un número o <code>no</code>.", parse_mode="HTML")
-            return CALC_CO2
-
-    calc_data = ctx.user_data["calc"]
-    resultado = calcular_precio_maximo_de(
-        precio_venta_es=calc_data["precio_es"],
-        beneficio_minimo=calc_data["beneficio"],
-        co2=co2,
-    )
-
-    await update.message.reply_text(
-        formato_calculadora_inversa(resultado),
-        parse_mode="HTML",
-    )
-    return ConversationHandler.END
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -3473,29 +3087,6 @@ def main():
     init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).concurrent_updates(5).build()
 
-    # Conversación: búsqueda
-    conv_buscar = ConversationHandler(
-        entry_points=[CommandHandler("buscar", buscar_start)],
-        states={
-            ASK_MODELO:          [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_modelo)],
-            ASK_PRECIO_OBJETIVO: [MessageHandler(filters.TEXT & ~filters.COMMAND, recibir_precio_objetivo)],
-            ASK_FILTROS:         [MessageHandler(filters.TEXT & ~filters.COMMAND, ejecutar_busqueda)],
-            SHOW_RESULTS:        [CallbackQueryHandler(callback_resultados)],
-        },
-        fallbacks=[CommandHandler("cancelar", cancelar)],
-    )
-
-    # Conversación: calculadora inversa
-    conv_calcular = ConversationHandler(
-        entry_points=[CommandHandler("calcular", calcular_start)],
-        states={
-            CALC_PRECIO:    [MessageHandler(filters.TEXT & ~filters.COMMAND, calc_recibir_precio)],
-            CALC_BENEFICIO: [MessageHandler(filters.TEXT & ~filters.COMMAND, calc_recibir_beneficio)],
-            CALC_CO2:       [MessageHandler(filters.TEXT & ~filters.COMMAND, calc_recibir_co2)],
-        },
-        fallbacks=[CommandHandler("cancelar", cancelar)],
-    )
-
     # Logger global de comandos en grupo -1 (corre antes que los handlers reales,
     # no consume el update porque no hace ApplicationHandlerStop)
     async def _log_cmd(update: Update, _ctx: ContextTypes.DEFAULT_TYPE):
@@ -3553,10 +3144,8 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_ideal_v2_aceptar, pattern=r"^ideal_aceptar:\d+$"))
     app.add_handler(CallbackQueryHandler(callback_ideal_v2_mas, pattern=r"^ideal_mas$"))
     app.add_handler(CallbackQueryHandler(callback_ideal_v2_ninguno, pattern=r"^ideal_ninguno$"))
-    # Ocultos en beta — código intacto, solo sin handler en Telegram:
+    # /misiones — gestión legacy de misiones (sigue viva; el sniper usa /sniper)
     app.add_handler(CommandHandler("misiones", mis_misiones))
-    # app.add_handler(conv_buscar)
-    # app.add_handler(conv_calcular)
     app.add_handler(CallbackQueryHandler(callback_misiones, pattern=r"^(pausar|activar|eliminar)_\d+$"))
     app.add_handler(CallbackQueryHandler(callback_qa, pattern=r"^qa:(si|no)$"))
     app.add_handler(CallbackQueryHandler(callback_pago, pattern=r"^pagar_pack_(10|100)$"))
