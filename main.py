@@ -3136,6 +3136,26 @@ async def cmd_sniper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(_PROMPT_SNIPER, parse_mode="HTML")
 
 
+def _hace_cuanto(iso_ts: str) -> str:
+    """'hace 4 min' / 'hace 2h' / 'nunca' — legible sin depender de zona horaria."""
+    if not iso_ts:
+        return "nunca"
+    try:
+        from datetime import datetime as _dt
+        delta = _dt.utcnow() - _dt.fromisoformat(iso_ts)
+    except (ValueError, TypeError):
+        return "?"
+    mins = int(delta.total_seconds() // 60)
+    if mins < 1:
+        return "ahora mismo"
+    if mins < 60:
+        return f"hace {mins} min"
+    horas = mins // 60
+    if horas < 24:
+        return f"hace {horas}h"
+    return f"hace {horas // 24}d"
+
+
 async def _mostrar_misiones_sniper(dest, misiones: list[dict]):
     filas = []
     lineas = ["🎯 <b>Tus sniper</b>\n"]
@@ -3143,10 +3163,25 @@ async def _mostrar_misiones_sniper(dest, misiones: list[dict]):
         estado = m.get("estado", "ACTIVA")
         icono = {"ACTIVA": "🟢", "PAUSADA": "⏸", "EXPIRADA": "⌛"}.get(estado, "•")
         titulo = f"{m.get('marca','').title()} {m.get('modelo','').upper()}".strip()
+
+        partes_umbral = []
+        if m.get("umbral_margen_eur"):
+            partes_umbral.append(f"≥{int(m['umbral_margen_eur']):,}€".replace(",", "."))
+        if m.get("umbral_margen_pct"):
+            partes_umbral.append(f"≥{m['umbral_margen_pct']:.0f}%")
+        umbral_txt = " y ".join(partes_umbral) or "cualquier margen"
+
         lineas.append(
-            f"{icono} <b>{html.escape(titulo)}</b> — {m.get('alertas_total',0)} alertas · "
-            f"margen ≥ {int(m.get('umbral_margen_eur') or 0):,}€".replace(",", ".")
+            f"{icono} <b>{html.escape(titulo)}</b> — {m.get('alertas_total',0)} alertas · margen {umbral_txt}"
         )
+        if estado == "ACTIVA":
+            # Señal de vida: si no ha corrido en mucho más de lo esperado, algo
+            # va mal (worker caído, fuente pausada) — mejor decirlo que callar.
+            ultima = _hace_cuanto(m.get("last_run_at", ""))
+            lineas.append(f"   <i>última pasada: {ultima}</i>")
+            if m.get("ultimo_error"):
+                lineas.append(f"   ⚠️ <i>último error: {html.escape(str(m['ultimo_error'])[:60])}</i>")
+
         mid = m["id"]
         fila = []
         if estado == "ACTIVA":
