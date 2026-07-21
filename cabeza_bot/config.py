@@ -120,6 +120,10 @@ SNIPER_MISION_DIAS = int(os.getenv("SNIPER_MISION_DIAS", "30"))
 # Valoración de mercado ES cacheada.
 VALORACION_TTL_H   = int(os.getenv("VALORACION_TTL_H", "12"))
 VALORACION_KM_BANDA = int(os.getenv("VALORACION_KM_BANDA", "20000"))  # ancho de banda de km
+# Filtro de comparables: solo del mismo año ±tol (clave para modelos recientes)
+# y mínimo de comparables tras filtrar; por debajo → "sin valoración fiable".
+SNIPER_VALORACION_ANOS_TOL = int(os.getenv("SNIPER_VALORACION_ANOS_TOL", "2"))
+SNIPER_MIN_COMPARABLES     = int(os.getenv("SNIPER_MIN_COMPARABLES", "4"))
 
 # Páginas de la fase de detección (listado AS24 ordenado por reciente).
 SNIPER_DETECCION_PAGINAS = int(os.getenv("SNIPER_DETECCION_PAGINAS", "2"))

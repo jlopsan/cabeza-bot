@@ -15,6 +15,7 @@ from cabeza_bot.config import (
     VALORACION_TTL_H, VALORACION_KM_BANDA,
     SNIPER_UMBRAL_EUR, SNIPER_UMBRAL_PCT,
     SNIPER_AVISO_IEDMT_ANOS,
+    SNIPER_VALORACION_ANOS_TOL, SNIPER_MIN_COMPARABLES, ANTI_SCAM_FACTOR,
 )
 from cabeza_bot.fiscal.calculator import calcular_margen_sniper, es_nuevo_fiscal
 from cabeza_bot.scraping.scraper import ScraperAutoScout24, buscar_comparables_todas
@@ -53,22 +54,49 @@ def valoracion_fresca(marca: str, modelo: str, año: int, km: int) -> dict | Non
     return None
 
 
+def _precios_fiables(comparables: list, año: int) -> list[float]:
+    """
+    Filtra los comparables para una valoración creíble:
+      1. Mismo año ±SNIPER_VALORACION_ANOS_TOL (evita que un 2025 herede precios
+         de un 320d de 2012 y saque una mediana falsa de 8.800€).
+      2. Descarta outliers baratos/caros respecto a la mediana provisional
+         (anti-scam + evita gama alta que infla).
+    Los comparables sin año se excluyen (para valorar, mejor estricto).
+    """
+    año = int(año or 0)
+    precios = []
+    for a in comparables:
+        p = float(getattr(a, "precio", 0) or 0)
+        ay = int(getattr(a, "año", 0) or 0)
+        if p <= 0:
+            continue
+        if año and (not ay or abs(ay - año) > SNIPER_VALORACION_ANOS_TOL):
+            continue
+        precios.append(p)
+    precios.sort()
+    if len(precios) >= 4:
+        med0 = statistics.median(precios)
+        precios = [p for p in precios if med0 * ANTI_SCAM_FACTOR <= p <= med0 * 2.0]
+    return precios
+
+
 async def refrescar_valoracion(marca: str, modelo: str, año: int, km: int) -> dict | None:
     """
-    Scrapea comparables ES, calcula mediana, la persiste (valoración + histórico)
-    y la devuelve. None si no hay comparables suficientes (<3). Reutiliza el
-    pipeline de comparables de /analizar (cero scraping nuevo).
+    Scrapea comparables ES, filtra por año + outliers, calcula mediana, la
+    persiste y la devuelve. None si NO hay comparables fiables suficientes
+    (< SNIPER_MIN_COMPARABLES) → el producto muestra "sin valoración fiable"
+    en vez de inventar un número. Reutiliza el pipeline de /analizar.
     """
     try:
-        comparables = await buscar_comparables_todas(marca, modelo, año, km, n=30)
+        comparables = await buscar_comparables_todas(marca, modelo, año, km, n=40)
     except Exception as e:
         logger.warning(f"[SNIPER] comparables ES fallaron {marca} {modelo}: {e}")
-        return db.get_valoracion(marca, modelo, año, km_banda(km))  # devuelve lo viejo si hay
+        return None
 
-    precios = sorted(float(getattr(a, "precio", 0) or 0) for a in comparables)
-    precios = [p for p in precios if p > 0]
-    if len(precios) < 3:
-        return db.get_valoracion(marca, modelo, año, km_banda(km))
+    precios = _precios_fiables(comparables, año)
+    if len(precios) < SNIPER_MIN_COMPARABLES:
+        logger.info(f"[SNIPER] {marca} {modelo} {año}: solo {len(precios)} comparables fiables → sin valoración")
+        return None
 
     mediana = round(statistics.median(precios), 0)
     db.upsert_valoracion(marca, modelo, año, km_banda(km), mediana, len(precios), precios)
@@ -117,6 +145,47 @@ def evaluar_candidato(anuncio: dict, valoracion: dict,
         "cuenta": cuenta,
         "n_comparables": int(valoracion.get("n_comparables", 0) or 0),
     }
+
+
+async def mejores_del_mercado(marca: str, modelo: str, filtros: dict,
+                              umbral_eur: int, umbral_pct: float,
+                              top_n: int = 3, max_refrescos: int = 3) -> list[dict]:
+    """
+    Escaneo INMEDIATO para '¿qué hay ahora?'. Detecta en AS24, valora cada
+    candidato (caché primero, máx `max_refrescos` scrapeos ES para no eternizar),
+    afina los top con el detalle real y devuelve top_n ordenado por margen desc.
+    Cada item: {anuncio, valoracion, cuenta, margen_eur}. Solo con valoración fiable.
+    """
+    try:
+        anuncios, _señal = await ScraperAutoScout24().buscar_deteccion(marca, modelo, filtros)
+    except Exception as e:
+        logger.warning(f"[SNIPER] escaneo inmediato falló: {e}")
+        return []
+    if not anuncios:
+        return []
+
+    refrescos = 0
+    evaluados = []
+    for a in anuncios:
+        v = valoracion_fresca(marca, modelo, a.get("año", 0), a.get("km", 0))
+        if v is None and refrescos < max_refrescos:
+            v = await refrescar_valoracion(marca, modelo, a.get("año", 0), a.get("km", 0))
+            refrescos += 1
+        if not v:
+            continue
+        r = evaluar_candidato(a, v, umbral_eur, umbral_pct)
+        evaluados.append((a, v, r["cuenta"]))
+
+    evaluados.sort(key=lambda t: t[2]["margen_eur"], reverse=True)
+
+    salida = []
+    for a, v, _c in evaluados[:top_n]:
+        a = await ScraperAutoScout24().obtener_detalle_candidato(a)
+        r = evaluar_candidato(a, v, umbral_eur, umbral_pct)
+        salida.append({"anuncio": a, "valoracion": v, "cuenta": r["cuenta"],
+                       "margen_eur": r["cuenta"]["margen_eur"]})
+    salida.sort(key=lambda x: x["margen_eur"], reverse=True)
+    return salida
 
 
 # ─── DEDUP / SNAPSHOT ────────────────────────────────────────────────────────

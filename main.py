@@ -3300,14 +3300,37 @@ async def _crear_sniper_confirmado(query, ctx: ContextTypes.DEFAULT_TYPE):
     if v and v.get("n_comparables"):
         nota_mercado = f"\nMercado ES de referencia: {int(v['mediana']):,}€ ({v['n_comparables']} comparables).".replace(",", ".")
     elif v is None:
-        nota_mercado = "\n<i>Aún sin comparables ES claros; los busco en cada pasada.</i>"
+        nota_mercado = "\n<i>Aún sin comparables ES fiables para el año pedido.</i>"
 
     await query.message.reply_text(
         f"🎯 <b>Sniper activo.</b>\n"
-        f"Vigilando el mercado alemán. Te aviso en minutos cuando salte uno con margen."
-        f"{nota_mercado}",
+        f"Vigilando el mercado alemán.{nota_mercado}",
         parse_mode="HTML",
     )
+
+    # Escaneo INMEDIATO: enseña lo mejor que hay ahora mismo (no solo "te avisaré").
+    buscando = await query.message.reply_text("🔎 Buscando lo mejor ahora mismo…")
+    try:
+        top = await sp.mejores_del_mercado(marca, modelo, filtros, umbral_eur, umbral_pct, top_n=3)
+    except Exception as e:
+        logger.warning(f"[SNIPER] escaneo inmediato falló: {e}")
+        top = []
+
+    if not top:
+        await buscando.edit_text(
+            "Ahora mismo no hay ninguna unidad con margen. En cuanto salte, te aviso. 🎯"
+        )
+        return
+
+    await buscando.edit_text(f"🏆 <b>Top {len(top)} ahora mismo</b> (ordenado por margen):", parse_mode="HTML")
+    for item in top:
+        tarjeta = sp.render_tarjeta_alerta(item["anuncio"], item["valoracion"], item["cuenta"])
+        await query.message.reply_text(
+            tarjeta, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔗 Ver anuncio", url=item["anuncio"].get("link") or "#")]]
+            ),
+        )
 
 
 async def _capturar_datos_sniper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
