@@ -53,6 +53,7 @@ from cabeza_bot.data.database import (
     crear_mision_sniper, obtener_mision, contar_misiones_activas,
     contar_eventos, registrar_evento_embudo, set_fuente_captacion,
     stats_sniper, renovar_mision, huella_anuncio, obtener_registro_alerta,
+    editar_umbral_mision,
 )
 from cabeza_bot.config import FREE_CREDITOS, PAID_CREDITOS_PACK_10, PAID_CREDITOS_PACK_100
 from cabeza_bot.config import (
@@ -2804,6 +2805,8 @@ async def _mostrar_misiones_sniper(dest, misiones: list[dict]):
             fila.append(InlineKeyboardButton("▶️ Reanudar", callback_data=f"sniper_reanudar:{mid}"))
         elif estado == "EXPIRADA":
             fila.append(InlineKeyboardButton("🔄 Renovar", callback_data=f"sniper_renovar:{mid}"))
+        if estado != "EXPIRADA":
+            fila.append(InlineKeyboardButton("🎯 Umbral", callback_data=f"sniper_umbral:{mid}"))
         fila.append(InlineKeyboardButton("🗑 Borrar", callback_data=f"sniper_borrar:{mid}"))
         filas.append(fila)
     await dest.reply_text(
@@ -2831,6 +2834,27 @@ async def callback_sniper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data.startswith("sniper_vin:"):
         # Hueco para el informe VIN (afiliación/upsell futuro) — stub, no cobra.
         await query.answer("Informe VIN: próximamente. Aún no disponible.", show_alert=True)
+        return
+
+    if data.startswith("sniper_umbral:"):
+        # Editar el umbral de margen de una misión ya creada (gratis).
+        try:
+            mid = int(data.split(":", 1)[1])
+        except (ValueError, IndexError):
+            await query.answer()
+            return
+        m = obtener_mision(mid)
+        if not m or m.get("user_id") != user_id:
+            await query.answer("No es tuya", show_alert=True)
+            return
+        await query.answer()
+        ctx.user_data["esperando_umbral_sniper"] = mid
+        await query.message.reply_text(
+            "🎯 <b>Nuevo umbral de margen</b> para esta misión.\n\n"
+            "Escríbelo como quieras. Ej: <code>15%</code> · <code>3.000€</code> · "
+            "<code>2500€ y 12%</code>",
+            parse_mode="HTML",
+        )
         return
 
     if data.startswith("sniper_cuenta:"):
@@ -3041,7 +3065,30 @@ async def _crear_sniper_confirmado(query, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _capturar_datos_sniper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Captura el texto de creación del sniper (estado esperando_sniper)."""
+    """Captura texto del sniper: creación de misión O edición de umbral."""
+    # Edición de umbral de una misión existente.
+    mid = ctx.user_data.get("esperando_umbral_sniper")
+    if mid:
+        texto = (update.message.text or "").strip()
+        if not texto:
+            return
+        ctx.user_data.pop("esperando_umbral_sniper", None)
+        m = obtener_mision(mid)
+        if not m or m.get("user_id") != update.effective_user.id:
+            await update.message.reply_text("⚠️ Esa misión ya no existe.")
+            return
+        # En la edición el mensaje ENTERO es el umbral (no hay precio máx con el
+        # que confundir), así que anteponemos "margen " para que el parser
+        # reconozca también euros sin la palabra clave (ej. "3000€" pelado).
+        eur, pct = _resolver_umbral("margen " + texto)
+        editar_umbral_mision(mid, eur, pct)
+        await update.message.reply_text(
+            f"✅ Umbral actualizado: te aviso con margen <b>{_texto_umbral(eur, pct)}</b>.",
+            parse_mode="HTML",
+        )
+        return
+
+    # Creación de una misión nueva.
     if not ctx.user_data.get("esperando_sniper"):
         return
     texto = (update.message.text or "").strip()

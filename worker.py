@@ -26,7 +26,7 @@ from cabeza_bot.data.database import (
     obtener_misiones_sniper_activas, set_mision_run, incr_alertas_mision,
     fuente_pausada, scrapes_ultima_hora, registrar_evento_embudo,
 )
-from cabeza_bot.scraping.scraper import buscar_comparables_todas
+from cabeza_bot.scraping.scraper import buscar_comparables_todas, ScraperAutoScout24
 from cabeza_bot.sniper.riesgo import NIVEL_ROJO
 import cabeza_bot.sniper.sniper_pipeline as sp
 
@@ -246,6 +246,28 @@ async def _ciclo_sniper():
 _HEALTH_FUENTES_REF = {"wallapop": 0, "coches.net": 0}
 
 
+async def _sonda_autoscout24():
+    """
+    Sonda diaria de AS24: una detección de un modelo líquido (VW Golf). Distingue
+    degradación real ('fallo' del scraper: HTML cambiado / bloqueo) de mercado
+    normal, y avisa en el log ANTES de que un usuario reporte "no me llegan
+    alertas". Solo sonda si el sniper está activo (si no, AS24 no se usa).
+    """
+    if not ENABLE_SNIPER:
+        return
+    try:
+        anuncios, señal = await ScraperAutoScout24().buscar_deteccion("volkswagen", "golf", {})
+    except Exception as e:
+        logger.error(f"[HEALTH] AS24 sonda EXCEPCIÓN: {e}")
+        return
+    if señal == "fallo":
+        logger.warning("[HEALTH] AutoScout24 CAÍDA — sonda devolvió 'fallo' (HTML/selector o bloqueo)")
+    elif not anuncios:
+        logger.warning("[HEALTH] AutoScout24 raro — 0 anuncios de VW Golf (revisar)")
+    else:
+        logger.info(f"[HEALTH] AutoScout24 OK — {len(anuncios)} anuncios en sonda")
+
+
 async def _ciclo_health():
     while True:
         try:
@@ -262,6 +284,7 @@ async def _ciclo_health():
                 _HEALTH_FUENTES_REF[nombre] = n
         except Exception as e:
             logger.error(f"[HEALTH] Sonda falló: {e}")
+        await _sonda_autoscout24()
         try:
             purgar_historico_antiguo(dias=180)
         except Exception as e:
