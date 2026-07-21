@@ -953,6 +953,17 @@ def anuncio_ya_visto(mision_id: int, anuncio_id: str) -> bool:
     return row is not None
 
 
+def obtener_registro_alerta(mision_id: int, anuncio_id: str) -> dict | None:
+    """Fila completa (desglose/riesgo incluidos) para el botón 'Cuenta completa'."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM alertas_enviadas WHERE mision_id=? AND anuncio_id=? "
+            "ORDER BY id DESC LIMIT 1",
+            (mision_id, anuncio_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def huella_vista_reciente(mision_id: int, huella: str, dias: int = 30) -> bool:
     """True si esa huella ya se registró para la misión en los últimos N días (re-publicación)."""
     if not huella:

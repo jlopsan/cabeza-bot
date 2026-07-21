@@ -51,7 +51,7 @@ from cabeza_bot.data.database import (
     puede_usar, registrar_uso,
     crear_mision_sniper, obtener_mision, contar_misiones_activas,
     contar_eventos, registrar_evento_embudo, set_fuente_captacion,
-    stats_sniper, renovar_mision, huella_anuncio,
+    stats_sniper, renovar_mision, huella_anuncio, obtener_registro_alerta,
 )
 from cabeza_bot.config import FREE_CREDITOS, PAID_CREDITOS_PACK_10, PAID_CREDITOS_PACK_100
 from cabeza_bot.config import (
@@ -3183,6 +3183,20 @@ async def callback_sniper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.answer("Informe VIN: próximamente. Aún no disponible.", show_alert=True)
         return
 
+    if data.startswith("sniper_cuenta:"):
+        # Desglose completo — ya persistido en la alerta, cero coste extra.
+        await query.answer()
+        try:
+            _, mid_s, aid = data.split(":", 2)
+            registro = obtener_registro_alerta(int(mid_s), aid)
+        except (ValueError, IndexError):
+            registro = None
+        if not registro:
+            await query.message.reply_text("🧾 No encontré el desglose de este anuncio.")
+        else:
+            await query.message.reply_text(sp.render_cuenta_completa(registro), parse_mode="HTML")
+        return
+
     if data == "sniper_cancelar_scan":
         tarea = _TAREAS_ESCANEO_SNIPER.get(user_id)
         if tarea and not tarea.done():
@@ -3331,6 +3345,8 @@ async def _crear_sniper_confirmado(query, ctx: ContextTypes.DEFAULT_TYPE):
         if anuncio.get("id"):
             botones.append([InlineKeyboardButton("🪪 Informe VIN (próximamente)",
                                                   callback_data=f"sniper_vin:{anuncio['id']}")])
+            botones.append([InlineKeyboardButton("🧾 Cuenta completa",
+                                                  callback_data=f"sniper_cuenta:{mid}:{anuncio['id']}")])
         await query.message.reply_text(tarjeta, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(botones))
         # Registrar como visto: el usuario YA lo vio aquí — si no, el worker lo
         # trataría como "nuevo" en su próxima pasada (a veces en minutos) y

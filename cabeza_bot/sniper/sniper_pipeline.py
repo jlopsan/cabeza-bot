@@ -387,32 +387,81 @@ def marcar_visto(mision_id: int, anuncio: dict, tipo: str = "snapshot",
     """
     Registra el anuncio como visto (snapshot) o alertado (alerta). Persiste el
     desglose de costes y el nivel/banderas de riesgo — transparencia del número
-    mostrado y dataset de casos reales del sniper.
+    mostrado (botón "Cuenta completa") y dataset de casos reales del sniper.
     """
     h = anuncio.get("_huella", "")
+    desglose = None
+    if cuenta:
+        # Se guarda el desglose fijo + los datos que dan contexto al número
+        # (¿CO₂ real o estimado?, tramo IEDMT, mediana ES usada, motor afinado)
+        # para que "Cuenta completa" no tenga que recalcular nada.
+        desglose = {
+            **(cuenta.get("desglose") or {}),
+            "co2_estimado":   cuenta.get("co2_estimado", False),
+            "co2":            cuenta.get("co2", 0),
+            "tipo_iedmt_pct": cuenta.get("tipo_iedmt_pct", 0),
+            "mediana_es":     cuenta.get("mediana_es", 0),
+            "inversion":      cuenta.get("inversion", 0),
+        }
     db.registrar_visto(
         mision_id, str(anuncio.get("id", "")), h, tipo=tipo,
         precio=anuncio.get("precio", 0),
         margen_eur=(cuenta or {}).get("margen_eur", 0),
         margen_pct=(cuenta or {}).get("margen_pct", 0),
         url=anuncio.get("link", ""),
-        desglose=(cuenta or {}).get("desglose"),
+        desglose=desglose,
         riesgo=riesgo.to_dict() if riesgo is not None else None,
     )
 
 
 # ─── RENDER DE LA TARJETA DE ALERTA ──────────────────────────────────────────
 
-def boton_ver_anuncio(url: str, anuncio_id: str = "") -> dict:
+def boton_ver_anuncio(url: str, anuncio_id: str = "", mision_id: int | None = None) -> dict:
     """
     reply_markup para la API HTTP de Telegram (worker) o InlineKeyboard (bot).
-    Segunda fila: hueco para el informe VIN (afiliación/upsell futuro — ver
-    proposal). Hoy es un stub informativo, no cobra ni pide datos de pago.
+    Fila 2: hueco para el informe VIN (afiliación/upsell futuro). Fila 3:
+    desglose completo de la cuenta (ya persistido, cero coste — lee de BD).
     """
     filas = [[{"text": "🔗 Ver anuncio", "url": url or "#"}]]
     if anuncio_id:
         filas.append([{"text": "🪪 Informe VIN (próximamente)", "callback_data": f"sniper_vin:{anuncio_id}"}])
+    if anuncio_id and mision_id is not None:
+        filas.append([{"text": "🧾 Cuenta completa", "callback_data": f"sniper_cuenta:{mision_id}:{anuncio_id}"}])
     return {"inline_keyboard": filas}
+
+
+def render_cuenta_completa(registro: dict) -> str:
+    """
+    Desglose completo desde un registro de alertas_enviadas (cero coste extra
+    — solo lee lo ya calculado en el momento de la alerta). Muestra cada
+    partida de la importación y por qué el IEDMT es el que es.
+    """
+    try:
+        d = json.loads(registro.get("desglose_json") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        d = {}
+    if not d:
+        return "🧾 No hay desglose guardado para este anuncio."
+
+    iedmt_nota = " <i>(estimado)</i>" if d.get("co2_estimado") else ""
+    co2_txt = f"{d.get('co2', 0):.0f} g/km" if d.get("co2") else "no publicado"
+
+    lineas = [
+        "🧾 <b>Cuenta completa de importación</b>",
+        "",
+        f"🇪🇸 Mercado ES usado: <b>{_eur(d.get('mediana_es', 0))}</b>",
+        f"🇩🇪 Precio Alemania: <b>{_eur(registro.get('precio', 0))}</b>",
+        "",
+        f"🚛 Transporte: {_eur(d.get('transporte', 0))}",
+        f"📋 COC + gestión: {_eur(d.get('coc_gestion', 0))}",
+        f"🔧 Homologación + ITV: {_eur(d.get('homologacion_itv', 0))}",
+        f"🏛️ Tasas DGT: {_eur(d.get('tasas_dgt', 0))}",
+        f"🔖 IEDMT ({d.get('tipo_iedmt_pct', 0)}%, CO₂ {co2_txt}): {_eur(d.get('iedmt', 0))}{iedmt_nota}",
+        "─" * 28,
+        f"💶 Inversión total: <b>{_eur(d.get('inversion', 0))}</b>",
+        f"💰 Margen neto: <b>{_eur(registro.get('margen_eur', 0))} ({registro.get('margen_pct', 0):+.0f}%)</b>",
+    ]
+    return "\n".join(lineas)
 
 
 def _eur(v: float) -> str:
