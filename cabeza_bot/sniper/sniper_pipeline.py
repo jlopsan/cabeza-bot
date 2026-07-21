@@ -16,12 +16,19 @@ from cabeza_bot.config import (
     SNIPER_UMBRAL_EUR, SNIPER_UMBRAL_PCT,
     SNIPER_AVISO_IEDMT_ANOS,
     SNIPER_VALORACION_ANOS_TOL, SNIPER_MIN_COMPARABLES, ANTI_SCAM_FACTOR,
+    ENABLE_SNIPER_MOBILE_DE, SNIPER_CB_FALLOS, SNIPER_CB_PAUSA_MIN,
+    SNIPER_KM_ANOS_TOL, SNIPER_KM_MIN_MUESTRA, SNIPER_KM_PCTL_AMARILLO, SNIPER_KM_PCTL_ROJO,
+    SNIPER_PRECIO_DE_MIN_MUESTRA, SNIPER_PRECIO_DE_ANOMALO_PCT,
+    SNIPER_RIESGO_FOTOS_MIN, SNIPER_RIESGO_PROPIETARIOS_MAX, SNIPER_RIESGO_BLANDAS_AMARILLO,
 )
 from cabeza_bot.fiscal.calculator import calcular_margen_sniper, es_nuevo_fiscal
-from cabeza_bot.scraping.scraper import ScraperAutoScout24, buscar_comparables_todas
+from cabeza_bot.scraping.scraper import ScraperAutoScout24, ScraperMobileDe, buscar_comparables_todas
+from cabeza_bot.sniper.riesgo import evaluar_riesgo, NIVEL_ROJO
 import cabeza_bot.data.database as db
 
 logger = logging.getLogger(__name__)
+
+FUENTES_DE = ("autoscout24", "mobile.de")
 
 
 # ─── CLAVE DE SCRAPEO (agrupación de misiones) ───────────────────────────────
@@ -34,10 +41,58 @@ def filtros_mision(mision: dict) -> dict:
 
 
 def clave_scrapeo(mision: dict) -> str:
-    """URL de detección normalizada. Misiones con la misma clave comparten scrapeo."""
+    """URL de detección normalizada (AS24). Misiones con la misma clave comparten scrapeo."""
     return ScraperAutoScout24().url_deteccion_normalizada(
         mision.get("marca", ""), mision.get("modelo", ""), filtros_mision(mision)
     )
+
+
+def _dedupe_dicts(anuncios: list[dict]) -> list[dict]:
+    """Dedup cross-fuente por (precio±200€, km±2000, año±1) — mismo coche en AS24 y mobile.de."""
+    vistos: list[tuple[float, int, int]] = []
+    unicos: list[dict] = []
+    for a in anuncios:
+        key = (a.get("precio", 0), a.get("km", 0), a.get("año", 0))
+        if any(abs(v[0] - key[0]) < 200 and abs(v[1] - key[1]) < 2000 and abs(v[2] - key[2]) <= 1
+               for v in vistos):
+            continue
+        vistos.append(key)
+        unicos.append(a)
+    return unicos
+
+
+async def detectar_multifuente(marca: str, modelo: str, filtros: dict) -> list[dict]:
+    """
+    Detección DE mergeada: AS24 (siempre) + mobile.de (si ENABLE_SNIPER_MOBILE_DE
+    y no pausada por su circuit breaker). Cada fuente respeta su propio breaker
+    (fallo→incr, ok/vacío→reset) para que un bloqueo de mobile.de NUNCA afecte
+    a AS24. Usado tanto por el ciclo del worker como por el escaneo inmediato.
+    """
+    resultados: list[dict] = []
+
+    if not db.fuente_pausada("autoscout24"):
+        db.incr_scrape_hora("autoscout24")
+        anuncios, señal = await ScraperAutoScout24().buscar_deteccion(marca, modelo, filtros)
+        if señal == "fallo":
+            db.incr_fallo_fuente("autoscout24", SNIPER_CB_FALLOS, SNIPER_CB_PAUSA_MIN)
+        else:
+            db.reset_fuente("autoscout24")
+            resultados.extend(anuncios)
+
+    if ENABLE_SNIPER_MOBILE_DE and not db.fuente_pausada("mobile.de"):
+        db.incr_scrape_hora("mobile.de")
+        try:
+            anuncios_m, señal_m = await ScraperMobileDe().buscar_deteccion(marca, modelo, filtros)
+        except Exception as e:
+            logger.warning(f"[SNIPER] mobile.de detección lanzó excepción: {e}")
+            anuncios_m, señal_m = [], "fallo"
+        if señal_m == "fallo":
+            db.incr_fallo_fuente("mobile.de", SNIPER_CB_FALLOS, SNIPER_CB_PAUSA_MIN)
+        else:
+            db.reset_fuente("mobile.de")
+            resultados.extend(anuncios_m)
+
+    return _dedupe_dicts(resultados)
 
 
 # ─── VALORACIÓN DE MERCADO ES (cacheada) ─────────────────────────────────────
@@ -121,12 +176,36 @@ def confianza(n_comparables: int) -> tuple[str, str]:
     return "🔴", "baja"
 
 
+def evaluar_riesgo_anuncio(anuncio: dict, marca: str, modelo: str, año: int):
+    """
+    Semáforo de riesgo de un anuncio: consulta el dataset propio (km y precios
+    DE) y aplica las reglas de `riesgo.evaluar_riesgo`. Devuelve un `Riesgo`.
+    Prioriza el propio historico_precios que el sniper construye en cada
+    scrapeo — nadie más tiene este dataset (activo del producto).
+    """
+    km_ds = db.km_dataset(marca, modelo, año, SNIPER_KM_ANOS_TOL)
+    precios_de_ds = db.precios_de_dataset(marca, modelo, año, SNIPER_KM_ANOS_TOL)
+    return evaluar_riesgo(
+        anuncio, km_ds, precios_de_ds,
+        km_min_muestra=SNIPER_KM_MIN_MUESTRA,
+        km_pctl_amarillo=SNIPER_KM_PCTL_AMARILLO,
+        km_pctl_rojo=SNIPER_KM_PCTL_ROJO,
+        precio_de_min_muestra=SNIPER_PRECIO_DE_MIN_MUESTRA,
+        precio_de_anomalo_pct=SNIPER_PRECIO_DE_ANOMALO_PCT,
+        fotos_min=SNIPER_RIESGO_FOTOS_MIN,
+        propietarios_max=SNIPER_RIESGO_PROPIETARIOS_MAX,
+        blandas_amarillo=SNIPER_RIESGO_BLANDAS_AMARILLO,
+    )
+
+
 def evaluar_candidato(anuncio: dict, valoracion: dict,
                       umbral_eur: int | None = None,
                       umbral_pct: float | None = None) -> dict:
     """
-    Calcula la cuenta de importación del candidato contra la valoración ES.
-    Devuelve {alerta, cuenta, n_comparables}. `alerta` exige AMBOS umbrales.
+    Calcula la cuenta de importación Y el semáforo de riesgo del candidato.
+    Devuelve {alerta, cuenta, riesgo, n_comparables}. `alerta` (margen) y el
+    nivel de riesgo son señales independientes — el caller decide si alertar
+    ROJO o no; aquí solo se calculan ambas.
     """
     umbral_eur = SNIPER_UMBRAL_EUR if umbral_eur is None else umbral_eur
     umbral_pct = SNIPER_UMBRAL_PCT if umbral_pct is None else umbral_pct
@@ -140,24 +219,39 @@ def evaluar_candidato(anuncio: dict, valoracion: dict,
         año=anuncio.get("año", 0),
     )
     alerta = cuenta["margen_eur"] >= umbral_eur and cuenta["margen_pct"] >= umbral_pct
+
+    riesgo = evaluar_riesgo_anuncio(
+        anuncio, valoracion.get("marca", ""), valoracion.get("modelo", ""),
+        anuncio.get("año", 0),
+    )
+
     return {
         "alerta": alerta,
         "cuenta": cuenta,
+        "riesgo": riesgo,
         "n_comparables": int(valoracion.get("n_comparables", 0) or 0),
     }
+
+
+async def _con_detalle(anuncio: dict) -> dict:
+    """Completa el detalle si aún no lo tiene (mobile.de ya lo trae completo)."""
+    if anuncio.get("_detalle_completo"):
+        return anuncio
+    return await ScraperAutoScout24().obtener_detalle_candidato(anuncio)
 
 
 async def mejores_del_mercado(marca: str, modelo: str, filtros: dict,
                               umbral_eur: int, umbral_pct: float,
                               top_n: int = 3, max_refrescos: int = 3) -> list[dict]:
     """
-    Escaneo INMEDIATO para '¿qué hay ahora?'. Detecta en AS24, valora cada
-    candidato (caché primero, máx `max_refrescos` scrapeos ES para no eternizar),
-    afina los top con el detalle real y devuelve top_n ordenado por margen desc.
-    Cada item: {anuncio, valoracion, cuenta, margen_eur}. Solo con valoración fiable.
+    Escaneo INMEDIATO para '¿qué hay ahora?'. Detecta en AS24 + mobile.de
+    (multifuente), valora cada candidato (caché primero, máx `max_refrescos`
+    scrapeos ES para no eternizar), afina los top con el detalle real y calcula
+    el semáforo de riesgo. Devuelve top_n ordenado por margen desc, SOLO con
+    valoración fiable. Cada item: {anuncio, valoracion, cuenta, riesgo, margen_eur}.
     """
     try:
-        anuncios, _señal = await ScraperAutoScout24().buscar_deteccion(marca, modelo, filtros)
+        anuncios = await detectar_multifuente(marca, modelo, filtros)
     except Exception as e:
         logger.warning(f"[SNIPER] escaneo inmediato falló: {e}")
         return []
@@ -180,9 +274,9 @@ async def mejores_del_mercado(marca: str, modelo: str, filtros: dict,
 
     salida = []
     for a, v, _c in evaluados[:top_n]:
-        a = await ScraperAutoScout24().obtener_detalle_candidato(a)
+        a = await _con_detalle(a)
         r = evaluar_candidato(a, v, umbral_eur, umbral_pct)
-        salida.append({"anuncio": a, "valoracion": v, "cuenta": r["cuenta"],
+        salida.append({"anuncio": a, "valoracion": v, "cuenta": r["cuenta"], "riesgo": r["riesgo"],
                        "margen_eur": r["cuenta"]["margen_eur"]})
     salida.sort(key=lambda x: x["margen_eur"], reverse=True)
     return salida
@@ -223,8 +317,12 @@ def filtrar_nuevos(mision: dict, anuncios: list[dict]) -> list[dict]:
 
 
 def marcar_visto(mision_id: int, anuncio: dict, tipo: str = "snapshot",
-                 cuenta: dict | None = None):
-    """Registra el anuncio como visto (snapshot) o alertado (alerta)."""
+                 cuenta: dict | None = None, riesgo=None):
+    """
+    Registra el anuncio como visto (snapshot) o alertado (alerta). Persiste el
+    desglose de costes y el nivel/banderas de riesgo — transparencia del número
+    mostrado y dataset de casos reales del sniper.
+    """
     h = anuncio.get("_huella", "")
     db.registrar_visto(
         mision_id, str(anuncio.get("id", "")), h, tipo=tipo,
@@ -232,14 +330,23 @@ def marcar_visto(mision_id: int, anuncio: dict, tipo: str = "snapshot",
         margen_eur=(cuenta or {}).get("margen_eur", 0),
         margen_pct=(cuenta or {}).get("margen_pct", 0),
         url=anuncio.get("link", ""),
+        desglose=(cuenta or {}).get("desglose"),
+        riesgo=riesgo.to_dict() if riesgo is not None else None,
     )
 
 
 # ─── RENDER DE LA TARJETA DE ALERTA ──────────────────────────────────────────
 
-def boton_ver_anuncio(url: str) -> dict:
-    """reply_markup para la API HTTP de Telegram (worker) o InlineKeyboard (bot)."""
-    return {"inline_keyboard": [[{"text": "🔗 Ver anuncio", "url": url or "#"}]]}
+def boton_ver_anuncio(url: str, anuncio_id: str = "") -> dict:
+    """
+    reply_markup para la API HTTP de Telegram (worker) o InlineKeyboard (bot).
+    Segunda fila: hueco para el informe VIN (afiliación/upsell futuro — ver
+    proposal). Hoy es un stub informativo, no cobra ni pide datos de pago.
+    """
+    filas = [[{"text": "🔗 Ver anuncio", "url": url or "#"}]]
+    if anuncio_id:
+        filas.append([{"text": "🪪 Informe VIN (próximamente)", "callback_data": f"sniper_vin:{anuncio_id}"}])
+    return {"inline_keyboard": filas}
 
 
 def _eur(v: float) -> str:
@@ -250,15 +357,18 @@ def _eur(v: float) -> str:
 
 
 def render_tarjeta_alerta(anuncio: dict, valoracion: dict, cuenta: dict,
-                          mision_id: int | None = None) -> str:
+                          mision_id: int | None = None, riesgo=None) -> str:
     """
     Tarjeta de alerta con el formato del vídeo. html.escape en todo campo
     scrapeado. No promete datos que no tiene (sin CO₂ → IEDMT estimado, total).
+    El semáforo (si se pasa `riesgo`) prioriza dónde gastar el informe VIN o
+    la inspección — nunca afirma que un coche "está bien".
     """
     titulo = html.escape(anuncio.get("titulo", "") or f"{anuncio.get('año','')}")
     año = anuncio.get("año", "") or "N/D"
     km  = anuncio.get("km", 0) or 0
     km_str = f"{int(km):,}".replace(",", ".") if km else "N/D"
+    fuente = anuncio.get("fuente", "") or "AutoScout24"
 
     emoji_conf, nivel_conf = confianza(valoracion.get("n_comparables", 0))
     margen = cuenta["margen_eur"]
@@ -267,7 +377,7 @@ def render_tarjeta_alerta(anuncio: dict, valoracion: dict, cuenta: dict,
     lineas = [
         "🎯 <b>SNIPER — nuevo anuncio</b>",
         f"<b>{titulo}</b>",
-        f"📅 {año} · 📍 {km_str} km",
+        f"📅 {año} · 📍 {km_str} km · <i>{html.escape(fuente)}</i>",
         "",
         f"🇩🇪 Alemania: <b>{_eur(anuncio.get('precio', 0))}</b>",
         f"🇪🇸 Mercado ES: <b>{_eur(valoracion.get('mediana', 0))}</b>",
@@ -300,5 +410,14 @@ def render_tarjeta_alerta(anuncio: dict, valoracion: dict, cuenta: dict,
 
     if cuenta.get("co2_estimado"):
         lineas.append("<i>CO₂ no publicado → IEDMT estimado.</i>")
+
+    if riesgo is not None:
+        lineas.append("")
+        lineas.append(f"{riesgo.emoji} <b>Riesgo: {riesgo.nivel}</b> — en qué gastarte el informe VIN")
+        for b in riesgo.banderas:
+            emoji_b = {"ROJO": "🔴", "AMARILLO": "🟡", "VERDE": "▫️"}.get(b.nivel, "▫️")
+            lineas.append(f"{emoji_b} {html.escape(b.texto)}")
+        if not riesgo.banderas:
+            lineas.append("Sin señales de riesgo detectables en el anuncio.")
 
     return "\n".join(lineas)

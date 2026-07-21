@@ -791,15 +791,20 @@ class ScraperAutoScout24(ScraperDE):
 
     async def obtener_detalle_candidato(self, coche: dict) -> dict:
         """
-        Visita el detalle de UN candidato y rellena campos para la cuenta:
-        co2, potencia (PS), nº propietarios, vendedor (haendler/particular),
-        es_netto (MwSt. ausweisbar), caja, combustible, descripción.
+        Visita el detalle de UN candidato y rellena campos para la cuenta y el
+        semáforo de riesgo: co2, potencia (PS), nº propietarios, vendedor
+        (haendler/particular), es_netto (MwSt. ausweisbar), caja, combustible,
+        descripción, reimport, unfallfrei, scheckheftgepflegt, nº de fotos.
         NUNCA llama a IA. Muta y devuelve el dict.
         """
         coche.setdefault("cv", 0)
         coche.setdefault("propietarios", 0)
         coche.setdefault("vendedor", "")
         coche.setdefault("es_netto", False)
+        coche.setdefault("reimport", False)
+        coche.setdefault("unfallfrei", False)
+        coche.setdefault("scheckheftgepflegt", False)
+        coche.setdefault("num_fotos", 0)
         link = coche.get("link")
         if not link:
             return coche
@@ -844,6 +849,20 @@ class ScraperAutoScout24(ScraperDE):
                                   || t.includes('nettopreis');
                         r.privado = t.includes('privatverkäufer') || t.includes('privatanbieter')
                                     || t.includes('privatverkauf');
+                        // Reimport / EU-Neuwagen: historial de km no verificable entre países.
+                        r.reimport = t.includes('reimport') || t.includes('eu-neuwagen')
+                                     || t.includes('reimportfahrzeug');
+                        // Unfallfrei (sin accidentes) y Scheckheftgepflegt (libro de
+                        // revisiones): los vendedores alemanes SIEMPRE lo declaran si
+                        // lo tienen — la ausencia es la señal, no la mención de "unfall".
+                        r.unfallfrei = t.includes('unfallfrei');
+                        r.scheckheft = t.includes('scheckheftgepflegt')
+                                       || t.includes('scheckheft gepflegt');
+                        // Nº de fotos de la galería.
+                        r.numFotos = document.querySelectorAll(
+                            "[class*='gallery'] img, [data-testid*='gallery'] img, "
+                            + "picture img[src*='pictures.autoscout24']"
+                        ).length;
                         return r;
                     }
                 """)
@@ -869,6 +888,13 @@ class ScraperAutoScout24(ScraperDE):
                         coche["propietarios"] = int(prop)
                     coche["es_netto"] = bool(datos.get("netto"))
                     coche["vendedor"] = "particular" if datos.get("privado") else "haendler"
+                    coche["reimport"] = bool(datos.get("reimport"))
+                    coche["unfallfrei"] = bool(datos.get("unfallfrei"))
+                    coche["scheckheftgepflegt"] = bool(datos.get("scheckheft"))
+                    try:
+                        coche["num_fotos"] = int(datos.get("numFotos") or 0)
+                    except (ValueError, TypeError):
+                        coche["num_fotos"] = 0
             except Exception as e:
                 logger.debug(f"[AS24] Detalle candidato falló {link}: {e}")
             finally:
@@ -889,29 +915,21 @@ class ScraperMobileDe(ScraperDE):
     # mobile.de usa URLs SEO: /auto/volkswagen-golf-gti.html
     BASE_URL = "https://suchen.mobile.de/auto"
 
-    async def buscar(self, marca: str, modelo: str, filtros: dict) -> list[dict]:
+    def _construir_url(self, marca: str, modelo: str, filtros: dict) -> str:
         filtros = filtros or {}
-        user_agent = random.choice(USER_AGENTS)
-        proxy_cfg = {"server": random.choice(PROXIES)} if PROXIES else None
-        resultados: list[dict] = []
-
-        # URL SEO: /auto/volkswagen-golf-gti.html
         marca_slug = marca.lower().strip().replace(" ", "-")
         modelo_slug = modelo.lower().strip().replace(" ", "-")
         url = f"{self.BASE_URL}/{marca_slug}-{modelo_slug}.html"
 
-        # Filtros como query params
         params = []
         if filtros.get("km_max"):    params.append(f"ml=:{filtros['km_max']}")
         if filtros.get("km_min"):    params.append(f"ml={filtros['km_min']}:")
 
-        # year: combinar min y max en un solo param fr=MIN:MAX
         yr_min = filtros.get("year_min", "")
         yr_max = filtros.get("year_max", "")
         if yr_min or yr_max:
             params.append(f"fr={yr_min or ''}:{yr_max or ''}")
 
-        # price: combinar min y max en un solo param p=MIN:MAX
         pr_min = filtros.get("price_min", "")
         pr_max = filtros.get("price_max", "")
         if pr_min or pr_max:
@@ -930,7 +948,6 @@ class ScraperMobileDe(ScraperDE):
         if carro in CARROCERIAS_MOBILE:
             params.append(f"bod={CARROCERIAS_MOBILE[carro]}")
 
-        # Extras / equipamiento
         extras = filtros.get("extras", [])
         if extras:
             for extra in extras:
@@ -945,7 +962,15 @@ class ScraperMobileDe(ScraperDE):
 
         if params:
             url += "?" + "&".join(params)
+        return url
 
+    async def buscar(self, marca: str, modelo: str, filtros: dict) -> list[dict]:
+        filtros = filtros or {}
+        user_agent = random.choice(USER_AGENTS)
+        proxy_cfg = {"server": random.choice(PROXIES)} if PROXIES else None
+        resultados: list[dict] = []
+
+        url = self._construir_url(marca, modelo, filtros)
         logger.info(f"[MOBILE] URL: {url}")
 
         async with _PLAYWRIGHT_SEM, async_playwright() as p:
@@ -974,31 +999,7 @@ class ScraperMobileDe(ScraperDE):
                     except Exception:
                         continue
 
-                # Recoger URLs de detalle — probar múltiples selectores
-                detail_urls = set()
-                for link_sel in [
-                    "a[href*='/fahrzeuge/details']",
-                    "a[href*='fahrzeuge/details.html']",
-                    "a[data-testid*='result']",
-                    "a[class*='result']",
-                    "a[href*='id='][href*='.html']",
-                ]:
-                    els = page.locator(link_sel)
-                    n = await els.count()
-                    if n > 0:
-                        logger.info(f"[MOBILE] Selector '{link_sel}': {n} links")
-                        for i in range(n):
-                            try:
-                                href = await els.nth(i).get_attribute("href") or ""
-                                if href and len(href) > 20:
-                                    if not href.startswith("http"):
-                                        href = f"https://suchen.mobile.de{href}"
-                                    detail_urls.add(href)
-                            except Exception:
-                                continue
-                        if detail_urls:
-                            break
-
+                detail_urls = await self._recolectar_urls_detalle(page)
                 logger.info(f"[MOBILE] {len(detail_urls)} URLs de detalle")
 
                 if not detail_urls:
@@ -1027,7 +1028,132 @@ class ScraperMobileDe(ScraperDE):
         logger.info(f"[MOBILE] Total extraídos: {len(resultados)}")
         return resultados
 
-    async def _extraer_detalle(self, context, url: str, marca: str, modelo: str) -> dict | None:
+    async def _recolectar_urls_detalle(self, page) -> set[str]:
+        """Recolección barata (sin visitar detalle): URLs de anuncio del listado."""
+        detail_urls = set()
+        for link_sel in [
+            "a[href*='/fahrzeuge/details']",
+            "a[href*='fahrzeuge/details.html']",
+            "a[data-testid*='result']",
+            "a[class*='result']",
+            "a[href*='id='][href*='.html']",
+        ]:
+            els = page.locator(link_sel)
+            n = await els.count()
+            if n > 0:
+                for i in range(n):
+                    try:
+                        href = await els.nth(i).get_attribute("href") or ""
+                        if href and len(href) > 20:
+                            if not href.startswith("http"):
+                                href = f"https://suchen.mobile.de{href}"
+                            detail_urls.add(href)
+                    except Exception:
+                        continue
+                if detail_urls:
+                    break
+        return detail_urls
+
+    async def buscar_deteccion(self, marca: str, modelo: str, filtros: dict,
+                               limite: int | None = None) -> tuple[list[dict], str]:
+        """
+        Detección para el sniper. mobile.de NO expone precio/km/año en el
+        listado (a diferencia de AS24), así que la "detección barata" aquí es:
+        recolectar enlaces (gratis) + visitar detalle completo de los primeros
+        `limite` (SNIPER_MOBILE_DETALLES_LIM por defecto) — más caro por
+        candidato que AS24, por eso se limita fuerte. CERO IA (usar_ia_co2=False).
+        Devuelve (anuncios, señal) con señal ∈ {'ok','vacio','fallo'}, mismo
+        contrato que AS24.buscar_deteccion. Los anuncios devueltos ya llevan
+        `_detalle_completo=True` (no hace falta una segunda pasada de detalle).
+        """
+        from cabeza_bot.config import SNIPER_MOBILE_DETALLES_LIM
+        filtros = filtros or {}
+        limite = limite or SNIPER_MOBILE_DETALLES_LIM
+        user_agent = random.choice(USER_AGENTS)
+        proxy_cfg = {"server": random.choice(PROXIES)} if PROXIES else None
+        url = self._construir_url(marca, modelo, filtros)
+
+        async with _PLAYWRIGHT_SEM, async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await _nuevo_contexto_stealth(browser, user_agent, proxy_cfg)
+            await context.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+            )
+            try:
+                page = await context.new_page()
+                await page.goto(url, timeout=60_000, wait_until="domcontentloaded")
+                await asyncio.sleep(random.uniform(1.5, 3.0))
+
+                for sel in ["button#mde-consent-accept-btn",
+                             "button:has-text('Alle akzeptieren')",
+                             "button:has-text('Einverstanden')",
+                             "#gdpr-consent-accept-btn",
+                             "button[class*='accept']"]:
+                    try:
+                        btn = page.locator(sel).first
+                        if await btn.is_visible(timeout=3_000):
+                            await btn.click()
+                            await asyncio.sleep(1.0)
+                            break
+                    except Exception:
+                        continue
+
+                detail_urls = await self._recolectar_urls_detalle(page)
+                estructura_ok = bool(detail_urls) or await self._pagina_tiene_landmark_mobile(page)
+                await page.close()
+
+                if not estructura_ok:
+                    logger.warning(f"[MOBILE] Detección: estructura inesperada en {url}")
+                    return [], "fallo"
+                if not detail_urls:
+                    return [], "vacio"
+
+                resultados: list[dict] = []
+                for detail_url in list(detail_urls)[:limite]:
+                    coche = await self._extraer_detalle(context, detail_url, marca, modelo, usar_ia_co2=False)
+                    if coche:
+                        resultados.append(coche)
+                    await asyncio.sleep(random.uniform(0.3, 0.8))
+
+                if resultados:
+                    _persistir_de_historico(resultados, marca, modelo, fuente="mobile.de")
+                    return resultados, "ok"
+                return [], "vacio"
+            except Exception as e:
+                logger.error(f"[MOBILE] Detección falló: {e}")
+                return [], "fallo"
+            finally:
+                await browser.close()
+
+    async def _pagina_tiene_landmark_mobile(self, page) -> bool:
+        """Distingue 'mercado vacío' de 'HTML roto/bloqueo' cuando no hay links de resultado."""
+        try:
+            body = (await page.inner_text("body"))[:4000].lower()
+        except Exception:
+            return False
+        # WAF/bot-block de mobile.de: "Zugriff verweigert" (acceso denegado).
+        # Esto NUNCA es 'vacío legítimo' — debe contar como fallo para que el
+        # circuit breaker actúe y pause la fuente en vez de reintentar en bucle.
+        if any(s in body for s in ("zugriff verweigert", "access denied", "blocked",
+                                     "verdächtige aktivität", "captcha")):
+            return False
+        if any(s in body for s in ("keine ergebnisse", "keine fahrzeuge gefunden", "leider")):
+            return True
+        for sel in ["h1", "[class*='SearchResult']", "form[role='search']"]:
+            try:
+                if await page.locator(sel).first.count():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def _extraer_detalle(self, context, url: str, marca: str, modelo: str,
+                               usar_ia_co2: bool = True) -> dict | None:
+        """
+        `usar_ia_co2=False` para el sniper: CERO llamadas IA en el ciclo. La
+        estimación cuando falta CO₂ la hace `calculator.estimar_co2_deterministico`
+        aguas abajo (conservador, sin red).
+        """
         page = await context.new_page()
         try:
             await page.goto(url, timeout=25_000, wait_until="domcontentloaded")
@@ -1062,7 +1188,8 @@ class ScraperMobileDe(ScraperDE):
 
             datos = await page.evaluate("""
                 () => {
-                    const r = {km:'', year:'', co2:'', caja:'', combustible:'', carroceria:''};
+                    const r = {km:'', year:'', co2:'', caja:'', combustible:'', carroceria:'',
+                               potencia:'', propietarios:''};
                     const byId = (id) => {
                         const el = document.getElementById(id) ||
                                    document.querySelector('[id*="'+id+'"]');
@@ -1074,6 +1201,8 @@ class ScraperMobileDe(ScraperDE):
                     r.caja = byId('transmission-v');
                     r.combustible = byId('fuel-v');
                     r.carroceria = byId('category-v');
+                    r.potencia = byId('power-v');
+                    r.propietarios = byId('numberOfPreviousOwners-v');
                     if (!r.caja || !r.combustible) {
                         for (const dt of document.querySelectorAll('dt')) {
                             const label = (dt.innerText||'').trim().toLowerCase();
@@ -1086,6 +1215,19 @@ class ScraperMobileDe(ScraperDE):
                                 && !r.carroceria) r.carroceria = val;
                         }
                     }
+                    const t = (document.body.innerText || '').toLowerCase();
+                    r.netto = t.includes('mwst. ausweisbar') || t.includes('mwst ausweisbar')
+                              || t.includes('nettopreis');
+                    r.privado = t.includes('privatverkäufer') || t.includes('privatanbieter')
+                                || t.includes('privatverkauf');
+                    r.reimport = t.includes('reimport') || t.includes('eu-neuwagen')
+                                 || t.includes('reimportfahrzeug');
+                    r.unfallfrei = t.includes('unfallfrei');
+                    r.scheckheft = t.includes('scheckheftgepflegt')
+                                   || t.includes('scheckheft gepflegt');
+                    r.numFotos = document.querySelectorAll(
+                        "img[src*='img.classistatic.de']"
+                    ).length;
                     return r;
                 }
             """)
@@ -1100,13 +1242,28 @@ class ScraperMobileDe(ScraperDE):
             if datos.get("co2"):
                 v = _parse_numero(datos["co2"])
                 co2 = v if 50 <= v <= 400 else 0.0
-            if co2 == 0.0:
+            if co2 == 0.0 and usar_ia_co2:
                 try:
                     from cabeza_bot.analisis.ai import estimar_co2
                     comb = _normalizar_combustible_de(datos.get("combustible", "")) or _detectar_combustible_titulo(titulo)
                     co2 = await estimar_co2(marca, modelo, año, comb)
                 except Exception:
                     pass
+
+            cv = 0
+            pot_txt = datos.get("potencia", "") or ""
+            m_ps = re.search(r"(\d{2,4})\s*PS", pot_txt)
+            if m_ps:
+                cv = int(m_ps.group(1))
+            elif "kw" in pot_txt.lower():
+                kw = _parse_numero(pot_txt)
+                if kw > 0:
+                    cv = round(kw * 1.35962)
+
+            propietarios = 0
+            prop_v = _parse_numero(datos.get("propietarios", "") or "0")
+            if prop_v > 0:
+                propietarios = int(prop_v)
 
             descripcion = ""
             try:
@@ -1131,6 +1288,10 @@ class ScraperMobileDe(ScraperDE):
             except Exception:
                 pass
 
+            combustible = _normalizar_combustible_de(datos.get("combustible", ""))
+            if not combustible:
+                combustible = _detectar_combustible_titulo(titulo)
+
             return {
                 "id":          _generar_id("mobile", titulo, precio, url),
                 "titulo":      titulo,
@@ -1142,9 +1303,18 @@ class ScraperMobileDe(ScraperDE):
                 "foto":        foto,
                 "descripcion": descripcion,
                 "caja":        _normalizar_caja_de(datos.get("caja", "")),
-                "combustible": _normalizar_combustible_de(datos.get("combustible", "")),
+                "combustible": combustible,
                 "carroceria":  _normalizar_carroceria_de(datos.get("carroceria", "")),
                 "fuente":      "mobile.de",
+                "cv":          cv,
+                "propietarios": propietarios,
+                "vendedor":    "particular" if datos.get("privado") else "haendler",
+                "es_netto":    bool(datos.get("netto")),
+                "reimport":    bool(datos.get("reimport")),
+                "unfallfrei":  bool(datos.get("unfallfrei")),
+                "scheckheftgepflegt": bool(datos.get("scheckheft")),
+                "num_fotos":   int(datos.get("numFotos") or 0),
+                "_detalle_completo": True,
             }
         except Exception as e:
             logger.warning(f"[MOBILE] Error detalle {url}: {e}")
@@ -2467,11 +2637,13 @@ class ScraperCochesNet:
 # FUNCIONES PÚBLICAS
 # ════════════════════════════════════════════════════════════════════════════
 
-def _persistir_de_historico(anuncios: list[dict], marca: str, modelo: str) -> int:
+def _persistir_de_historico(anuncios: list[dict], marca: str, modelo: str,
+                            fuente: str = "autoscout24") -> int:
     """
-    Persiste los anuncios DE (dicts del scraper) en historico_precios con
-    fuente='autoscout24'. Mismos filtros de calidad que ES: precio>0, año>1990.
-    El dataset DE vs ES es un activo del producto.
+    Persiste los anuncios DE (dicts del scraper) en historico_precios con la
+    `fuente` indicada (autoscout24 / mobile.de). Mismos filtros de calidad que
+    ES: precio>0, año>1990. El dataset DE vs ES es un activo del producto —
+    también alimenta el semáforo de riesgo (precio anómalo, plausibilidad km).
     """
     from cabeza_bot.models import Anuncio
     from cabeza_bot.data.database import guardar_historico_batch
@@ -2486,7 +2658,7 @@ def _persistir_de_historico(anuncios: list[dict], marca: str, modelo: str) -> in
             continue
         lote.append(Anuncio(
             item_id=str(a.get("id", "")),
-            fuente="autoscout24",
+            fuente=fuente,
             marca=marca, modelo=modelo,
             año=año, km=int(a.get("km", 0) or 0), precio=precio,
             provincia="DE", descripcion=a.get("descripcion", ""),

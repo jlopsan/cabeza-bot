@@ -3216,6 +3216,11 @@ async def callback_sniper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _crear_sniper_confirmado(query, ctx)
         return
 
+    if data.startswith("sniper_vin:"):
+        # Hueco para el informe VIN (afiliación/upsell futuro) — stub, no cobra.
+        await query.answer("Informe VIN: próximamente. Aún no disponible.", show_alert=True)
+        return
+
     # Gestión: sniper_<accion>:<id>
     try:
         accion, sid = data.split(":", 1)
@@ -3324,13 +3329,13 @@ async def _crear_sniper_confirmado(query, ctx: ContextTypes.DEFAULT_TYPE):
 
     await buscando.edit_text(f"🏆 <b>Top {len(top)} ahora mismo</b> (ordenado por margen):", parse_mode="HTML")
     for item in top:
-        tarjeta = sp.render_tarjeta_alerta(item["anuncio"], item["valoracion"], item["cuenta"])
-        await query.message.reply_text(
-            tarjeta, parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🔗 Ver anuncio", url=item["anuncio"].get("link") or "#")]]
-            ),
-        )
+        anuncio = item["anuncio"]
+        tarjeta = sp.render_tarjeta_alerta(anuncio, item["valoracion"], item["cuenta"], riesgo=item.get("riesgo"))
+        botones = [[InlineKeyboardButton("🔗 Ver anuncio", url=anuncio.get("link") or "#")]]
+        if anuncio.get("id"):
+            botones.append([InlineKeyboardButton("🪪 Informe VIN (próximamente)",
+                                                  callback_data=f"sniper_vin:{anuncio['id']}")])
+        await query.message.reply_text(tarjeta, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(botones))
 
 
 async def _capturar_datos_sniper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

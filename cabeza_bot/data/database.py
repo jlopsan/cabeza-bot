@@ -216,6 +216,17 @@ def init_db():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_alertas_mision ON alertas_enviadas(mision_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_alertas_huella ON alertas_enviadas(huella)")
+        # Migración: desglose de costes + nivel de riesgo por unidad (transparencia,
+        # y dataset para el vídeo "caso real del sniper").
+        for col, ddl in [
+            ("desglose_json", "TEXT DEFAULT ''"),
+            ("riesgo_nivel",  "TEXT DEFAULT ''"),
+            ("riesgo_json",   "TEXT DEFAULT ''"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE alertas_enviadas ADD COLUMN {col} {ddl}")
+            except sqlite3.OperationalError:
+                pass  # Ya existe
 
         # Valoración de mercado ES cacheada por modelo+año+banda de km.
         conn.execute("""
@@ -951,18 +962,26 @@ def huella_vista_reciente(mision_id: int, huella: str, dias: int = 30) -> bool:
 
 def registrar_visto(mision_id: int, anuncio_id: str, huella: str = "",
                     tipo: str = "snapshot", precio: float = 0,
-                    margen_eur: float = 0, margen_pct: float = 0, url: str = "") -> bool:
+                    margen_eur: float = 0, margen_pct: float = 0, url: str = "",
+                    desglose: dict | None = None, riesgo: dict | None = None) -> bool:
     """
     Registra un anuncio como visto (snapshot) o alertado (alerta). Idempotente
     por UNIQUE(mision_id, anuncio_id): un segundo intento no duplica.
+    `desglose`/`riesgo` (opcionales) se guardan como JSON — transparencia del
+    número mostrado y dataset de casos reales del sniper.
     Devuelve True si insertó (no estaba), False si ya existía.
     """
     with get_conn() as conn:
         cur = conn.execute(
             "INSERT OR IGNORE INTO alertas_enviadas "
-            "(mision_id, anuncio_id, huella, tipo, precio, margen_eur, margen_pct, url, ts) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (mision_id, anuncio_id, huella, tipo, precio, margen_eur, margen_pct, url, _ahora()),
+            "(mision_id, anuncio_id, huella, tipo, precio, margen_eur, margen_pct, url, "
+            " desglose_json, riesgo_nivel, riesgo_json, ts) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (mision_id, anuncio_id, huella, tipo, precio, margen_eur, margen_pct, url,
+             json.dumps(desglose) if desglose else "",
+             (riesgo or {}).get("nivel", ""),
+             json.dumps(riesgo) if riesgo else "",
+             _ahora()),
         )
         conn.commit()
         return cur.rowcount > 0
@@ -1200,3 +1219,45 @@ def stats_sniper() -> dict:
         "alertas_7d": a7d,
         "conversion_por_fuente": fuentes,
     }
+
+
+# ─── DATASET PARA EL SEMÁFORO DE RIESGO ─────────────────────────────────────
+# Ambas leen historico_precios: el dataset que se construye con CADA scrapeo
+# (regla innegociable) es el activo que alimenta el semáforo — nadie más lo tiene.
+
+def km_dataset(marca: str, modelo: str, año: int, tol_años: int) -> list[int]:
+    """
+    Km de todos los anuncios (cualquier fuente, ES o DE) del mismo marca/modelo
+    en el rango de años [año-tol, año+tol]. Para el percentil de plausibilidad
+    de km — sirve para detectar "km demasiado bajos para su edad".
+    """
+    if not marca or not modelo or not año:
+        return []
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT km FROM historico_precios "
+            "WHERE lower(marca)=lower(?) AND lower(modelo)=lower(?) "
+            "AND año BETWEEN ? AND ? AND km > 0",
+            (marca, modelo, int(año) - tol_años, int(año) + tol_años),
+        ).fetchall()
+    return [r["km"] for r in rows]
+
+
+def precios_de_dataset(marca: str, modelo: str, año: int, tol_años: int) -> list[float]:
+    """
+    Precios alemanes (fuente autoscout24/mobile.de) del mismo marca/modelo/año±tol,
+    acumulados de TODOS los scrapeos anteriores (no solo el batch actual del ciclo).
+    Es el dataset propio — comparables DE amplios, nivel pro — para detectar
+    precio anómalo dentro del propio mercado alemán (no contra España).
+    """
+    if not marca or not modelo or not año:
+        return []
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT precio FROM historico_precios "
+            "WHERE lower(marca)=lower(?) AND lower(modelo)=lower(?) "
+            "AND año BETWEEN ? AND ? AND precio > 0 "
+            "AND fuente IN ('autoscout24', 'mobile.de')",
+            (marca, modelo, int(año) - tol_años, int(año) + tol_años),
+        ).fetchall()
+    return [r["precio"] for r in rows]

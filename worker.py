@@ -16,18 +16,18 @@ import time
 import httpx
 
 from cabeza_bot.config import (
-    TELEGRAM_TOKEN, ENABLE_SNIPER,
+    TELEGRAM_TOKEN, ENABLE_SNIPER, ENABLE_SNIPER_MOBILE_DE,
     SNIPER_INTERVAL_MINUTES, SNIPER_BUDGET_S, SNIPER_MAX_SCRAPES_HORA,
-    SNIPER_CB_FALLOS, SNIPER_CB_PAUSA_MIN, SNIPER_ALERTAS_PASADA,
+    SNIPER_ALERTAS_PASADA,
 )
 from cabeza_bot.data.database import (
     init_db, purgar_historico_antiguo,
     expirar_misiones_legacy, expirar_misiones_vencidas,
     obtener_misiones_sniper_activas, set_mision_run, incr_alertas_mision,
-    fuente_pausada, incr_fallo_fuente, reset_fuente,
-    incr_scrape_hora, scrapes_ultima_hora, registrar_evento_embudo,
+    fuente_pausada, scrapes_ultima_hora, registrar_evento_embudo,
 )
-from cabeza_bot.scraping.scraper import buscar_comparables_todas, ScraperAutoScout24
+from cabeza_bot.scraping.scraper import buscar_comparables_todas
+from cabeza_bot.sniper.riesgo import NIVEL_ROJO
 import cabeza_bot.sniper.sniper_pipeline as sp
 
 logging.basicConfig(
@@ -59,8 +59,11 @@ async def _send(chat_id: int, texto: str, reply_markup: dict | None = None):
 
 async def _procesar_mision(mision: dict, anuncios: list[dict], refrescos: int) -> int:
     """
-    Evalúa los anuncios de la clave contra una misión. Devuelve el nº de refrescos
-    de valoración acumulados en la pasada (para respetar el máx 1 por pasada).
+    Evalúa los anuncios de la clave contra una misión: valora, calcula margen +
+    riesgo, y junta los candidatos alertables (margen OK Y riesgo != ROJO) para
+    alertar los de MAYOR margen primero — no por orden de llegada. Los ROJOS
+    nunca se alertan pero quedan registrados (riesgo/desglose) para consulta.
+    Devuelve el nº de refrescos de valoración acumulados en la pasada.
     """
     mid    = mision["id"]
     marca  = mision["marca"]
@@ -79,7 +82,8 @@ async def _procesar_mision(mision: dict, anuncios: list[dict], refrescos: int) -
         set_mision_run(mid)
         return refrescos
 
-    alertas = 0
+    alertables: list[tuple[dict, dict, dict]] = []  # (anuncio, valoracion, resultado_final)
+
     for anuncio in nuevos:
         año = anuncio.get("año", 0)
         km  = anuncio.get("km", 0)
@@ -95,42 +99,75 @@ async def _procesar_mision(mision: dict, anuncios: list[dict], refrescos: int) -
                 sp.marcar_visto(mid, anuncio, tipo="snapshot")  # sin comparables: no reintentar
                 continue
 
-        # Pre-filtro con datos del listado (CO₂ estimado) para no bajar a detalle en balde.
+        # Pre-filtro con datos del listado (barato) para no bajar a detalle en balde.
         pre = sp.evaluar_candidato(anuncio, v, umbral_eur, umbral_pct)
         if not pre["alerta"]:
-            sp.marcar_visto(mid, anuncio, tipo="snapshot", cuenta=pre["cuenta"])
+            sp.marcar_visto(mid, anuncio, tipo="snapshot", cuenta=pre["cuenta"], riesgo=pre["riesgo"])
             continue
 
-        # Fase 2: detalle real (CO₂, Netto, propietarios…) y re-evaluación.
-        anuncio = await ScraperAutoScout24().obtener_detalle_candidato(anuncio)
+        # Detalle real (CO₂, Netto, propietarios, reimport…) y re-evaluación con riesgo.
+        anuncio = await sp._con_detalle(anuncio)
         final = sp.evaluar_candidato(anuncio, v, umbral_eur, umbral_pct)
-        if not final["alerta"]:
-            sp.marcar_visto(mid, anuncio, tipo="snapshot", cuenta=final["cuenta"])
+
+        if not final["alerta"] or final["riesgo"].nivel == NIVEL_ROJO:
+            # Riesgo ROJO: NUNCA se alerta aunque el margen sea bueno — pero
+            # queda registrado con su riesgo/desglose (consultable, no perdido).
+            sp.marcar_visto(mid, anuncio, tipo="snapshot", cuenta=final["cuenta"], riesgo=final["riesgo"])
             continue
 
-        # Tope de alertas por misión/pasada: el resto se registra visto sin alertar.
-        if alertas >= SNIPER_ALERTAS_PASADA:
-            sp.marcar_visto(mid, anuncio, tipo="snapshot", cuenta=final["cuenta"])
-            continue
+        alertables.append((anuncio, v, final))
 
-        texto = sp.render_tarjeta_alerta(anuncio, v, final["cuenta"], mid)
-        await _send(mision["user_id"], texto, reply_markup=sp.boton_ver_anuncio(anuncio.get("link", "")))
-        sp.marcar_visto(mid, anuncio, tipo="alerta", cuenta=final["cuenta"])
+    if not alertables:
+        set_mision_run(mid)
+        return refrescos
+
+    # Mayor margen primero — no por orden de llegada del scraper.
+    alertables.sort(key=lambda t: t[2]["cuenta"]["margen_eur"], reverse=True)
+
+    top = alertables[:SNIPER_ALERTAS_PASADA]
+    resto = alertables[SNIPER_ALERTAS_PASADA:]
+
+    for anuncio, v, final in top:
+        texto = sp.render_tarjeta_alerta(anuncio, v, final["cuenta"], mid, riesgo=final["riesgo"])
+        await _send(mision["user_id"], texto,
+                   reply_markup=sp.boton_ver_anuncio(anuncio.get("link", ""), str(anuncio.get("id", ""))))
+        sp.marcar_visto(mid, anuncio, tipo="alerta", cuenta=final["cuenta"], riesgo=final["riesgo"])
         incr_alertas_mision(mid, 1)
         registrar_evento_embudo(
             mision["user_id"], "alerta_enviada",
             f"mision={mid};margen={final['cuenta']['margen_eur']:.0f}",
         )
-        alertas += 1
         logger.info(f"[SNIPER] Misión #{mid}: alerta {anuncio.get('id')} margen {final['cuenta']['margen_eur']:.0f}€")
         await asyncio.sleep(1.0)
+
+    # Excedente: registrado (no se pierde), sin alertar, y avisamos que hay más.
+    for anuncio, v, final in resto:
+        sp.marcar_visto(mid, anuncio, tipo="snapshot", cuenta=final["cuenta"], riesgo=final["riesgo"])
+    if resto:
+        await _send(
+            mision["user_id"],
+            f"🎯 Y <b>{len(resto)} más</b> con margen en esta pasada de la misión #{mid}. "
+            "Sube el umbral o consulta /sniper si quieres verlas todas.",
+        )
 
     set_mision_run(mid)
     return refrescos
 
 
+def _fuentes_disponibles() -> bool:
+    """False solo si TODAS las fuentes DE están pausadas/deshabilitadas."""
+    as24_ok = not fuente_pausada(FUENTE_DE)
+    mobile_ok = ENABLE_SNIPER_MOBILE_DE and not fuente_pausada("mobile.de")
+    return as24_ok or mobile_ok
+
+
 async def _pasada_sniper():
-    """Una pasada del ciclo sniper. Agrupa por clave, respeta presupuesto y breaker."""
+    """
+    Una pasada del ciclo sniper. Agrupa por clave (AS24), respeta presupuesto y
+    detecta en AS24 + mobile.de (multifuente — cada una con su propio circuit
+    breaker, gestionado dentro de `sp.detectar_multifuente`; un bloqueo de una
+    fuente NUNCA tumba la otra).
+    """
     expiradas = expirar_misiones_vencidas()
     if expiradas:
         logger.info(f"[SNIPER] {expiradas} misiones expiradas")
@@ -139,8 +176,8 @@ async def _pasada_sniper():
     if not misiones:
         return
 
-    if fuente_pausada(FUENTE_DE):
-        logger.warning("[SNIPER] AutoScout24 pausada (circuit breaker); salto pasada")
+    if not _fuentes_disponibles():
+        logger.warning("[SNIPER] Todas las fuentes DE pausadas (circuit breaker); salto pasada")
         return
 
     # Agrupar misiones por clave de scrapeo (filtros equivalentes → un scrapeo).
@@ -161,7 +198,7 @@ async def _pasada_sniper():
         if scrapes_ultima_hora(FUENTE_DE) >= SNIPER_MAX_SCRAPES_HORA:
             logger.warning("[SNIPER] Cap de scrapes/hora alcanzado; salto resto de pasada")
             break
-        if fuente_pausada(FUENTE_DE):
+        if not _fuentes_disponibles():
             break
 
         grupo   = grupos[clave]
@@ -169,21 +206,7 @@ async def _pasada_sniper():
         modelo  = grupo[0]["modelo"]
         filtros = sp.filtros_mision(grupo[0])
 
-        incr_scrape_hora(FUENTE_DE)
-        anuncios, señal = await ScraperAutoScout24().buscar_deteccion(marca, modelo, filtros)
-
-        if señal == "fallo":
-            fallos, pausada = incr_fallo_fuente(FUENTE_DE, SNIPER_CB_FALLOS, SNIPER_CB_PAUSA_MIN)
-            logger.warning(f"[SNIPER] Fallo AS24 ({fallos}/{SNIPER_CB_FALLOS}) clave={clave}")
-            for m in grupo:
-                set_mision_run(m["id"], error="scrape_fallo")
-            if pausada:
-                logger.error(f"[SNIPER] Circuit breaker ABIERTO — pausa {SNIPER_CB_PAUSA_MIN} min")
-                break
-            continue
-
-        # 'ok' o 'vacio': la fuente respondió bien → sana.
-        reset_fuente(FUENTE_DE)
+        anuncios = await sp.detectar_multifuente(marca, modelo, filtros)
         for m in grupo:
             try:
                 refrescos = await _procesar_mision(m, anuncios, refrescos)

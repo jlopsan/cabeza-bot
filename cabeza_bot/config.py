@@ -93,6 +93,7 @@ HISTORICO_RETENCION_DIAS = int(os.getenv("HISTORICO_RETENCION_DIAS", "180"))
 
 # ─── WORKER ──────────────────────────────────────────────────────────────────
 WORKER_INTERVAL_MINUTES    = 15    # misiones normales (legacy, en retirada)
+# Corto para validar en pruebas; sube a 15-30 en producción real (env, sin tocar código).
 SNIPER_INTERVAL_MINUTES    = int(os.getenv("SNIPER_INTERVAL_MINUTES", "3"))
 
 # ─── SNIPER ALEMANIA ─────────────────────────────────────────────────────────
@@ -132,6 +133,33 @@ SNIPER_DETECCION_PAGINAS = int(os.getenv("SNIPER_DETECCION_PAGINAS", "2"))
 # encima del mercado usado → el IEDMT real puede superar la estimación.
 # La tarjeta avisa. Ver memoria iedmt-metodologia-oficial (fase 2 = tablas BOE).
 SNIPER_AVISO_IEDMT_ANOS = int(os.getenv("SNIPER_AVISO_IEDMT_ANOS", "8"))
+
+# ─── SNIPER: SEGUNDA FUENTE (mobile.de) ─────────────────────────────────────
+# mobile.de no ofrece listado ligero como AS24 (su HTML de resultados no expone
+# precio/km/año por tarjeta de forma fiable) — la "detección" barata ahí es
+# recolectar enlaces (gratis) + visitar detalle completo de los primeros N.
+# Más caro que AS24 por candidato: se limita fuerte y es opcional (flag propio).
+ENABLE_SNIPER_MOBILE_DE     = os.getenv("ENABLE_SNIPER_MOBILE_DE", "true").lower() in ("1", "true", "yes")
+SNIPER_MOBILE_DETALLES_LIM  = int(os.getenv("SNIPER_MOBILE_DETALLES_LIM", "8"))
+
+# ─── SNIPER: SEMÁFORO DE RIESGO (fase 2) ────────────────────────────────────
+# Km vs distribución del dataset (mismo marca/modelo, año ±tol). Percentil bajo
+# = km sospechosamente pocos para su edad → señal de alerta, nunca de chollo.
+SNIPER_KM_MIN_MUESTRA   = int(os.getenv("SNIPER_KM_MIN_MUESTRA", "8"))
+SNIPER_KM_ANOS_TOL      = int(os.getenv("SNIPER_KM_ANOS_TOL", "1"))
+SNIPER_KM_PCTL_AMARILLO = float(os.getenv("SNIPER_KM_PCTL_AMARILLO", "10"))
+SNIPER_KM_PCTL_ROJO     = float(os.getenv("SNIPER_KM_PCTL_ROJO", "3"))
+
+# Precio anómalo vs gemelos ALEMANES (no España): dataset propio persistido en
+# historico_precios (fuente autoscout24/mobile.de), no solo el batch del ciclo.
+SNIPER_PRECIO_DE_MIN_MUESTRA = int(os.getenv("SNIPER_PRECIO_DE_MIN_MUESTRA", "5"))
+SNIPER_PRECIO_DE_ANOMALO_PCT = float(os.getenv("SNIPER_PRECIO_DE_ANOMALO_PCT", "55"))  # < 55% de la mediana DE
+
+# Señales blandas.
+SNIPER_RIESGO_FOTOS_MIN         = int(os.getenv("SNIPER_RIESGO_FOTOS_MIN", "4"))
+SNIPER_RIESGO_PROPIETARIOS_MAX  = int(os.getenv("SNIPER_RIESGO_PROPIETARIOS_MAX", "3"))
+# Nº de señales blandas para subir de VERDE a AMARILLO.
+SNIPER_RIESGO_BLANDAS_AMARILLO  = int(os.getenv("SNIPER_RIESGO_BLANDAS_AMARILLO", "2"))
 
 # ─── FREEMIUM SNIPER ─────────────────────────────────────────────────────────
 # Coste por tier al crear misión. free = 1 crédito UNA sola vez de por vida;
