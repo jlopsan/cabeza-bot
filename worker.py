@@ -165,10 +165,17 @@ def _fuentes_disponibles() -> bool:
 
 async def _pasada_sniper():
     """
-    Una pasada del ciclo sniper. Agrupa por clave (AS24), respeta presupuesto y
-    detecta en AS24 + mobile.de (multifuente — cada una con su propio circuit
-    breaker, gestionado dentro de `sp.detectar_multifuente`; un bloqueo de una
-    fuente NUNCA tumba la otra).
+    Una pasada del ciclo sniper. Agrupa por marca+modelo (SIN filtros —
+    `sp.clave_scrapeo`) y hace UN scrapeo amplio por grupo compartido entre
+    todas las misiones de ese modelo, sea cual sea su año/km/precio exactos.
+    Cada misión aplica después sus propios filtros en Python
+    (`postfiltrar_para_mision`, cero coste extra) — así 10 usuarios vigilando
+    "BMW 320d" con rangos distintos cuestan 1 scrapeo, no 10.
+
+    AS24 + mobile.de (multifuente) — cada fuente con su propio circuit breaker
+    (gestionado dentro de `sp.detectar_multifuente`; un bloqueo de una fuente
+    NUNCA tumba la otra) y su propio cupo de scrapes/hora para el contexto
+    "worker" (separado del cupo del escaneo inmediato al crear misión).
     """
     expiradas = expirar_misiones_vencidas()
     if expiradas:
@@ -182,14 +189,14 @@ async def _pasada_sniper():
         logger.warning("[SNIPER] Todas las fuentes DE pausadas (circuit breaker); salto pasada")
         return
 
-    # Agrupar misiones por clave de scrapeo (filtros equivalentes → un scrapeo).
+    # Agrupar misiones por marca+modelo (sin filtros) — comparten el scrapeo.
     grupos: dict[str, list[dict]] = {}
     for m in misiones:
         grupos.setdefault(sp.clave_scrapeo(m), []).append(m)
 
     # Orden por la misión más olvidada del grupo (round-robin justo).
     claves = sorted(grupos, key=lambda k: min((mm.get("last_run_at") or "") for mm in grupos[k]))
-    logger.info(f"[SNIPER] {len(misiones)} misiones en {len(claves)} claves de scrapeo")
+    logger.info(f"[SNIPER] {len(misiones)} misiones en {len(claves)} grupos marca+modelo")
 
     inicio = time.monotonic()
     refrescos = 0
@@ -197,21 +204,23 @@ async def _pasada_sniper():
         if time.monotonic() - inicio > SNIPER_BUDGET_S:
             logger.info("[SNIPER] Presupuesto de pasada agotado; resto en la próxima")
             break
-        if scrapes_ultima_hora(FUENTE_DE) >= SNIPER_MAX_SCRAPES_HORA:
-            logger.warning("[SNIPER] Cap de scrapes/hora alcanzado; salto resto de pasada")
+        if scrapes_ultima_hora("autoscout24:worker") >= SNIPER_MAX_SCRAPES_HORA:
+            logger.warning("[SNIPER] Cap de scrapes/hora (worker) alcanzado; salto resto de pasada")
             break
         if not _fuentes_disponibles():
             break
 
-        grupo   = grupos[clave]
-        marca   = grupo[0]["marca"]
-        modelo  = grupo[0]["modelo"]
-        filtros = sp.filtros_mision(grupo[0])
+        grupo  = grupos[clave]
+        marca  = grupo[0]["marca"]
+        modelo = grupo[0]["modelo"]
 
-        anuncios = await sp.detectar_multifuente(marca, modelo, filtros)
+        # Scrapeo AMPLIO (sin filtros): la unión de lo que cualquier misión de
+        # este marca+modelo podría querer. El filtrado fino es por misión.
+        anuncios_amplios = await sp.detectar_multifuente(marca, modelo, {}, contexto="worker")
         for m in grupo:
+            anuncios_m = sp.postfiltrar_para_mision(anuncios_amplios, m)
             try:
-                refrescos = await _procesar_mision(m, anuncios, refrescos)
+                refrescos = await _procesar_mision(m, anuncios_m, refrescos)
             except Exception as e:
                 logger.error(f"[SNIPER] Misión #{m['id']} error: {e}", exc_info=True)
                 set_mision_run(m["id"], error=str(e)[:200])

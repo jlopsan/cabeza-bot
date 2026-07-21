@@ -17,12 +17,15 @@ from cabeza_bot.config import (
     SNIPER_AVISO_IEDMT_ANOS,
     SNIPER_VALORACION_ANOS_TOL, SNIPER_MIN_COMPARABLES, ANTI_SCAM_FACTOR,
     ENABLE_SNIPER_MOBILE_DE, SNIPER_CB_FALLOS, SNIPER_CB_PAUSA_MIN,
+    SNIPER_MAX_SCRAPES_HORA, SNIPER_MAX_SCRAPES_HORA_INMEDIATO,
     SNIPER_KM_ANOS_TOL, SNIPER_KM_MIN_MUESTRA, SNIPER_KM_PCTL_AMARILLO, SNIPER_KM_PCTL_ROJO,
     SNIPER_PRECIO_DE_MIN_MUESTRA, SNIPER_PRECIO_DE_ANOMALO_PCT,
     SNIPER_RIESGO_FOTOS_MIN, SNIPER_RIESGO_PROPIETARIOS_MAX, SNIPER_RIESGO_BLANDAS_AMARILLO,
 )
 from cabeza_bot.fiscal.calculator import calcular_margen_sniper, es_nuevo_fiscal
-from cabeza_bot.scraping.scraper import ScraperAutoScout24, ScraperMobileDe, buscar_comparables_todas
+from cabeza_bot.scraping.scraper import (
+    ScraperAutoScout24, ScraperMobileDe, buscar_comparables_todas, postfiltrar,
+)
 from cabeza_bot.sniper.riesgo import evaluar_riesgo, NIVEL_ROJO
 import cabeza_bot.analisis.motor as motor
 import cabeza_bot.data.database as db
@@ -42,10 +45,21 @@ def filtros_mision(mision: dict) -> dict:
 
 
 def clave_scrapeo(mision: dict) -> str:
-    """URL de detección normalizada (AS24). Misiones con la misma clave comparten scrapeo."""
-    return ScraperAutoScout24().url_deteccion_normalizada(
-        mision.get("marca", ""), mision.get("modelo", ""), filtros_mision(mision)
-    )
+    """
+    Clave de agrupación = marca+modelo (SIN filtros). Misiones del mismo modelo
+    comparten UN scrapeo amplio aunque tengan años/km/precio distintos — cada
+    una se afina después con `postfiltrar_para_mision` (cero coste extra). Diez
+    usuarios vigilando "BMW 320d" con rangos ligeramente distintos pasan a
+    costar 1 scrapeo, no 10.
+    """
+    marca = (mision.get("marca") or "").lower().strip()
+    modelo = (mision.get("modelo") or "").lower().strip()
+    return f"{marca}|{modelo}"
+
+
+def postfiltrar_para_mision(anuncios: list[dict], mision: dict) -> list[dict]:
+    """Aplica los filtros ESPECÍFICOS de una misión sobre un scrapeo amplio compartido."""
+    return postfiltrar(anuncios, filtros_mision(mision))
 
 
 def _dedupe_dicts(anuncios: list[dict]) -> list[dict]:
@@ -62,36 +76,51 @@ def _dedupe_dicts(anuncios: list[dict]) -> list[dict]:
     return unicos
 
 
-async def detectar_multifuente(marca: str, modelo: str, filtros: dict) -> list[dict]:
+async def detectar_multifuente(marca: str, modelo: str, filtros: dict,
+                               contexto: str = "worker") -> list[dict]:
     """
     Detección DE mergeada: AS24 (siempre) + mobile.de (si ENABLE_SNIPER_MOBILE_DE
     y no pausada por su circuit breaker). Cada fuente respeta su propio breaker
-    (fallo→incr, ok/vacío→reset) para que un bloqueo de mobile.de NUNCA afecte
-    a AS24. Usado tanto por el ciclo del worker como por el escaneo inmediato.
+    real (fallo→incr, ok/vacío→reset, clave "autoscout24"/"mobile.de" — un
+    bloqueo real para a TODOS los contextos por igual).
+
+    `contexto` ("worker" | "scan") separa el CONTADOR de volumen/hora: el ciclo
+    de fondo (misiones ya activas, pagadas) y el escaneo inmediato (al crear
+    una misión) tienen presupuestos independientes. Sin esto, una ráfaga de
+    altas nuevas podía agotar el cupo y dejar SIN vigilancia a las misiones
+    que ya llevaban vigilando — el bug que reportó Juan en producción.
     """
     resultados: list[dict] = []
+    cap_as24 = SNIPER_MAX_SCRAPES_HORA if contexto == "worker" else SNIPER_MAX_SCRAPES_HORA_INMEDIATO
+    cap_mobile = cap_as24  # mismo orden de magnitud; mobile.de es la fuente más cara por candidato
 
     if not db.fuente_pausada("autoscout24"):
-        db.incr_scrape_hora("autoscout24")
-        anuncios, señal = await ScraperAutoScout24().buscar_deteccion(marca, modelo, filtros)
-        if señal == "fallo":
-            db.incr_fallo_fuente("autoscout24", SNIPER_CB_FALLOS, SNIPER_CB_PAUSA_MIN)
+        if db.scrapes_ultima_hora(f"autoscout24:{contexto}") >= cap_as24:
+            logger.info(f"[SNIPER] AS24 cap agotado (contexto={contexto}); sin scrapeo esta vez")
         else:
-            db.reset_fuente("autoscout24")
-            resultados.extend(anuncios)
+            db.incr_scrape_hora(f"autoscout24:{contexto}")
+            anuncios, señal = await ScraperAutoScout24().buscar_deteccion(marca, modelo, filtros)
+            if señal == "fallo":
+                db.incr_fallo_fuente("autoscout24", SNIPER_CB_FALLOS, SNIPER_CB_PAUSA_MIN)
+            else:
+                db.reset_fuente("autoscout24")
+                resultados.extend(anuncios)
 
     if ENABLE_SNIPER_MOBILE_DE and not db.fuente_pausada("mobile.de"):
-        db.incr_scrape_hora("mobile.de")
-        try:
-            anuncios_m, señal_m = await ScraperMobileDe().buscar_deteccion(marca, modelo, filtros)
-        except Exception as e:
-            logger.warning(f"[SNIPER] mobile.de detección lanzó excepción: {e}")
-            anuncios_m, señal_m = [], "fallo"
-        if señal_m == "fallo":
-            db.incr_fallo_fuente("mobile.de", SNIPER_CB_FALLOS, SNIPER_CB_PAUSA_MIN)
+        if db.scrapes_ultima_hora(f"mobile.de:{contexto}") >= cap_mobile:
+            logger.info(f"[SNIPER] mobile.de cap agotado (contexto={contexto}); sin scrapeo esta vez")
         else:
-            db.reset_fuente("mobile.de")
-            resultados.extend(anuncios_m)
+            db.incr_scrape_hora(f"mobile.de:{contexto}")
+            try:
+                anuncios_m, señal_m = await ScraperMobileDe().buscar_deteccion(marca, modelo, filtros)
+            except Exception as e:
+                logger.warning(f"[SNIPER] mobile.de detección lanzó excepción: {e}")
+                anuncios_m, señal_m = [], "fallo"
+            if señal_m == "fallo":
+                db.incr_fallo_fuente("mobile.de", SNIPER_CB_FALLOS, SNIPER_CB_PAUSA_MIN)
+            else:
+                db.reset_fuente("mobile.de")
+                resultados.extend(anuncios_m)
 
     return _dedupe_dicts(resultados)
 
@@ -316,7 +345,7 @@ async def mejores_del_mercado(marca: str, modelo: str, filtros: dict,
     valoración fiable. Cada item: {anuncio, valoracion, cuenta, riesgo, margen_eur}.
     """
     try:
-        anuncios = await detectar_multifuente(marca, modelo, filtros)
+        anuncios = await detectar_multifuente(marca, modelo, filtros, contexto="scan")
     except Exception as e:
         logger.warning(f"[SNIPER] escaneo inmediato falló: {e}")
         return []

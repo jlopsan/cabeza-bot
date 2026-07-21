@@ -315,6 +315,16 @@ def _postfiltrar(coches: list[dict], filtros: dict) -> list[dict]:
     return resultado
 
 
+def postfiltrar(coches: list[dict], filtros: dict) -> list[dict]:
+    """
+    Alias público de _postfiltrar — usado por el sniper para aplicar los
+    filtros ESPECÍFICOS de cada misión en Python, después de un scrapeo
+    AMPLIO compartido por marca+modelo (agrupación de misiones). Cero
+    scraping extra: el filtrado ocurre sobre datos que ya tenemos.
+    """
+    return _postfiltrar(coches, filtros)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # BASE ABSTRACTA
 # ════════════════════════════════════════════════════════════════════════════

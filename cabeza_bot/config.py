@@ -107,9 +107,14 @@ SNIPER_UMBRAL_PCT = float(os.getenv("SNIPER_UMBRAL_PCT", "10"))
 # Máximo de alertas por misión y pasada (anti-spam).
 SNIPER_ALERTAS_PASADA = int(os.getenv("SNIPER_ALERTAS_PASADA", "3"))
 
-# Presupuesto y caps del ciclo.
-SNIPER_BUDGET_S        = int(os.getenv("SNIPER_BUDGET_S", "150"))
-SNIPER_MAX_SCRAPES_HORA = int(os.getenv("SNIPER_MAX_SCRAPES_HORA", "60"))
+# Presupuesto y caps del ciclo. Cap separado para el ciclo de fondo (misiones
+# YA activas) vs el escaneo inmediato (al crear una misión nueva) — así una
+# ráfaga de altas nuevas NUNCA deja sin vigilancia a las misiones ya pagadas,
+# y viceversa. Ambos cuentan aparte del circuit breaker real (que sigue
+# compartido por fuente: un bloqueo real de AS24 para a los dos contextos).
+SNIPER_BUDGET_S                  = int(os.getenv("SNIPER_BUDGET_S", "150"))
+SNIPER_MAX_SCRAPES_HORA          = int(os.getenv("SNIPER_MAX_SCRAPES_HORA", "60"))
+SNIPER_MAX_SCRAPES_HORA_INMEDIATO = int(os.getenv("SNIPER_MAX_SCRAPES_HORA_INMEDIATO", "20"))
 
 # Circuit breaker por fuente DE.
 SNIPER_CB_FALLOS   = int(os.getenv("SNIPER_CB_FALLOS", "3"))
