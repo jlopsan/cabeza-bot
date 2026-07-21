@@ -80,6 +80,16 @@ TAVILY_DOMINIOS_FOROS       = ["forocoches.com", "reddit.com", "km77.com", "club
 TAVILY_DOMINIOS_FIABILIDAD  = ["adac.de", "tuv.com", "dekra.com", "fiabilidadcoches.es", "autobild.de"]
 TAVILY_DOMINIOS_ARTICULOS   = ["km77.com", "motorpasion.es", "motor.es", "autocasion.com", "coches.com"]
 
+# ─── mobile.de SEARCH-API OFICIAL (opcional) ────────────────────────────────
+# Si hay credenciales, sustituye al scraper HTML de mobile.de (hoy bloqueado
+# por su WAF) por la API REST oficial — sin scraping, sin riesgo de bloqueo.
+# Credenciales: API-Account solicitado a soporte de mobile.de (HTTP Basic Auth).
+# Sin esto configurado, el sistema sigue exactamente igual que hoy (scraper
+# HTML + circuit breaker existente, sin cambios de comportamiento).
+MOBILE_DE_API_USER     = os.getenv("MOBILE_DE_API_USER", "")
+MOBILE_DE_API_PASSWORD = os.getenv("MOBILE_DE_API_PASSWORD", "")
+MOBILE_DE_API_BASE     = os.getenv("MOBILE_DE_API_BASE", "https://services.mobile.de/search-api")
+
 # ─── VISION (análisis visual de fotos del anuncio) ──────────────────────────
 ENABLE_VISION    = os.getenv("ENABLE_VISION", "false").lower() in ("1", "true", "yes")
 VISION_MODEL     = os.getenv("VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct")

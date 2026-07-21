@@ -25,7 +25,9 @@ from cabeza_bot.config import (
 from cabeza_bot.fiscal.calculator import calcular_margen_sniper, es_nuevo_fiscal
 from cabeza_bot.scraping.scraper import (
     ScraperAutoScout24, ScraperMobileDe, buscar_comparables_todas, postfiltrar,
+    _persistir_de_historico,
 )
+import cabeza_bot.scraping.mobile_de_api as mobile_de_api
 from cabeza_bot.sniper.riesgo import evaluar_riesgo, NIVEL_ROJO
 import cabeza_bot.analisis.motor as motor
 import cabeza_bot.data.database as db
@@ -112,7 +114,14 @@ async def detectar_multifuente(marca: str, modelo: str, filtros: dict,
         else:
             db.incr_scrape_hora(f"mobile.de:{contexto}")
             try:
-                anuncios_m, señal_m = await ScraperMobileDe().buscar_deteccion(marca, modelo, filtros)
+                if mobile_de_api.configurada():
+                    # API oficial disponible: sustituye al scraper HTML (hoy
+                    # bloqueado por WAF) — sin scraping, sin riesgo de bloqueo.
+                    anuncios_m, señal_m = await mobile_de_api.buscar_deteccion(marca, modelo, filtros)
+                    if señal_m in ("ok", "vacio") and anuncios_m:
+                        _persistir_de_historico(anuncios_m, marca, modelo, fuente="mobile.de")
+                else:
+                    anuncios_m, señal_m = await ScraperMobileDe().buscar_deteccion(marca, modelo, filtros)
             except Exception as e:
                 logger.warning(f"[SNIPER] mobile.de detección lanzó excepción: {e}")
                 anuncios_m, señal_m = [], "fallo"
