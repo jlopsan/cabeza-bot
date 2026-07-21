@@ -128,7 +128,8 @@ async def _procesar_mision(mision: dict, anuncios: list[dict], refrescos: int) -
     resto = alertables[SNIPER_ALERTAS_PASADA:]
 
     for anuncio, v, final in top:
-        texto = sp.render_tarjeta_alerta(anuncio, v, final["cuenta"], mid, riesgo=final["riesgo"])
+        texto = sp.render_tarjeta_alerta(anuncio, v, final["cuenta"], mid, riesgo=final["riesgo"],
+                                         n_comparables=final["n_comparables"], motor_afinado=final["motor_afinado"])
         await _send(mision["user_id"], texto,
                    reply_markup=sp.boton_ver_anuncio(anuncio.get("link", ""), str(anuncio.get("id", ""))))
         sp.marcar_visto(mid, anuncio, tipo="alerta", cuenta=final["cuenta"], riesgo=final["riesgo"])

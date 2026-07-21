@@ -814,77 +814,13 @@ def _calcular_stats_precios(precios: list[float]) -> dict | None:
 
 
 # ── Motor: extracción de CV y combustible para afinar la tasación ──────────
-_CV_TOL = 20  # ± CV para considerar "mismo motor"
-
-
-def _extraer_cv(texto: str) -> int | None:
-    """CV de un texto libre o título de anuncio. Convierte kW→CV si hace falta."""
-    t = texto or ""
-    m = _re.search(r"(\d{2,3})\s*cv\b", t, _re.IGNORECASE)
-    if m:
-        return int(m.group(1))
-    m = _re.search(r"(\d{2,3})\s*kw\b", t, _re.IGNORECASE)
-    if m:
-        return round(int(m.group(1)) * 1.35962)
-    return None
-
-
-def _detectar_combustible(texto: str) -> str | None:
-    """Combustible normalizado desde texto libre o título."""
-    t = (texto or "").lower()
-    if any(k in t for k in ("phev", "enchufable")):
-        return "híbrido enchufable"
-    if any(k in t for k in ("híbrido", "hibrido", "hybrid", "hev")):
-        return "híbrido"
-    if any(k in t for k in ("eléctric", "electric", "e-golf", "kwh", " ev ")):
-        return "eléctrico"
-    if any(k in t for k in ("tdi", "diesel", "diésel", "dci", "hdi", "cdti", "gasoil", "gasóleo", "bluehdi")):
-        return "diésel"
-    if any(k in t for k in ("tsi", "tfsi", "gasolina", "mpi", "vti", "puretech", "gti", "tce")):
-        return "gasolina"
-    return None
-
-
-def _texto_motor(c) -> str:
-    """Campos de un Anuncio donde puede venir el motor."""
-    return f"{c.titulo or ''} {c.motor or ''} {c.modelo or ''}"
-
-
-def _match_cv(comparables, cv_obj, comb_obj, tol):
-    out = []
-    for c in comparables:
-        cvc = _extraer_cv(_texto_motor(c))
-        if cvc and abs(cvc - cv_obj) <= tol:
-            if comb_obj and _detectar_combustible(_texto_motor(c)) not in (comb_obj, None):
-                continue
-            out.append(c)
-    return out
-
-
-def _filtrar_por_motor(comparables, cv_obj, comb_obj):
-    """
-    Filtra comparables al motor pedido. Devuelve (lista, criterio_legible|None, modo).
-    modo: 'cv'   → coincidencia por CV (aunque sean pocos: mejor 1 del motor correcto
-                    que muchos del equivocado; jamás cae al pool base si pediste CV).
-          'comb' → solo combustible (≥3).
-          'pool' → sin filtro de motor.
-    """
-    if cv_obj:
-        crit = f"≈{cv_obj} CV" + (f" · {comb_obj}" if comb_obj else "")
-        # CV exacto y luego ampliado. Se usa lo que haya (≥1), no se cae al pool base.
-        for tol in (_CV_TOL, _CV_TOL * 2):
-            m = _match_cv(comparables, cv_obj, comb_obj, tol)
-            if len(m) >= 3:
-                return m, crit, "cv"
-        m = _match_cv(comparables, cv_obj, comb_obj, _CV_TOL * 2)
-        if m:
-            return m, crit, "cv"
-        # 0 anuncios de ese CV → intenta combustible; si no, pool (con aviso en pipeline).
-    if comb_obj:
-        t2 = [c for c in comparables if _detectar_combustible(_texto_motor(c)) == comb_obj]
-        if len(t2) >= 3:
-            return t2, comb_obj, "comb"
-    return comparables, None, "pool"
+# Movidos a cabeza_bot/analisis/motor.py (los comparte el sniper). Aliases
+# para no tocar los call-sites de /tasar.
+from cabeza_bot.analisis.motor import (
+    extraer_cv as _extraer_cv,
+    detectar_combustible as _detectar_combustible,
+    filtrar_por_motor as _filtrar_por_motor,
+)
 
 
 # Banda de negociación sobre el valor de mercado (±%).
@@ -3389,7 +3325,8 @@ async def _crear_sniper_confirmado(query, ctx: ContextTypes.DEFAULT_TYPE):
     )
     for item in top:
         anuncio = item["anuncio"]
-        tarjeta = sp.render_tarjeta_alerta(anuncio, item["valoracion"], item["cuenta"], riesgo=item.get("riesgo"))
+        tarjeta = sp.render_tarjeta_alerta(anuncio, item["valoracion"], item["cuenta"], riesgo=item.get("riesgo"),
+                                           n_comparables=item.get("n_comparables"), motor_afinado=item.get("motor_afinado", ""))
         botones = [[InlineKeyboardButton("🔗 Ver anuncio", url=anuncio.get("link") or "#")]]
         if anuncio.get("id"):
             botones.append([InlineKeyboardButton("🪪 Informe VIN (próximamente)",

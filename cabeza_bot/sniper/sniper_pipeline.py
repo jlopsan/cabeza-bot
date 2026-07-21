@@ -24,6 +24,7 @@ from cabeza_bot.config import (
 from cabeza_bot.fiscal.calculator import calcular_margen_sniper, es_nuevo_fiscal
 from cabeza_bot.scraping.scraper import ScraperAutoScout24, ScraperMobileDe, buscar_comparables_todas
 from cabeza_bot.sniper.riesgo import evaluar_riesgo, NIVEL_ROJO
+import cabeza_bot.analisis.motor as motor
 import cabeza_bot.data.database as db
 
 logger = logging.getLogger(__name__)
@@ -109,9 +110,11 @@ def valoracion_fresca(marca: str, modelo: str, año: int, km: int) -> dict | Non
     return None
 
 
-def _precios_fiables(comparables: list, año: int) -> list[float]:
+def _comparables_fiables(comparables: list, año: int) -> list:
     """
-    Filtra los comparables para una valoración creíble:
+    Filtra los comparables para una valoración creíble y devuelve los objetos
+    (no solo el precio) — hace falta el título para poder afinar por motor
+    después sin re-scrapear:
       1. Mismo año ±SNIPER_VALORACION_ANOS_TOL (evita que un 2025 herede precios
          de un 320d de 2012 y saque una mediana falsa de 8.800€).
       2. Descarta outliers baratos/caros respecto a la mediana provisional
@@ -119,7 +122,7 @@ def _precios_fiables(comparables: list, año: int) -> list[float]:
     Los comparables sin año se excluyen (para valorar, mejor estricto).
     """
     año = int(año or 0)
-    precios = []
+    filtrados = []
     for a in comparables:
         p = float(getattr(a, "precio", 0) or 0)
         ay = int(getattr(a, "año", 0) or 0)
@@ -127,18 +130,23 @@ def _precios_fiables(comparables: list, año: int) -> list[float]:
             continue
         if año and (not ay or abs(ay - año) > SNIPER_VALORACION_ANOS_TOL):
             continue
-        precios.append(p)
-    precios.sort()
-    if len(precios) >= 4:
-        med0 = statistics.median(precios)
-        precios = [p for p in precios if med0 * ANTI_SCAM_FACTOR <= p <= med0 * 2.0]
-    return precios
+        filtrados.append(a)
+    filtrados.sort(key=lambda a: a.precio)
+    if len(filtrados) >= 4:
+        med0 = statistics.median(a.precio for a in filtrados)
+        filtrados = [a for a in filtrados if med0 * ANTI_SCAM_FACTOR <= a.precio <= med0 * 2.0]
+    return filtrados
+
+
+def _precios_fiables(comparables: list, año: int) -> list[float]:
+    return [float(a.precio) for a in _comparables_fiables(comparables, año)]
 
 
 async def refrescar_valoracion(marca: str, modelo: str, año: int, km: int) -> dict | None:
     """
     Scrapea comparables ES, filtra por año + outliers, calcula mediana, la
-    persiste y la devuelve. None si NO hay comparables fiables suficientes
+    persiste (con título de cada comparable, para afinar por motor después)
+    y la devuelve. None si NO hay comparables fiables suficientes
     (< SNIPER_MIN_COMPARABLES) → el producto muestra "sin valoración fiable"
     en vez de inventar un número. Reutiliza el pipeline de /analizar.
     """
@@ -148,13 +156,15 @@ async def refrescar_valoracion(marca: str, modelo: str, año: int, km: int) -> d
         logger.warning(f"[SNIPER] comparables ES fallaron {marca} {modelo}: {e}")
         return None
 
-    precios = _precios_fiables(comparables, año)
-    if len(precios) < SNIPER_MIN_COMPARABLES:
-        logger.info(f"[SNIPER] {marca} {modelo} {año}: solo {len(precios)} comparables fiables → sin valoración")
+    fiables = _comparables_fiables(comparables, año)
+    if len(fiables) < SNIPER_MIN_COMPARABLES:
+        logger.info(f"[SNIPER] {marca} {modelo} {año}: solo {len(fiables)} comparables fiables → sin valoración")
         return None
 
+    precios = [float(a.precio) for a in fiables]
     mediana = round(statistics.median(precios), 0)
-    db.upsert_valoracion(marca, modelo, año, km_banda(km), mediana, len(precios), precios)
+    comparables_slim = [{"precio": a.precio, "titulo": a.titulo or ""} for a in fiables]
+    db.upsert_valoracion(marca, modelo, año, km_banda(km), mediana, len(precios), precios, comparables_slim)
 
     # Dataset histórico (regla innegociable): persistir comparables ES.
     try:
@@ -198,19 +208,73 @@ def evaluar_riesgo_anuncio(anuncio: dict, marca: str, modelo: str, año: int):
     )
 
 
+class _PseudoAnuncio:
+    """Envoltorio mínimo para reusar motor.filtrar_por_motor sobre comparables
+    guardados como {precio, titulo} (sin volver a scrapear)."""
+    __slots__ = ("precio", "titulo", "motor", "modelo")
+
+    def __init__(self, precio: float, titulo: str):
+        self.precio = precio
+        self.titulo = titulo
+        self.motor = ""
+        self.modelo = ""
+
+
+def afinar_por_motor(anuncio: dict, valoracion: dict) -> dict:
+    """
+    Refina la mediana ES usando el motor del candidato (CV/combustible, del
+    propio título del anuncio DE) contra los comparables ya guardados en la
+    valoración. CERO scraping y CERO IA extra — mismo patrón que /tasar (evita
+    el bug "GTI valorado como Golf base", aquí aplicado al sniper. Si no hay
+    suficientes comparables del mismo motor, cae a la mediana amplia.
+    Devuelve {mediana, n_comparables, criterio} — criterio='' si no se afinó.
+    """
+    mediana_base = float(valoracion.get("mediana", 0) or 0)
+    n_base = int(valoracion.get("n_comparables", 0) or 0)
+    sin_afinar = {"mediana": mediana_base, "n_comparables": n_base, "criterio": ""}
+
+    try:
+        items = json.loads(valoracion.get("comparables_json") or "[]")
+    except (json.JSONDecodeError, TypeError):
+        items = []
+    if not items:
+        return sin_afinar
+
+    titulo = anuncio.get("titulo", "") or ""
+    cv_obj = motor.extraer_cv(titulo)
+    comb_obj = motor.detectar_combustible(titulo)
+    if not cv_obj and not comb_obj:
+        return sin_afinar
+
+    pseudo = [_PseudoAnuncio(it.get("precio", 0), it.get("titulo", ""))
+             for it in items if it.get("precio", 0) > 0]
+    filtrados, criterio, modo = motor.filtrar_por_motor(pseudo, cv_obj, comb_obj)
+    if modo == "pool" or len(filtrados) < 3:
+        return sin_afinar
+
+    precios_afinados = sorted(p.precio for p in filtrados)
+    return {
+        "mediana": round(statistics.median(precios_afinados), 0),
+        "n_comparables": len(precios_afinados),
+        "criterio": criterio or "",
+    }
+
+
 def evaluar_candidato(anuncio: dict, valoracion: dict,
                       umbral_eur: int | None = None,
                       umbral_pct: float | None = None) -> dict:
     """
     Calcula la cuenta de importación Y el semáforo de riesgo del candidato.
-    Devuelve {alerta, cuenta, riesgo, n_comparables}. `alerta` (margen) y el
-    nivel de riesgo son señales independientes — el caller decide si alertar
-    ROJO o no; aquí solo se calculan ambas.
+    La mediana se afina por motor (CV/combustible) contra los comparables ya
+    guardados en la valoración — sin coste extra. Devuelve {alerta, cuenta,
+    riesgo, n_comparables, motor_afinado}. `alerta` y `riesgo` son señales
+    independientes — el caller decide si alertar ROJO o no.
     """
     umbral_eur = SNIPER_UMBRAL_EUR if umbral_eur is None else umbral_eur
     umbral_pct = SNIPER_UMBRAL_PCT if umbral_pct is None else umbral_pct
 
-    mediana = float(valoracion.get("mediana", 0) or 0)
+    afinado = afinar_por_motor(anuncio, valoracion)
+    mediana = afinado["mediana"]
     cuenta = calcular_margen_sniper(
         precio_de=float(anuncio.get("precio", 0) or 0),
         mediana_es=mediana,
@@ -229,7 +293,8 @@ def evaluar_candidato(anuncio: dict, valoracion: dict,
         "alerta": alerta,
         "cuenta": cuenta,
         "riesgo": riesgo,
-        "n_comparables": int(valoracion.get("n_comparables", 0) or 0),
+        "n_comparables": afinado["n_comparables"],
+        "motor_afinado": afinado["criterio"],
     }
 
 
@@ -277,6 +342,7 @@ async def mejores_del_mercado(marca: str, modelo: str, filtros: dict,
         a = await _con_detalle(a)
         r = evaluar_candidato(a, v, umbral_eur, umbral_pct)
         salida.append({"anuncio": a, "valoracion": v, "cuenta": r["cuenta"], "riesgo": r["riesgo"],
+                       "n_comparables": r["n_comparables"], "motor_afinado": r["motor_afinado"],
                        "margen_eur": r["cuenta"]["margen_eur"]})
     salida.sort(key=lambda x: x["margen_eur"], reverse=True)
     return salida
@@ -357,12 +423,18 @@ def _eur(v: float) -> str:
 
 
 def render_tarjeta_alerta(anuncio: dict, valoracion: dict, cuenta: dict,
-                          mision_id: int | None = None, riesgo=None) -> str:
+                          mision_id: int | None = None, riesgo=None,
+                          n_comparables: int | None = None, motor_afinado: str = "") -> str:
     """
     Tarjeta de alerta con el formato del vídeo. html.escape en todo campo
     scrapeado. No promete datos que no tiene (sin CO₂ → IEDMT estimado, total).
     El semáforo (si se pasa `riesgo`) prioriza dónde gastar el informe VIN o
     la inspección — nunca afirma que un coche "está bien".
+
+    `n_comparables`/`motor_afinado` (de evaluar_candidato): si la valoración se
+    afinó por motor (CV/combustible), el nº mostrado es el del grupo afinado,
+    no el de la banda amplia — coherente con la mediana que usa `cuenta`
+    (mediana_es), no `valoracion.mediana` (que puede ser la sin afinar).
     """
     titulo = html.escape(anuncio.get("titulo", "") or f"{anuncio.get('año','')}")
     año = anuncio.get("año", "") or "N/D"
@@ -370,7 +442,9 @@ def render_tarjeta_alerta(anuncio: dict, valoracion: dict, cuenta: dict,
     km_str = f"{int(km):,}".replace(",", ".") if km else "N/D"
     fuente = anuncio.get("fuente", "") or "AutoScout24"
 
-    emoji_conf, nivel_conf = confianza(valoracion.get("n_comparables", 0))
+    n_comp = valoracion.get("n_comparables", 0) if n_comparables is None else n_comparables
+    mediana_mostrada = cuenta.get("mediana_es", valoracion.get("mediana", 0))
+    emoji_conf, nivel_conf = confianza(n_comp)
     margen = cuenta["margen_eur"]
     signo = "" if margen < 0 else ""
 
@@ -380,7 +454,7 @@ def render_tarjeta_alerta(anuncio: dict, valoracion: dict, cuenta: dict,
         f"📅 {año} · 📍 {km_str} km · <i>{html.escape(fuente)}</i>",
         "",
         f"🇩🇪 Alemania: <b>{_eur(anuncio.get('precio', 0))}</b>",
-        f"🇪🇸 Mercado ES: <b>{_eur(valoracion.get('mediana', 0))}</b>",
+        f"🇪🇸 Mercado ES: <b>{_eur(mediana_mostrada)}</b>",
     ]
 
     iedmt_nota = " (estimado)" if cuenta.get("co2_estimado") else ""
@@ -388,9 +462,12 @@ def render_tarjeta_alerta(anuncio: dict, valoracion: dict, cuenta: dict,
 
     emoji_m = "💰" if margen >= 0 else "🔻"
     lineas.append(f"{emoji_m} <b>Margen neto: {signo}{_eur(margen)} ({cuenta['margen_pct']:+.0f}%)</b>")
-    lineas.append(f"{emoji_conf} Confianza {nivel_conf} · {valoracion.get('n_comparables', 0)} comparables")
+    comp_txt = f"{emoji_conf} Confianza {nivel_conf} · {n_comp} comparables"
+    if motor_afinado:
+        comp_txt += f" del mismo motor ({html.escape(motor_afinado)})"
+    lineas.append(comp_txt)
 
-    if valoracion.get("n_comparables", 0) < 4:
+    if n_comp < 4:
         lineas.append("⚠️ <i>Pocos comparables. Margen poco fiable.</i>")
 
     # Avisos fiscales

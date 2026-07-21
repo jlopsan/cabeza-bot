@@ -243,6 +243,12 @@ def init_db():
                 UNIQUE(marca, modelo, año, km_banda)
             )
         """)
+        # Migración: título+precio de cada comparable (no solo el precio) para
+        # poder afinar la valoración por motor (CV/combustible) sin re-scrapear.
+        try:
+            conn.execute("ALTER TABLE valoraciones_mercado ADD COLUMN comparables_json TEXT DEFAULT '[]'")
+        except sqlite3.OperationalError:
+            pass
 
         # Embudo de conversión genérico (start → misión → alerta → pago).
         conn.execute("""
@@ -1024,17 +1030,26 @@ def get_valoracion(marca: str, modelo: str, año: int, km_banda: int) -> dict | 
 
 
 def upsert_valoracion(marca: str, modelo: str, año: int, km_banda: int,
-                      mediana: float, n_comparables: int, precios: list[float]):
+                      mediana: float, n_comparables: int, precios: list[float],
+                      comparables: list[dict] | None = None):
+    """
+    `comparables` (opcional): [{"precio":.., "titulo":..}, ...] de los anuncios
+    ES que entraron en la mediana — permite afinar por motor (CV/combustible)
+    después, sin volver a scrapear (cero coste extra).
+    """
     with get_conn() as conn:
         conn.execute(
             "INSERT INTO valoraciones_mercado "
-            "(marca, modelo, año, km_banda, mediana, n_comparables, precios_json, actualizado_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "(marca, modelo, año, km_banda, mediana, n_comparables, precios_json, "
+            " comparables_json, actualizado_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(marca, modelo, año, km_banda) DO UPDATE SET "
             "mediana=excluded.mediana, n_comparables=excluded.n_comparables, "
-            "precios_json=excluded.precios_json, actualizado_at=excluded.actualizado_at",
+            "precios_json=excluded.precios_json, comparables_json=excluded.comparables_json, "
+            "actualizado_at=excluded.actualizado_at",
             ((marca or "").lower(), (modelo or "").lower(), int(año or 0), int(km_banda),
-             mediana, n_comparables, json.dumps(precios), _ahora()),
+             mediana, n_comparables, json.dumps(precios),
+             json.dumps(comparables or []), _ahora()),
         )
         conn.commit()
 
