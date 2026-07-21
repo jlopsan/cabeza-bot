@@ -561,8 +561,8 @@ async def parsear_filtros_nl(texto_usuario: str) -> dict:
         return {}
 
     system = (
-        "Extrae filtros de busqueda de coches del texto del usuario. "
-        "Responde SOLO con JSON puro sin texto ni backticks. "
+        "Extrae filtros de busqueda de coches del texto del usuario (compradores "
+        "e importadores profesionales). Responde SOLO con JSON puro sin texto ni backticks. "
         "Campos disponibles y sus tipos: "
         "  km_min (int), km_max (int): kilometraje. "
         "  year_min (int), year_max (int): año de matriculacion. "
@@ -571,19 +571,36 @@ async def parsear_filtros_nl(texto_usuario: str) -> dict:
         "  doors (int): numero de puertas. "
         "  color (str): uno de: negro, azul, marron, amarillo, gris, verde, rojo, plata, blanco, dorado, naranja, morado, beige. "
         "  carroceria (str): uno de: sedan, berlina, familiar, suv, todoterreno, cabrio, coupe, monovolumen, pickup. "
-        "  combustible (str): uno de: gasolina, diesel, electrico, hibrido, glp. "
+        "  combustible (str, UN SOLO VALOR, nunca una lista): uno de: gasolina, diesel, electrico, hibrido, glp. "
+        "    Normaliza sinonimos: gasoil/gasoleo/tdi/hdi/cdti -> diesel; nafta/tsi/tfsi -> gasolina. "
         "  caja (str): uno de: manual, automatico. "
         "  extras (list de str): lista de equipamientos deseados, en español. "
         "  Ejemplos extras: navegacion, cuero, techo panoramico, head-up, camara 360, "
         "    sensores aparcamiento, apple carplay, bluetooth, calefaccion asientos, "
         "    llantas aluminio, luces led, traccion integral, enganche remolque. "
         "Usa SOLO los campos mencionados por el usuario. "
-        "Ejemplos: "
+        "\n\nREGLA DE AÑO — critica, se confunde a menudo: "
+        '"del <año>", "de <año>", "año <año>", "modelo <año>", "matriculado en <año>" '
+        "(SIN palabras de apertura) es un año EXACTO -> year_min Y year_max iguales a ese año. "
+        'SOLO es rango abierto (year_min sin year_max) si el usuario dice explicitamente '
+        '"desde", "a partir de", "en adelante", "o mas reciente", "o posterior". '
+        '"del 2019" (año exacto, NO desde 2019) -> {"year": 2019} | '
+        '"desde 2019" (rango abierto) -> {"year_min": 2019} | '
+        '"a partir del 2019" -> {"year_min": 2019} | '
+        '"hasta 2019" -> {"year_max": 2019}'
+        "\n\nREGLA DE COMBUSTIBLE: si el usuario EXCLUYE un combustible "
+        '(ej "sin diesel", "que no sea gasolina", "nada de hibridos") NO generes el campo '
+        "combustible (el sistema no soporta exclusion todavia; mejor omitirlo que invertirlo). "
+        "Si el usuario menciona varios combustibles con \"o\" (ej \"diesel o hibrido\"), "
+        "usa solo el PRIMERO que mencione (el sistema filtra por un solo combustible a la vez). "
+        "\n\nEjemplos: "
         '"menos de 80000 km" -> {"km_max": 80000} | '
         '"entre 2018 y 2021 color rojo" -> {"year_min": 2018, "year_max": 2021, "color": "rojo"} | '
         '"diesel automatico menos de 50k km" -> {"combustible": "diesel", "caja": "automatico", "km_max": 50000} | '
         '"suv entre 20000 y 35000 euros" -> {"carroceria": "suv", "price_min": 20000, "price_max": 35000} | '
         '"mas de 150cv hasta 2022" -> {"power_min": 150, "year_max": 2022} | '
+        '"gasoil del 2020" -> {"combustible": "diesel", "year": 2020} | '
+        '"sin diesel, desde 2018" -> {"year_min": 2018} | '
         '"sin filtros" -> {}'
     )
 
@@ -608,10 +625,15 @@ async def parsear_filtros_nl(texto_usuario: str) -> dict:
             result.setdefault("year_max", result["year"])
             del result["year"]
 
-        # Campos de texto
+        # Campos de texto (siempre UN valor — si la IA devuelve una lista pese a
+        # la instrucción, ej. "diesel o hibrido", nos quedamos con el primero
+        # en vez de generar el string roto "['diesel', 'hibrido']").
         for k in ("color", "carroceria", "combustible", "caja"):
-            if raw.get(k):
-                result[k] = str(raw[k]).lower().strip()
+            v = raw.get(k)
+            if isinstance(v, list):
+                v = v[0] if v else None
+            if v:
+                result[k] = str(v).lower().strip()
         # Extras (lista)
         if raw.get("extras"):
             ex = raw["extras"]

@@ -3089,19 +3089,40 @@ def _texto_umbral(eur: int, pct: float) -> str:
     return " y ".join(partes) if partes else "cualquier margen"
 
 
+_COMBUSTIBLE_EMOJI = {
+    "diesel": "⛽ diésel", "gasolina": "⛽ gasolina", "electrico": "🔋 eléctrico",
+    "hibrido": "🔋 híbrido", "glp": "⛽ GLP",
+}
+_CAJA_EMOJI = {"manual": "🕹️ manual", "automatico": "⚙️ automático"}
+
+
 def _resumen_slots_sniper(marca: str, modelo: str, filtros: dict) -> str:
+    """
+    Resumen legible de los filtros antes de confirmar — el importador tiene que
+    poder ver de un vistazo si el año/combustible se entendió bien antes de
+    gastar el crédito. Año exacto se muestra sin guion (no "2019-2019").
+    """
     partes = [f"<b>{html.escape(marca.title())} {html.escape(modelo.upper())}</b>"]
-    if filtros.get("year_min") or filtros.get("year_max"):
-        ymin = filtros.get("year_min", "") or "?"
-        ymax = filtros.get("year_max", "") or "?"
+    ymin, ymax = filtros.get("year_min"), filtros.get("year_max")
+    if ymin and ymax and ymin == ymax:
+        partes.append(f"📅 {ymin}")
+    elif ymin and ymax:
         partes.append(f"📅 {ymin}-{ymax}")
+    elif ymin:
+        partes.append(f"📅 desde {ymin}")
+    elif ymax:
+        partes.append(f"📅 hasta {ymax}")
+
     if filtros.get("km_max"):
         partes.append(f"📍 hasta {int(filtros['km_max']):,} km".replace(",", "."))
     if filtros.get("price_max"):
         partes.append(f"💶 hasta {int(filtros['price_max']):,}€".replace(",", "."))
-    for k, etiq in (("combustible", ""), ("caja", ""), ("power_min", "≥{} CV")):
-        if filtros.get(k):
-            partes.append(etiq.format(filtros[k]) if "{}" in etiq else str(filtros[k]))
+    if filtros.get("combustible"):
+        partes.append(_COMBUSTIBLE_EMOJI.get(filtros["combustible"], str(filtros["combustible"])))
+    if filtros.get("caja"):
+        partes.append(_CAJA_EMOJI.get(filtros["caja"], str(filtros["caja"])))
+    if filtros.get("power_min"):
+        partes.append(f"🐎 ≥{int(filtros['power_min'])} CV")
     return " · ".join(partes)
 
 
