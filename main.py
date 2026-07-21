@@ -76,6 +76,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Escaneo inmediato del sniper en curso por usuario (para poder cancelarlo).
+# En memoria del proceso del bot — no persiste reinicios, no hace falta:
+# la misión ya está creada y el worker sigue vigilando aunque se cancele esto.
+_TAREAS_ESCANEO_SNIPER: dict[int, asyncio.Task] = {}
+
 # ─── ESTADOS ─────────────────────────────────────────────────────────────────
 ASK_MODELO, ASK_PRECIO_OBJETIVO, ASK_FILTROS, SHOW_RESULTS = range(4)
 CALC_PRECIO, CALC_BENEFICIO, CALC_CO2 = range(10, 13)
@@ -3221,6 +3226,15 @@ async def callback_sniper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.answer("Informe VIN: próximamente. Aún no disponible.", show_alert=True)
         return
 
+    if data == "sniper_cancelar_scan":
+        tarea = _TAREAS_ESCANEO_SNIPER.get(user_id)
+        if tarea and not tarea.done():
+            tarea.cancel()
+            await query.answer("Cancelando…")
+        else:
+            await query.answer("La búsqueda ya terminó.")
+        return
+
     # Gestión: sniper_<accion>:<id>
     try:
         accion, sid = data.split(":", 1)
@@ -3314,20 +3328,44 @@ async def _crear_sniper_confirmado(query, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
     # Escaneo INMEDIATO: enseña lo mejor que hay ahora mismo (no solo "te avisaré").
-    buscando = await query.message.reply_text("🔎 Buscando lo mejor ahora mismo…")
+    # Puede tardar minutos (AS24 + mobile.de + detalle real) — cancelable.
+    teclado_cancelar = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("⏹ Cancelar búsqueda", callback_data="sniper_cancelar_scan")]]
+    )
+    buscando = await query.message.reply_text(
+        "🔎 Buscando lo mejor ahora mismo…", reply_markup=teclado_cancelar,
+    )
+
+    tarea = asyncio.ensure_future(
+        sp.mejores_del_mercado(marca, modelo, filtros, umbral_eur, umbral_pct, top_n=3)
+    )
+    _TAREAS_ESCANEO_SNIPER[user_id] = tarea
     try:
-        top = await sp.mejores_del_mercado(marca, modelo, filtros, umbral_eur, umbral_pct, top_n=3)
+        top = await tarea
+    except asyncio.CancelledError:
+        await buscando.edit_text(
+            "⏹ Búsqueda cancelada.\n"
+            "El sniper #{} sigue vigilando en segundo plano — te avisaré igual.".format(mid),
+            reply_markup=None,
+        )
+        return
     except Exception as e:
         logger.warning(f"[SNIPER] escaneo inmediato falló: {e}")
         top = []
+    finally:
+        _TAREAS_ESCANEO_SNIPER.pop(user_id, None)
 
     if not top:
         await buscando.edit_text(
-            "Ahora mismo no hay ninguna unidad con margen. En cuanto salte, te aviso. 🎯"
+            "Ahora mismo no hay ninguna unidad con margen. En cuanto salte, te aviso. 🎯",
+            reply_markup=None,
         )
         return
 
-    await buscando.edit_text(f"🏆 <b>Top {len(top)} ahora mismo</b> (ordenado por margen):", parse_mode="HTML")
+    await buscando.edit_text(
+        f"🏆 <b>Top {len(top)} ahora mismo</b> (ordenado por margen):",
+        parse_mode="HTML", reply_markup=None,
+    )
     for item in top:
         anuncio = item["anuncio"]
         tarjeta = sp.render_tarjeta_alerta(anuncio, item["valoracion"], item["cuenta"], riesgo=item.get("riesgo"))
