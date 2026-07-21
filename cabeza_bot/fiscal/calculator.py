@@ -81,13 +81,24 @@ def calcular_cuenta_importacion(precio_de: float, mediana_es: float, co2: float 
     """
     Cuenta de importación del sniper. La base del IEDMT es el VALOR DE MERCADO ES
     (mediana de comparables), NO el precio de compra alemán.
-    co2<=0 → estimación determinista (sin IA); marca co2_estimado=True.
+
+    CO₂ conservador para motores térmicos: se usa max(cifra del anuncio, típico
+    del motor). Los CO₂ alemanes (NEDC) suelen quedar bajos y a veces la extracción
+    devuelve 0 → sin esto un diésel saldría a 0% de IEDMT, que es mentira peligrosa
+    para el importador. Solo los eléctricos se quedan en 0. Se marca co2_estimado
+    cuando NO nos apoyamos en una cifra real fiable.
     """
-    co2_estimado = False
-    co2_val = float(co2 or 0)
-    if co2_val <= 0:
-        co2_val = estimar_co2_deterministico(combustible, año)
-        co2_estimado = True
+    comb_norm = _normalizar_comb(combustible)
+    co2_raw = float(co2 or 0)
+
+    if comb_norm == "electrico":
+        co2_val, co2_estimado = 0.0, False
+    else:
+        est = estimar_co2_deterministico(combustible, año)
+        if co2_raw > 0 and co2_raw >= est:
+            co2_val, co2_estimado = co2_raw, False   # cifra real y creíble
+        else:
+            co2_val, co2_estimado = est, True        # ausente/0/optimista → típico del motor
 
     tipo  = calcular_tipo_iedmt(co2_val)
     iedmt = round(mediana_es * tipo, 2)

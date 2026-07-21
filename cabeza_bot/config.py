@@ -198,15 +198,15 @@ IEDMT_TRAMOS = [
 # antigüedad en calculator.estimar_co2_deterministico. Valores conservadores
 # (tiran a alza) para no infra-estimar el IEDMT.
 CO2_TIPICO_POR_COMBUSTIBLE = {
-    "diesel":     150,
-    "gasolina":   165,
+    "diesel":     150,   # 2.0 TDI típico → tramo 4,75%
+    "gasolina":   150,   # 1.5 TSI típico → tramo 4,75%
     "hibrido":    110,
     "phev":        45,
     "electrico":    0,
-    "glp":        155,
+    "glp":        150,
     "gnc":        140,
 }
-CO2_TIPICO_DEFAULT = 160  # combustible desconocido → tramo medio-alto
+CO2_TIPICO_DEFAULT = 150  # combustible desconocido → conservador, tramo 4,75%
 
 # ─── NUEVO FISCAL (IVA) ──────────────────────────────────────────────────────
 # Un vehículo es "nuevo fiscal" (IVA español aplicable) si < 6 meses O < 6.000 km.
