@@ -1079,7 +1079,7 @@ def valoracion_caducada(actualizado_at: str, ttl_h: int) -> bool:
 # ─── EMBUDO DE CONVERSIÓN (eventos) ──────────────────────────────────────────
 
 def registrar_evento_embudo(user_id: int, evento: str, meta: str = ""):
-    """Registra un evento del embudo (start, mision_creada, alerta_enviada, paywall_visto, pago_ok)."""
+    """Registra un evento del embudo (start, mision_creada, alerta_enviada, paywall_visto, boton_pago_pulsado, pago_ok)."""
     try:
         with get_conn() as conn:
             conn.execute(

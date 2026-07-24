@@ -28,6 +28,10 @@ COSTE_COMANDO: dict[str, int] = {
     "/sniper":   1,
 }
 
+# Copy de confianza mostrado junto a los botones de pago. Reduce la fricción
+# del "¿es seguro meter mi tarjeta?". Reutilizado en todos los paywalls.
+COPY_PAGO_SEGURO = "🔒 Pago seguro con Stripe."
+
 
 def requiere_acceso(comando: str, registrar: bool = True):
     """
@@ -70,7 +74,8 @@ def requiere_acceso(comando: str, registrar: bool = True):
                 await update.effective_message.reply_text(
                     "ℹ️ Esta es tu última acción gratuita. "
                     "No hay más gratis después.\n\n"
-                    "Sigue con un pack sin caducidad:",
+                    "Sigue con un pack sin caducidad:\n\n"
+                    f"{COPY_PAGO_SEGURO}",
                     parse_mode="HTML",
                     reply_markup=keyboard,
                 )
@@ -131,5 +136,5 @@ async def _enviar_paywall(update: Update, info: dict, comando: str):
         [InlineKeyboardButton(f"🔍 {PAID_CREDITOS_PACK_10} análisis — 2,99€", callback_data="pagar_pack_10")],
     ])
     await update.effective_message.reply_text(
-        texto, parse_mode="HTML", reply_markup=keyboard
+        f"{texto}\n\n{COPY_PAGO_SEGURO}", parse_mode="HTML", reply_markup=keyboard
     )

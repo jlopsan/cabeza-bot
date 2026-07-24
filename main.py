@@ -24,7 +24,7 @@ from telegram.ext import (
 from cabeza_bot.config import TELEGRAM_TOKEN, TOP_RESULTS, MIN_BENEFICIO, ALLOWED_USER_IDS, ADMIN_USER_IDS
 from cabeza_bot.config import IDEAL_TOP_N, IDEAL_KM_AÑO_MAX
 from cabeza_bot.config import STRIPE_API_KEY, STRIPE_PRICE_PACK_10, STRIPE_PRICE_PACK_100
-from cabeza_bot.bot.permisos import requiere_acceso
+from cabeza_bot.bot.permisos import requiere_acceso, COPY_PAGO_SEGURO
 from cabeza_bot.analisis.ai import (
     parsear_filtros_nl, parsear_modelo_nl, enriquecer_coches,
     texto_analisis, validar_precio_mercado, filtrar_por_extras,
@@ -2210,6 +2210,10 @@ async def callback_pago(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Instrumentación del embudo: intención de pago. Numerador para comparar
+    # con las sesiones que Stripe reporta completadas (boton → checkout → pago).
+    registrar_evento_embudo(query.from_user.id, "boton_pago_pulsado", concepto)
+
     try:
         session = stripe.checkout.Session.create(
             payment_method_types=["card"],
@@ -2224,11 +2228,18 @@ async def callback_pago(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             locale="es",
             expires_at=int(time.time()) + 1800,
         )
+        # Botón url= → Stripe directo, sin copiar enlace ni paso intermedio.
+        boton_pagar = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("💳 Pagar ahora", url=session.url)]]
+        )
         await query.message.reply_text(
-            f"🔗 <b>Completa el pago aquí:</b>\n\n{session.url}\n\n"
+            "💳 <b>Tu pago está listo.</b>\n\n"
+            "Pulsa el botón y completa el pago.\n"
             "Cuando pagues el bot se activa automáticamente.\n"
-            "<i>El enlace expira en 30 minutos.</i>",
+            "<i>El enlace expira en 30 minutos.</i>\n\n"
+            f"{COPY_PAGO_SEGURO}",
             parse_mode="HTML",
+            reply_markup=boton_pagar,
             disable_web_page_preview=True,
         )
     except Exception as e:
@@ -2571,7 +2582,11 @@ async def _paywall_sniper(dest, user_id: int, motivo: str):
             "Cada misión vigila Alemania y te avisa con la cuenta hecha.\n"
             "Un solo coche bien comprado paga el pack 100 veces."
         )
-    await dest.reply_text(texto, parse_mode="HTML", reply_markup=_SNIPER_PACK_BOTONES)
+    await dest.reply_text(
+        f"{texto}\n\n{COPY_PAGO_SEGURO}",
+        parse_mode="HTML",
+        reply_markup=_SNIPER_PACK_BOTONES,
+    )
 
 
 def _num_es(s: str) -> float:

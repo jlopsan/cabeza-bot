@@ -47,7 +47,22 @@
       "Bash(git checkout *)",
       "Bash(python -c \"import config; print\\('config OK', config.ENABLE_SNIPER, config.COSTES_FIJOS_IMPORTACION, config.MISIONES_MAX, config.COSTE_SNIPER_PAID\\)\")",
       "Bash(python -m py_compile main.py)",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('database.py',encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('config.py',encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('permisos.py',encoding='utf-8'\\).read\\(\\)\\); print\\('SYNTAX OK los 3'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('database.py',encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('config.py',encoding='utf-8'\\).read\\(\\)\\); ast.parse\\(open\\('permisos.py',encoding='utf-8'\\).read\\(\\)\\); print\\('SYNTAX OK los 3'\\)\")",
+      "Bash(git branch *)",
+      "Bash(git fetch *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('worker.py',encoding='utf-8'\\).read\\(\\)\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('scraper.py',encoding='utf-8'\\).read\\(\\)\\); print\\('scraper OK'\\)\")",
+      "Bash(git commit -q -m ' *)",
+      "WebFetch(domain:dieselogasolina.com)",
+      "WebSearch",
+      "WebFetch(domain:www.autoescueladummy.com)",
+      "Bash(python -c \"import config, sniper_pipeline; print\\('imports OK'\\)\")",
+      "Bash(PYTHONIOENCODING=utf-8 python -c ' *)",
+      "Bash(python -c \"import main; print\\('main.py IMPORTA OK'\\)\")",
+      "Bash(python \"C:/Users/Juan/AppData/Local/Temp/claude/c--Users-Juan-Documents-cabeza-bot/9880a6c2-67c6-4399-a7cd-6b467d7d597c/scratchpad/migrar_imports.py\")",
+      "Bash(python -c \"import main, worker\")",
+      "Bash(PYTHONIOENCODING=utf-8 timeout 300 python -c ' *)",
+      "Bash(python -c \"import cabeza_bot.fiscal.calculator, main; print\\('OK'\\)\")"
     ]
   }
 }
